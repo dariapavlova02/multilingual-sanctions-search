@@ -28,6 +28,96 @@ class GenderProcessor:
             'ru': get_female_given_names('ru') or set(),
             'uk': get_female_given_names('uk') or set(),
         }
+        from ....data.dicts.russian_names import RUSSIAN_NAMES
+        from ....data.dicts.ukrainian_names import UKRAINIAN_NAMES
+
+        self._given_genders = {}
+        for language, dictionary in (("ru", RUSSIAN_NAMES), ("uk", UKRAINIAN_NAMES)):
+            genders = {}
+            for name, info in dictionary.items():
+                for form in [name, *info.get("declensions", [])]:
+                    genders[form.casefold()] = info.get("gender")
+            self._given_genders[language] = genders
+
+    def infer_gender_scores(self, elements, language="ru"):
+        """Score independent name evidence; small or contradictory gaps stay unknown."""
+        scores = {"femn": 0, "masc": 0}
+        markers = {"пані": "femn", "г-жа": "femn", "mrs": "femn",
+                   "пан": "masc", "г-н": "masc", "mr": "masc"}
+        for token, role, metadata in elements:
+            token = token.strip()
+            if not token or role == "initial":
+                continue
+            gender = None
+            weight = 0
+            if token.casefold().rstrip(".") in markers:
+                gender, weight = markers[token.casefold().rstrip(".")], 1
+            elif role in {"given", "patronymic", "surname"}:
+                languages = (language, "uk" if language == "ru" else "ru")
+                for lang in languages:
+                    gender, _, _ = self._infer_token_gender(token, role, lang)
+                    if gender:
+                        break
+                if role == "surname" and metadata.get("original"):
+                    original_gender, _, _ = self._infer_token_gender(metadata["original"], role, language)
+                    if original_gender and gender and original_gender != gender:
+                        # A changed suffix is an output of morphology, not
+                        # independent evidence against the source given name.
+                        gender = None
+                weight = 2 if role == "surname" else 3
+            if gender in scores:
+                scores[gender] += weight
+        gap = scores["femn"] - scores["masc"]
+        gender = ("femn" if gap > 0 else "masc") if abs(gap) >= 3 else None
+        return gender, scores["femn"], scores["masc"]
+
+    def adjust_surname_with_evidence(
+        self,
+        lemma,
+        language,
+        gender,
+        gap,
+        original=None,
+        *,
+        preserve_ambiguous_source=True,
+    ):
+        """Apply gender suffixes only when the evidence margin permits a change."""
+        if not lemma:
+            return lemma
+        if "-" in lemma:
+            parts = lemma.split("-")
+            original_parts = original.split("-") if original else []
+            return "-".join(
+                self.adjust_surname_with_evidence(
+                    part, language, gender, gap,
+                    original_parts[index] if len(original_parts) == len(parts) else None,
+                    preserve_ambiguous_source=preserve_ambiguous_source,
+                )
+                for index, part in enumerate(parts)
+            )
+        if not lemma or lemma.casefold().endswith(("енко", "ук", "юк", "чук", "ян", "дзе")):
+            return lemma
+        pairs = {
+            "ru": (("ский", "ская"), ("цкий", "цкая"), ("ов", "ова"),
+                   ("ев", "ева"), ("ин", "ина")),
+            "uk": (("ський", "ська"), ("цький", "цька"), ("їв", "їва"),
+                   ("ів", "іва"), ("ов", "ова"), ("ев", "ева"), ("ин", "ина")),
+        }.get(language, ())
+        if gender not in {"masc", "femn"} or gap < 3:
+            if original and preserve_ambiguous_source:
+                # Preserve an explicitly feminine source or an unambiguous masculine
+                # possessive ending when morphology has changed its gender.
+                endings = tuple(f for _, f in pairs) + ("ов", "ев", "ский", "ський")
+                if original.casefold().endswith(endings):
+                    return original
+            return lemma
+        for masculine, feminine in pairs:
+            source, target = (masculine, feminine) if gender == "femn" else (feminine, masculine)
+            if lemma.casefold().endswith(source):
+                if target.startswith(source):
+                    return lemma + target[len(source):]
+                return lemma[:-len(source)] + target
+        return lemma
 
     def infer_gender(
         self,
@@ -102,6 +192,8 @@ class GenderProcessor:
         """Infer gender from surname patterns."""
         evidence: List[str] = []
         surname_lower = surname.lower()
+        if surname_lower.endswith(("енко", "ук", "юк", "чук", "ян", "дзе")):
+            return None, 0.0, evidence
 
         if language == 'ru':
             is_feminine, fem_form = looks_like_feminine_ru(surname)
@@ -160,6 +252,9 @@ class GenderProcessor:
         """Infer gender from given name patterns."""
         evidence: List[str] = []
         name_lower = given_name.lower()
+        known_gender = self._given_genders.get(language, {}).get(name_lower)
+        if known_gender in {"masc", "femn"}:
+            return known_gender, 0.95, ["Known given name gender"]
         female_names = self._female_name_sets.get(language, set())
 
         if female_names and name_lower in female_names:
@@ -322,9 +417,9 @@ class GenderProcessor:
                 trimmed = surname[:-len(suffix)] + replacement
                 return self._title_case(trimmed)
 
-        masculine = convert_surname_to_nominative(surname, 'uk')
-        if masculine and masculine.lower() != lower:
-            return self._title_case(masculine)
+        # Case normalization already ran in MorphologyAdapter. Reapplying the
+        # generic case converter as a gender conversion corrupts surnames whose
+        # nominative form ends in -а (for example, Скрипка -> Скрипк).
         return surname
 
     def _title_case(self, token: str) -> str:

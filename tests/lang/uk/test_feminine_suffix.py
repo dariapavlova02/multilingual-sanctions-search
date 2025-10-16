@@ -7,11 +7,11 @@ Ukrainian feminine suffixes (-ська/-цька) are preserved in nominative ca
 """
 
 import pytest
-from src.ai_service.layers.normalization.morphology.gender_rules import (
+from ai_service.layers.normalization.morphology.gender_rules import (
     convert_surname_to_nominative_uk,
     looks_like_feminine_uk
 )
-from src.ai_service.layers.normalization.processors.morphology_processor import MorphologyProcessor
+from ai_service.layers.normalization.processors.morphology_processor import MorphologyProcessor
 
 
 class TestUkrainianFeminineSuffix:

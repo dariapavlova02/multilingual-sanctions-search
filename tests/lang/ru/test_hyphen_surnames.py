@@ -7,7 +7,7 @@ preserved and normalized with proper feminine form handling.
 """
 
 import pytest
-from src.ai_service.layers.normalization.token_ops import normalize_hyphenated_name
+from ai_service.layers.normalization.token_ops import normalize_hyphenated_name
 
 
 class TestRussianHyphenSurnames:

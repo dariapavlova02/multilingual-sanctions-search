@@ -9,7 +9,7 @@ import time
 from unittest.mock import Mock, patch, MagicMock
 from typing import Dict, Any, List
 
-from src.ai_service.contracts.trace_models import (
+from ai_service.contracts.trace_models import (
     SearchTrace,
     SearchTraceBuilder,
     SearchTraceStep,
@@ -19,15 +19,16 @@ from src.ai_service.contracts.trace_models import (
     create_semantic_hit,
     create_hybrid_hit,
 )
-from src.ai_service.contracts.decision_contracts import DecisionOutput, RiskLevel
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator
-from src.ai_service.layers.embeddings.indexing.watchlist_index_service import WatchlistIndexService
+from ai_service.contracts.decision_contracts import DecisionOutput, RiskLevel
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.core.unified_orchestrator import UnifiedOrchestrator
+from ai_service.layers.embeddings.indexing.watchlist_index_service import WatchlistIndexService
 
 
 class TestSearchTraceContracts:
     """Test SearchTrace contracts and behavior."""
 
+    @pytest.mark.performance
     def test_debug_trace_false_no_overhead(self):
         """Test that debug_trace=False has minimal overhead."""
         # Create disabled trace
@@ -283,6 +284,7 @@ class TestSearchTraceContracts:
         assert hit_data.signals["id_match"] is False
         assert hit_data.signals["confidence"] == 0.95
 
+    @pytest.mark.performance
     def test_trace_performance_impact(self):
         """Test that enabled trace has measurable but reasonable performance impact."""
         # Test disabled trace performance

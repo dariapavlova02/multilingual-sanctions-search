@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
 @pytest.fixture(scope="module")
 def normalization_service():
     """Module-scoped normalization service fixture."""
-    from src.ai_service.layers.normalization.normalization_service import NormalizationService
+    from ai_service.layers.normalization.normalization_service import NormalizationService
     service = NormalizationService()
     yield service
     # Cleanup caches

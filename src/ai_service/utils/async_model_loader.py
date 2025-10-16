@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from typing import Any, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ class AsyncModelLoader:
 
     def __init__(self):
         self._models: Dict[str, Optional[Any]] = {}
-        self._loading: Dict[str, bool] = {}
+        self._loading: Dict[str, Future] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ModelLoader")
 
@@ -41,44 +41,34 @@ class AsyncModelLoader:
             return None
 
     async def load_model_async(self, model_name: str, package_name: str) -> Optional[Any]:
-        """Load a model asynchronously."""
+        """Share one load across callers and event loops without awaiting a lock.
+
+        A concurrent future belongs to the worker pool, rather than a particular
+        event loop. Shielding each wait prevents a cancelled request from
+        cancelling the shared load for other callers.
+        """
         with self._lock:
-            # Return cached model if available
             if model_name in self._models:
                 return self._models[model_name]
-
-            # Check if already loading
-            if self._loading.get(model_name, False):
-                # Wait for loading to complete
-                while self._loading.get(model_name, False):
-                    await asyncio.sleep(0.1)
-                return self._models.get(model_name)
-
-            # Mark as loading
-            self._loading[model_name] = True
-
+            future = self._loading.get(model_name)
+            if future is None:
+                future = self._executor.submit(
+                    self._load_spacy_model, model_name, package_name
+                )
+                self._loading[model_name] = future
         try:
-            # Load model in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            model = await loop.run_in_executor(
-                self._executor,
-                self._load_spacy_model,
-                model_name,
-                package_name
-            )
-
-            with self._lock:
-                self._models[model_name] = model
-                self._loading[model_name] = False
-
-            return model
-
+            model = await asyncio.shield(asyncio.wrap_future(future))
         except Exception as e:
             logger.error(f"Async loading failed for {model_name}: {e}")
-            with self._lock:
-                self._models[model_name] = None
-                self._loading[model_name] = False
-            return None
+            model = None
+        with self._lock:
+            self._models[model_name] = model
+            self._loading.pop(model_name, None)
+        return model
+
+    def close(self) -> None:
+        """Finish outstanding loads and release the owned worker threads."""
+        self._executor.shutdown(wait=True)
 
     def get_model_sync(self, model_name: str) -> Optional[Any]:
         """Get model synchronously (returns None if not loaded)."""
@@ -161,6 +151,3 @@ def get_spacy_ru_sync() -> Optional[Any]:
 def start_model_preloading():
     """Start background model preloading."""
     _model_loader.start_background_loading()
-
-# Auto-start background loading when module is imported
-start_model_preloading()

@@ -3,7 +3,7 @@ Unit tests for morphological normalization and diminutives expansion
 """
 
 import pytest
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestMorphologyAndDiminutives:

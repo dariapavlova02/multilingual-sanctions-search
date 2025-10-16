@@ -81,7 +81,7 @@ class TestSearchImports:
         
         assert opts.top_k == 100
         assert opts.threshold == 0.8
-        assert opts.search_mode == "ac"  # Pydantic converts enum to string value
+        assert opts.search_mode == SearchMode.AC
         assert opts.enable_escalation is False
     
     def test_hybrid_search_config_creation(self):
@@ -90,7 +90,7 @@ class TestSearchImports:
         
         assert config.service_name == "hybrid_search"
         assert config.enable_escalation is True
-        assert config.escalation_threshold == 0.8
+        assert config.escalation_threshold == 0.6
         assert config.elasticsearch is not None
         assert config.ac_search is not None
         assert config.vector_search is not None

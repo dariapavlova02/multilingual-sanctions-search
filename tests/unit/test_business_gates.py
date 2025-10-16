@@ -9,12 +9,12 @@ Tests the business rule:
 
 import pytest
 from unittest.mock import Mock
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.decision_contracts import (
     DecisionInput, DecisionOutput, RiskLevel, SmartFilterInfo, 
     SignalsInfo, SimilarityInfo
 )
-from src.ai_service.config.settings import DecisionConfig
+from ai_service.config.settings import DecisionConfig
 
 
 class TestBusinessGates:
@@ -250,7 +250,7 @@ class TestBusinessGates:
 
     def test_response_formatter_integration(self):
         """Test that response formatter includes business gate fields."""
-        from src.ai_service.utils.response_formatter import _get_review_required, _get_required_additional_fields
+        from ai_service.utils.response_formatter import _get_review_required, _get_required_additional_fields
         
         # Test with review required
         decision_with_review = DecisionOutput(

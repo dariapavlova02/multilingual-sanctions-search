@@ -117,15 +117,8 @@ class TestValidationService:
         mock_validator.validate_and_sanitize.side_effect = Exception("Validation error")
         service._validator = mock_validator
 
-        result = await service.validate_and_sanitize("test text")
-
-        # Should provide safe fallback
-        assert result["sanitized_text"] == "test text"
-        assert result["should_process"] is True
-        assert result["is_valid"] is True
-        assert "Validation error" in result["warnings"][0]
-        assert result["blocked_patterns"] == []
-        assert result["risk_level"] == "unknown"
+        with pytest.raises(RuntimeError, match="Input validation is unavailable"):
+            await service.validate_and_sanitize("test text")
 
     @pytest.mark.asyncio
     async def test_validate_and_sanitize_empty_text(self):
@@ -156,18 +149,13 @@ class TestValidationService:
         service = ValidationService()
 
         long_text = "a" * 2000
-        expected_truncated = "a" * 1000
 
         mock_validator = Mock()
         mock_validator.validate_and_sanitize.side_effect = Exception("Text too long")
         service._validator = mock_validator
 
-        result = await service.validate_and_sanitize(long_text)
-
-        # Should truncate in fallback
-        assert result["sanitized_text"] == expected_truncated
-        assert result["should_process"] is True
-        assert len(result["warnings"]) == 1
+        with pytest.raises(RuntimeError, match="Input validation is unavailable"):
+            await service.validate_and_sanitize(long_text)
 
     @pytest.mark.asyncio
     async def test_validate_and_sanitize_none_input(self):
@@ -178,12 +166,8 @@ class TestValidationService:
         mock_validator.validate_and_sanitize.side_effect = Exception("None input")
         service._validator = mock_validator
 
-        result = await service.validate_and_sanitize(None)
-
-        # Should handle None gracefully in fallback
-        assert result["sanitized_text"] == ""
-        assert result["should_process"] is False
-        assert result["is_valid"] is False
+        with pytest.raises(RuntimeError, match="Input validation is unavailable"):
+            await service.validate_and_sanitize(None)
 
     @pytest.mark.asyncio
     async def test_validate_with_risk_levels(self):

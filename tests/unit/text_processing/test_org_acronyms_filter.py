@@ -4,8 +4,8 @@ Unit tests for ORG_LEGAL_FORMS filter in normalization service.
 """
 
 import pytest
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.layers.normalization.processors.role_classifier import ORG_LEGAL_FORMS
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.processors.role_classifier import ORG_LEGAL_FORMS
 
 
 class TestOrgAcronymsFilter:

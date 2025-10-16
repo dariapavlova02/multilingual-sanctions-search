@@ -6,19 +6,20 @@ with titles, particles, and suffixes.
 """
 
 import pytest
-from src.ai_service.layers.normalization.nameparser_adapter import (
+from ai_service.layers.normalization.nameparser_adapter import (
     NameparserAdapter, 
     ParsedName,
     get_nameparser_adapter
 )
 from pathlib import Path
+from ai_service.data.resources import LEXICONS_DIR
 
 
 @pytest.fixture
 def nameparser_adapter():
     """Create a nameparser adapter for testing."""
     # Use the actual lexicons path
-    lexicons_path = Path(__file__).resolve().parents[3] / "data" / "lexicons"
+    lexicons_path = LEXICONS_DIR
     return NameparserAdapter(lexicons_path)
 
 

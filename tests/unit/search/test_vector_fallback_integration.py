@@ -6,10 +6,10 @@ import pytest
 from unittest.mock import Mock, AsyncMock, patch
 from typing import List, Dict, Any
 
-from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-from src.ai_service.layers.search.config import HybridSearchConfig
-from src.ai_service.layers.search.contracts import SearchOpts, Candidate, SearchMode
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.layers.search.hybrid_search_service import HybridSearchService
+from ai_service.layers.search.config import HybridSearchConfig
+from ai_service.layers.search.contracts import SearchOpts, Candidate, SearchMode
+from ai_service.contracts.base_contracts import NormalizationResult
 
 
 class TestVectorFallbackIntegration:

@@ -10,6 +10,7 @@ import ahocorasick
 from typing import List, Optional, Set, Tuple, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+from .lexicon_loader import get_lexicons
 
 # Import unified lexicon
 from ..variants.templates.lexicon import (
@@ -39,7 +40,7 @@ class RoleTag:
 class RoleTagger:
     """Role tagger for token classification with Aho-Corasick acceleration."""
 
-    def __init__(self, window: int = 3, enable_ac: bool = True):
+    def __init__(self, window: int = 3, enable_ac: bool = True, *, lexicons=None, strict_stopwords=False):
         """
         Initialize role tagger.
 
@@ -49,11 +50,13 @@ class RoleTagger:
         """
         self.window = window
         self.enable_ac = enable_ac
+        self.strict_stopwords = strict_stopwords
+        self.lexicons = lexicons if lexicons is not None else get_lexicons()
 
         # Pre-compile patterns for efficiency
         self._uppercase_pattern = re.compile(r'^[А-ЯA-Z]{2,}$')
         self._legal_form_pattern = re.compile(
-            r'^(' + '|'.join(re.escape(form) for form in LEGAL_FORMS) + r')$',
+            r'^(' + '|'.join(re.escape(form) for form in self.lexicons.legal_forms) + r')$',
             re.IGNORECASE
         )
 
@@ -74,7 +77,7 @@ class RoleTagger:
             automaton = ahocorasick.Automaton()
 
             # Add all lexicon tokens as patterns
-            all_tokens = get_all_lexicon_tokens()
+            all_tokens = set().union(*self.lexicons.stopwords.values(), self.lexicons.legal_forms, self.lexicons.payment_context)
             for i, token in enumerate(all_tokens):
                 # Store token with metadata for classification
                 automaton.add_word(token.lower(), (i, token, self._classify_lexicon_token(token)))
@@ -88,9 +91,9 @@ class RoleTagger:
 
     def _classify_lexicon_token(self, token: str) -> str:
         """Classify a lexicon token by type."""
-        if is_legal_form(token):
+        if token.casefold() in self.lexicons.legal_forms:
             return 'legal_form'
-        elif is_payment_context(token):
+        elif token.casefold() in self.lexicons.payment_context:
             return 'payment_context'
         else:
             return 'stopword'
@@ -110,7 +113,7 @@ class RoleTagger:
             return []
 
         # Get stopwords for the language
-        stopwords = get_stopwords(language)
+        stopwords = self.lexicons.stopwords.get(language, set())
         
         # First pass: use AC automaton or fallback to basic matching
         if self.enable_ac and self._ac_automaton:
@@ -169,7 +172,7 @@ class RoleTagger:
         """Tag tokens using Aho-Corasick automaton for fast pattern matching."""
         tags = []
         legal_form_indices = []
-        stopwords = get_stopwords(language)
+        stopwords = self.lexicons.stopwords.get(language, set())
 
         # For small token sets, AC overhead is not worth it, use basic matching
         if len(tokens) < 10:
@@ -331,7 +334,7 @@ class RoleTagger:
 
     def _is_legal_form(self, token: str) -> bool:
         """Check if token is a legal form."""
-        return is_legal_form(token)
+        return token.casefold() in self.lexicons.legal_forms
     
     def _is_uppercase_name(self, token: str) -> bool:
         """Check if token looks like an uppercase organization name."""

@@ -7,8 +7,8 @@ spaCy Ukrainian NER is properly integrated and improves role tagging.
 """
 
 import pytest
-from src.ai_service.layers.normalization.ner_gateways.spacy_uk import get_spacy_uk_ner, SpacyUkNER
-from src.ai_service.layers.normalization.ner_gateways import NERHints
+from ai_service.layers.normalization.ner_gateways.spacy_uk import get_spacy_uk_ner, SpacyUkNER
+from ai_service.layers.normalization.ner_gateways import NERHints
 
 
 class TestUkrainianNER:
@@ -17,25 +17,22 @@ class TestUkrainianNER:
     def setup_method(self):
         """Set up test fixtures."""
         self.ner = get_spacy_uk_ner()
-        if not self.ner:
-            pytest.skip("spaCy Ukrainian NER not available")
+        assert self.ner is not None, "Pinned Ukrainian model must be installed"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_ner_model_availability(self):
         """Test that NER model is available when expected."""
         assert self.ner.is_available(), "spaCy Ukrainian NER should be available"
-        assert self.ner._model is not None, "spaCy model should be loaded"
+        assert self.ner.gateway.get_model_info()["uk"]["loaded"]
 
-    def test_ner_model_unavailable_graceful_handling(self):
-        """Test graceful handling when NER model is unavailable."""
-        # This test should pass regardless of model availability
-        hints = self.ner.extract_entities("Тестовий текст")
-        assert isinstance(hints, NERHints), "Should return NERHints even when model unavailable"
-        assert hints.person_spans == [], "Should return empty person spans when model unavailable"
-        assert hints.org_spans == [], "Should return empty org spans when model unavailable"
-        assert hints.entities == [], "Should return empty entities when model unavailable"
+    def test_ner_model_unavailable_graceful_handling(self, monkeypatch):
+        from ai_service.layers.normalization.ner_gateways.unified_spacy_gateway import UnifiedSpacyGateway
+        gateway = UnifiedSpacyGateway()
+        monkeypatch.setattr(gateway, '_load_spacy_model', lambda language:(None,False))
+        hints = SpacyUkNER(gateway).extract_entities("Тестовий текст")
+        assert isinstance(hints, NERHints)
+        assert hints.person_spans == hints.org_spans == hints.entities == []
+        gateway.close()
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_person_entity_extraction(self):
         """Test extraction of person entities from Ukrainian text."""
         test_cases = [
@@ -55,7 +52,6 @@ class TestUkrainianNER:
             person_entities = [e for e in hints.entities if e.label == "PER"]
             assert len(person_entities) > 0, f"Should have person entities for: {text}"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_organization_entity_extraction(self):
         """Test extraction of organization entities from Ukrainian text."""
         test_cases = [
@@ -76,7 +72,6 @@ class TestUkrainianNER:
             org_entities = [e for e in hints.entities if e.label == "ORG"]
             assert len(org_entities) > 0, f"Should have org entities for: {text}"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_mixed_person_org_extraction(self):
         """Test extraction of both person and organization entities."""
         text = "Анна Ковальська працює в ТОВ ПРИВАТБАНК"
@@ -93,7 +88,6 @@ class TestUkrainianNER:
         assert len(person_entities) > 0, "Should have person entities"
         assert len(org_entities) > 0, "Should have org entities"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_entity_at_position(self):
         """Test getting entity at specific character position."""
         text = "Анна Ковальська працює в ТОВ ПРИВАТБАНК"
@@ -101,17 +95,18 @@ class TestUkrainianNER:
         
         # Test position within person entity
         person_entity = self.ner.get_entity_at_position(text, 0)  # Start of "Анна"
+        assert person_entity is not None
         if person_entity:
             assert person_entity.label == "PER", "Should be person entity"
             assert "Анна" in person_entity.text, "Should contain 'Анна'"
         
         # Test position within org entity
         org_entity = self.ner.get_entity_at_position(text, 30)  # Within "ПРИВАТБАНК"
+        assert org_entity is not None
         if org_entity:
             assert org_entity.label == "ORG", "Should be org entity"
             assert "ПРИВАТБАНК" in org_entity.text, "Should contain 'ПРИВАТБАНК'"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_is_person_entity(self):
         """Test checking if text span is person entity."""
         text = "Анна Ковальська працює в ТОВ ПРИВАТБАНК"
@@ -124,7 +119,6 @@ class TestUkrainianNER:
         is_person_org = self.ner.is_person_entity(text, 25, 35)  # "ПРИВАТБАНК"
         assert not is_person_org, "Should not identify 'ПРИВАТБАНК' as person entity"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_is_org_entity(self):
         """Test checking if text span is organization entity."""
         text = "Анна Ковальська працює в ТОВ ПРИВАТБАНК"
@@ -167,7 +161,6 @@ class TestUkrainianNER:
         else:
             assert stats["model_available"] is False, "Should report model as unavailable"
 
-    @pytest.mark.skipif(not (get_spacy_uk_ner() and get_spacy_uk_ner().is_available()), reason="spaCy Ukrainian model not available")
     def test_confidence_scores(self):
         """Test that entities have confidence scores."""
         text = "Анна Ковальська працює в ТОВ ПРИВАТБАНК"
@@ -175,8 +168,7 @@ class TestUkrainianNER:
         
         for entity in hints.entities:
             assert hasattr(entity, 'confidence'), "Entity should have confidence attribute"
-            assert isinstance(entity.confidence, (int, float)), "Confidence should be numeric"
-            assert 0 <= entity.confidence <= 1, "Confidence should be between 0 and 1"
+            assert entity.confidence is None, "spaCy does not supply calibrated entity scores"
 
     def test_ner_hints_structure(self):
         """Test NERHints data structure."""

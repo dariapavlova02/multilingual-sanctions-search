@@ -17,7 +17,7 @@ _SUPPORTED_LANGS = ("ru", "uk")
 class DiminutiveResolver:
     """Map diminutive tokens to their canonical form using static dictionaries."""
 
-    def __init__(self, base_path: Path) -> None:
+    def __init__(self, base_path: Optional[Path] = None) -> None:
         self._logger = get_logger(__name__)
         self._base_path = base_path
         self._maps: Dict[str, Dict[str, str]] = {}
@@ -72,6 +72,10 @@ class DiminutiveResolver:
             return {}
 
     def _get_data_path(self, lang: str) -> Path:
+        if self._base_path is None:
+            from ....data.resources import PACKAGE_DATA_DIR
+
+            return PACKAGE_DATA_DIR / f"diminutives_{lang}.json"
         return self._base_path / "data" / f"diminutives_{lang}.json"
 
     def clear_cache(self) -> None:

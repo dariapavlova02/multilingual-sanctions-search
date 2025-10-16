@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from ..config import SERVICE_CONFIG
 from ..exceptions import ValidationError
+from .source_text_view import without_format_controls
 
 
 @dataclass
@@ -180,6 +181,11 @@ class InputValidator:
         # 4. Sanitize the text
         sanitized = self._sanitize_text(text, remove_homoglyphs)
 
+        if not sanitized.strip():
+            return ValidationResult(is_valid=False, sanitized_text="",
+                warnings=["Empty input after formatting cleanup"],
+                blocked_patterns=blocked_patterns, risk_level=risk_level)
+
         # 5. Additional checks after sanitization
         if len(sanitized) != len(text):
             # Do not warn for benign whitespace/zero-width cleanup if no control chars were present
@@ -219,41 +225,21 @@ class InputValidator:
         Returns:
             Sanitized text
         """
-        # 1. Remove control characters (except newlines and tabs)
-        for char in self.control_chars:
-            text = text.replace(char, "")
+        # Use the same formatting policy as Unicode normalization and evidence
+        # extraction; numeric values and whitespace boundaries are preserved.
+        text = without_format_controls(text)
 
-        # 2. Remove zero-width characters that can be used for obfuscation
-        for char in self.zero_width_chars:
-            text = text.replace(char, "")
-
-        # 3. Replace homoglyphs if requested (smart script detection)
+        # 3. Repair mixed-script words without rewriting surrounding languages.
         if remove_homoglyphs:
-            try:
-                # Detect mixed scripts or suspicious homoglyph usage
-                has_cyrillic = re.search(r"[А-Яа-яІіЇїЄєҐґ]", text) is not None
-                has_latin = re.search(r"[A-Za-z]", text) is not None
+            replacements = str.maketrans({"а": "a", "о": "o", "р": "p", "е": "e"})
 
-                # Only apply homoglyph replacement for truly mixed scripts or suspicious patterns
-                # Don't convert legitimate pure Cyrillic text to Latin
-                if has_cyrillic and has_latin:
-                    # Mixed script detected - apply selective homoglyph normalization
-                    # Only replace obviously suspicious characters that might be intentional obfuscation
-                    suspicious_cyrillic_to_latin = {
-                        # Only replace the most common homoglyphs that are often used for spoofing
-                        "а": "a", "о": "o", "р": "p", "е": "e"
-                    }
-                    for homoglyph, replacement in suspicious_cyrillic_to_latin.items():
-                        text = text.replace(homoglyph, replacement)
-                elif has_latin and not has_cyrillic:
-                    # Pure Latin - only apply digit-to-letter mappings for obvious spoofing
-                    digit_mappings = {"0": "o", "1": "l", "3": "e", "5": "s"}
-                    for homoglyph, replacement in digit_mappings.items():
-                        text = text.replace(homoglyph, replacement)
-                # If has_cyrillic and not has_latin: leave pure Cyrillic text alone
-            except Exception:
-                # Best-effort; skip on regex issues
-                pass
+            def repair_word(match):
+                word = match.group()
+                latin = sum("a" <= char.lower() <= "z" for char in word)
+                cyrillic = sum("\u0400" <= char <= "\u04ff" for char in word)
+                return word.translate(replacements) if latin > cyrillic > 0 else word
+
+            text = re.sub(r"[^\W\d_]+", repair_word, text)
 
         # 4. Normalize excessive whitespace
         text = re.sub(r"\s+", " ", text)

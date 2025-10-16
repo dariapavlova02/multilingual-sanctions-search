@@ -170,6 +170,8 @@ _DIM_SUFFIX_MAP = {
         "ов", "ев", "ин", "ын",
         "ова", "ева", "ина", "ына",
         "ський", "ська", "цький", "цька",
+        "ського", "цького", "ському", "цькому", "ським", "цьким",
+        "ської", "цької", "ською", "цькою",
         "ко",
         "ський",
         "ська",
@@ -178,6 +180,8 @@ _DIM_SUFFIX_MAP = {
         "ук",
         "юк",
         "чук",
+        "ука", "уку", "уком", "укові", "юка", "юку", "юком", "юкові",
+        "енка", "енку", "енком", "енкові",
         "ян",
         "дзе",
         "швили",
@@ -252,7 +256,7 @@ class RoleClassifier:
         language: str = "ru",
         quoted_segments: Optional[List[str]] = None,
     ) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
-        """Classify tokens, mirroring the legacy _tag_roles flow.
+        """Classify tokens for the canonical normalization pipeline.
 
         Returns tagged tokens with roles, a list of trace messages, and the
         collection of organisation strings detected (quoted phrases or uppercase
@@ -307,6 +311,20 @@ class RoleClassifier:
             if _is_potential_business_id(base):
                 tagged.append((base, "candidate:identifier"))
                 traces.append(f"Potential business ID detected for '{base}'")
+                continue
+
+            # Nameparser accepts arbitrary strings, including invoice and house
+            # numbers. Keep these outside person classification and its positional
+            # fallback, even if the parser proposes a name role.
+            if any(char.isdigit() for char in base):
+                tagged.append((base, "other"))
+                traces.append(f"Non-person numeric token: '{base}'")
+                continue
+
+            if self._is_initial(base):
+                for initial in self._split_multi_initial(base):
+                    tagged.append((initial, "initial"))
+                    traces.append(f"Initial token '{initial}' from '{base}'")
                 continue
 
             if ner_roles.get(index):
@@ -388,6 +406,8 @@ class RoleClassifier:
             for i, (token, role) in enumerate(tagged)
             if role in {"unknown", "given", "surname", "patronymic", "initial", "other"}
             and not self._is_context_word(token)
+            and not any(char.isdigit() for char in token)
+            and any(char.isalpha() for char in token)
         ]
 
         tagged = self._apply_positional_heuristics(tagged, language, person_indices)
@@ -518,6 +538,13 @@ class RoleClassifier:
             return "given"
 
         if language in ("ru", "uk"):
+            from ..morphology_adapter import _given_declensions
+            if lower in _given_declensions(language):
+                return "given"
+            if "-" in token:
+                parts = token.split("-")
+                if all(parts) and all(self._classify_personal_role(part, language) == "surname" for part in parts):
+                    return "surname"
             # Check patronymic FIRST - they have priority over surname suffixes
             if self._classify_patronymic_role(token, language) == "patronymic":
                 return "patronymic"
@@ -817,21 +844,42 @@ class RoleClassifier:
                 return {}
 
         if language == "en" and HumanName:
-            text = " ".join(tokens)
-            try:
-                parsed = HumanName(text)
-                mapping = [
-                    (parsed.first, "given"),
-                    (parsed.middle, "given"),
-                    (parsed.last, "surname"),
-                ]
-                for value, role in mapping:
-                    if not value:
-                        continue
-                    for idx, token in enumerate(tokens):
-                        if token.lower() == value.lower():
-                            roles.setdefault(idx, role)
-            except Exception:  # pragma: no cover
-                pass
+            # Parse separate name spans. A comma or numeric document/address
+            # token must not reverse or replace the name preceding it.
+            spans = []
+            span = []
+            for index, token in enumerate(tokens):
+                is_name_token = (
+                    any(char.isalpha() for char in token)
+                    and not any(char.isdigit() for char in token)
+                    and not self._is_context_word(token.rstrip("."))
+                    and not self._is_legal_form(token.casefold())
+                    and not _is_business_document_marker(token)
+                    and all(char.isalpha() or char in "'-’." for char in token)
+                )
+                if is_name_token:
+                    span.append((index, token))
+                elif span:
+                    spans.append(span)
+                    span = []
+            if span:
+                spans.append(span)
+            for span in spans:
+                try:
+                    parsed = HumanName(" ".join(token for _, token in span))
+                    mapping = [
+                        (parsed.first, "given"),
+                        (parsed.middle, "given"),
+                        (parsed.last, "surname"),
+                    ]
+                    for value, role in mapping:
+                        if not value:
+                            continue
+                        components = {component.casefold() for component in value.split()}
+                        for idx, token in span:
+                            if token.casefold() in components:
+                                roles.setdefault(idx, role)
+                except Exception:  # pragma: no cover
+                    pass
 
         return roles

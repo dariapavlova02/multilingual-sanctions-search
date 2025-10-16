@@ -10,6 +10,7 @@ Enhanced with async support for long text processing.
 
 import time
 import asyncio
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
@@ -111,17 +112,22 @@ class TokenizerService:
         """
         start_time = time.perf_counter()
         self._total_requests += 1
+        flags = dict(feature_flags or {})
+        flags.update(remove_stop_words=remove_stop_words, preserve_names=preserve_names)
+        flags.setdefault("fix_initials_double_dot", self.fix_initials_double_dot)
+        flags.setdefault("preserve_hyphenated_case", self.preserve_hyphenated_case)
+        flags["stop_words"] = sorted(stop_words) if stop_words is not None else None
         
         # Create cache key
         cache_key = None
         if self.cache:
-            flags = feature_flags or {}
             flags_hash = create_flags_hash(flags)
             cache_key = create_cache_key(language, text, flags_hash)
             
             # Try to get from cache
             hit, cached_result = self.cache.get(cache_key)
             if hit:
+                cached_result = deepcopy(cached_result)
                 self._cache_hits += 1
                 processing_time = time.perf_counter() - start_time
                 self._total_processing_time += processing_time
@@ -146,11 +152,11 @@ class TokenizerService:
             remove_stop_words=remove_stop_words,
             preserve_names=preserve_names,
             stop_words=stop_words,
-            feature_flags=feature_flags
+            feature_flags=flags
         )
         
         # Apply post-processing rules
-        tokens, post_traces, token_traces = self._apply_post_processing_rules(tokens)
+        tokens, post_traces, token_traces = self._apply_post_processing_rules(tokens, flags)
         traces.extend(post_traces)
         
         processing_time = time.perf_counter() - start_time
@@ -174,7 +180,7 @@ class TokenizerService:
                 'metadata': metadata,
                 'token_traces': token_traces
             }
-            self.cache.set(cache_key, cache_value)
+            self.cache.set(cache_key, deepcopy(cache_value))
         
         return result
 
@@ -437,7 +443,7 @@ class TokenizerService:
             self._executor.shutdown(wait=True)
             self.logger.info("TokenizerService executor shutdown completed")
     
-    def _apply_post_processing_rules(self, tokens: List[str]) -> Tuple[List[str], List[str], List[Any]]:
+    def _apply_post_processing_rules(self, tokens: List[str], flags=None) -> Tuple[List[str], List[str], List[Any]]:
         """
         Apply post-processing rules to tokens.
         
@@ -450,13 +456,14 @@ class TokenizerService:
         processed_tokens = []
         token_traces = []  # List of TokenTrace objects
         traces = []
+        flags = flags or {}
         
         for token in tokens:
             original_token = token
             processed_token = token
             
             # Rule 1: Collapse double dots in initials (И.. → И.)
-            if self.fix_initials_double_dot:
+            if flags.get("fix_initials_double_dot", self.fix_initials_double_dot):
                 processed_token = self.collapse_double_dots(processed_token)
                 if processed_token != original_token:
                     # Create TokenTrace object for proper integration
@@ -481,7 +488,7 @@ class TokenizerService:
                     traces.append(trace_entry)
             
             # Rule 2: Preserve hyphenated names (add has_hyphen flag to metadata)
-            if self.preserve_hyphenated_case:
+            if flags.get("preserve_hyphenated_case", self.preserve_hyphenated_case):
                 if self._has_hyphen(token):
                     # Create TokenTrace object for hyphen preservation
                     from ...contracts.base_contracts import TokenTrace

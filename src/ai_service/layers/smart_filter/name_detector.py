@@ -1,3 +1,4 @@
+from ai_service.data.resources import PACKAGE_DATA_DIR
 """
 Simplified Name Detector
 
@@ -14,7 +15,7 @@ from pathlib import Path
 from ...data.dicts.smart_filter_patterns import SERVICE_WORDS
 
 # Load data from root data directory
-_data_dir = Path(__file__).parent.parent.parent.parent.parent / "data"
+_data_dir = PACKAGE_DATA_DIR
 
 # Load English nicknames
 with open(_data_dir / "lexicons" / "en_nicknames.json", "r", encoding="utf-8") as f:

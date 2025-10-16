@@ -68,7 +68,7 @@ class TestOrchestratorFactory:
         mock_smart_filter.initialize = AsyncMock()
         
         mock_variants_service = Mock()
-        mock_variants_service.initialize = AsyncMock()
+        mock_variants_service.initialize = Mock()
         
         mock_embeddings_service = Mock()
         mock_embeddings_service.initialize = AsyncMock()
@@ -91,7 +91,7 @@ class TestOrchestratorFactory:
             assert orchestrator.enable_embeddings is True
 
     @pytest.mark.asyncio
-    async def test_create_production_orchestrator(self):
+    async def test_create_production_orchestrator(self, monkeypatch):
         """Test creating production orchestrator with all services"""
         # Create async mock for validation service
         mock_validation_service = Mock()
@@ -101,7 +101,7 @@ class TestOrchestratorFactory:
         mock_smart_filter.initialize = AsyncMock()
         
         mock_variants_service = Mock()
-        mock_variants_service.initialize = AsyncMock()
+        mock_variants_service.initialize = Mock()
         
         mock_embeddings_service = Mock()
         mock_embeddings_service.initialize = AsyncMock()
@@ -117,6 +117,9 @@ class TestOrchestratorFactory:
         ), \
         patch('ai_service.layers.variants.variant_generation_service.VariantGenerationService', return_value=mock_variants_service), \
         patch('ai_service.layers.embeddings.embedding_service.EmbeddingService', return_value=mock_embeddings_service):
+            from ai_service.core.orchestrator_factory import SERVICE_CONFIG
+            monkeypatch.setattr(SERVICE_CONFIG, "enable_variants", True)
+            monkeypatch.setattr(SERVICE_CONFIG, "enable_embeddings", True)
             orchestrator = await OrchestratorFactory.create_production_orchestrator()
 
             assert isinstance(orchestrator, UnifiedOrchestrator)
@@ -207,7 +210,7 @@ class TestOrchestratorFactory:
         mock_smart_filter.initialize = AsyncMock()
         
         mock_variants = Mock()
-        mock_variants.initialize = AsyncMock()
+        mock_variants.initialize = Mock()
         
         mock_embeddings = Mock()
         mock_embeddings.initialize = AsyncMock()
@@ -241,7 +244,7 @@ class TestOrchestratorFactory:
         assert hasattr(OrchestratorFactory, 'create_orchestrator')
 
     @pytest.mark.asyncio
-    async def test_service_dependency_injection(self):
+    async def test_service_dependency_injection(self, monkeypatch):
         """Test that all required services are properly injected"""
         mock_services = {}
         service_classes = [
@@ -256,13 +259,16 @@ class TestOrchestratorFactory:
 
         # Mock locally imported services
         mock_variants_service = Mock()
-        mock_variants_service.initialize = AsyncMock()
+        mock_variants_service.initialize = Mock()
         mock_embeddings_service = Mock()
         mock_embeddings_service.initialize = AsyncMock()
 
         with patch.multiple('ai_service.core.orchestrator_factory', **mock_services), \
         patch('ai_service.layers.variants.variant_generation_service.VariantGenerationService', return_value=mock_variants_service), \
         patch('ai_service.layers.embeddings.embedding_service.EmbeddingService', return_value=mock_embeddings_service):
+            from ai_service.core.orchestrator_factory import SERVICE_CONFIG
+            monkeypatch.setattr(SERVICE_CONFIG, "enable_variants", True)
+            monkeypatch.setattr(SERVICE_CONFIG, "enable_embeddings", True)
             orchestrator = await OrchestratorFactory.create_production_orchestrator()
 
             # All services should be initialized for production orchestrator
@@ -280,17 +286,9 @@ class TestOrchestratorFactory:
 class TestOrchestratorFactoryIntegration:
     """Integration tests for OrchestratorFactory with real services"""
 
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_real_service_creation(self):
-        """Test creating orchestrator with real service instances"""
-        # This test would use real services - commented out for unit testing
-        # orchestrator = await OrchestratorFactory.create_testing_orchestrator()
-        # result = await orchestrator.process("Test text")
-        # assert result.success is True
-        pass
 
     @pytest.mark.asyncio
+    @pytest.mark.performance
     async def test_factory_performance(self):
         """Test factory performance with timing"""
         import time
@@ -309,9 +307,11 @@ class TestOrchestratorFactoryIntegration:
             SignalsService=Mock(return_value=Mock())
         ):
             start_time = time.time()
-            orchestrator = await OrchestratorFactory.create_testing_orchestrator()
+            orchestrator = await OrchestratorFactory.create_testing_orchestrator(
+                minimal=True
+            )
             creation_time = time.time() - start_time
 
-            # Factory should create orchestrator quickly (< 1 second)
+            # Core-only construction must remain fast and deterministic.
             assert creation_time < 1.0
             assert orchestrator is not None

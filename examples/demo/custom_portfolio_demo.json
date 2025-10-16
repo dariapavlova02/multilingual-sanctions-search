@@ -1,0 +1,24 @@
+{
+  "description": "Fictional records for the local portfolio demo. Not a sanctions list.",
+  "entries": [
+    {
+      "name": "John Smith",
+      "type": "person",
+      "aliases": ["John A. Smith"],
+      "birth_date": "1980-01-01",
+      "metadata": {"source_id": "demo-person-1", "synthetic": true}
+    },
+    {
+      "name": "Іван Петренко",
+      "type": "person",
+      "aliases": ["Ivan Petrenko", "Иван Петренко"],
+      "metadata": {"source_id": "demo-person-2", "synthetic": true}
+    },
+    {
+      "name": "Example Trading LLC",
+      "type": "organization",
+      "aliases": ["Example Trading"],
+      "metadata": {"source_id": "demo-company-1", "synthetic": true}
+    }
+  ]
+}

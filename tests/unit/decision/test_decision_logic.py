@@ -178,8 +178,8 @@ class TestDecisionLogic(unittest.TestCase):
     
     def test_is_excluded_text(self):
         """Test text exclusion patterns"""
-        # Numeric only
-        self.assertTrue(self.decision_logic._is_excluded_text("12345"))
+        # Numeric values can be sanctions identifiers and must reach Signals.
+        self.assertFalse(self.decision_logic._is_excluded_text("12345"))
         
         # Special characters only
         self.assertTrue(self.decision_logic._is_excluded_text("@#$%"))

@@ -1,0 +1,5 @@
+# Keep the vendor server/JDK intact and apply supported Ubuntu security updates.
+FROM docker.elastic.co/elasticsearch/elasticsearch:8.19.21@sha256:cbf5cd6cfe5532a9c02d510c66d238bf329cd51fe3d57170a2a880aca7d47419
+USER root
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+USER 1000:0

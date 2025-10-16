@@ -1,342 +1,141 @@
-"""
-Unit tests for search fallback logic.
+"""Fail-closed screening: dependency failures cannot select unrelated local data.
 
-Tests the fallback mechanisms when Elasticsearch is unavailable.
+Replaces the old success-on-outage expectations. Readiness uses real schema checks;
+only ES I/O, adapter responses and the embedding model are controlled here.
 """
 
 import asyncio
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from typing import List, Dict, Any
 
-from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-from src.ai_service.layers.search.config import HybridSearchConfig
-from src.ai_service.layers.search.contracts import SearchOpts, SearchMode, Candidate
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.layers.search.contracts import SearchMode, SearchOpts
+from ai_service.layers.search.hybrid_search_service import HybridSearchService
+from ai_service.layers.search.config import HybridSearchConfig
+from tests.search_service_support import candidate, normalized, search_service, assert_no_local_search
+
+MODES = [SearchMode.AC, SearchMode.FUZZY, SearchMode.VECTOR, SearchMode.HYBRID]
 
 
-class TestSearchFallbackLogic:
-    """Test cases for search fallback logic"""
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("fallback", [True, False])
+async def test_unavailable_source_fails_even_with_local_services(mode, fallback):
+    service = search_service(fallback=fallback)
+    client = await service._client_factory.get_client()
+    client.indices.get_mapping.side_effect = ConnectionError("Backend unavailable")
+    with pytest.raises(ConnectionError, match="Backend unavailable"):
+        await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=mode))
+    assert_no_local_search(service)
+    service._ac_adapter.search.assert_not_awaited()
+    service._vector_adapter.search.assert_not_awaited()
+    metrics = service.get_metrics()
+    assert (metrics.total_requests, metrics.successful_requests, metrics.failed_requests) == (1, 0, 1)
 
-    @pytest.fixture
-    def mock_config(self):
-        """Create a mock configuration for testing"""
-        return HybridSearchConfig(
-            elasticsearch={
-                "hosts": ["localhost:9200"],
-                "timeout": 10,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-                "verify_certs": False,
-                "ac_index": "test_ac",
-                "vector_index": "test_vector",
-                "smoke_test_timeout": 5
-            },
-            enable_fallback=True,
-            fallback_threshold=0.5,
-            fallback_timeout_ms=2000,
-            fallback_max_results=100,
-            enable_vector_fallback=True,
-            vector_fallback_threshold=0.4,
-            vector_fallback_timeout_ms=3000,
-            vector_fallback_max_results=50
-        )
 
-    @pytest.fixture
-    def mock_normalization_result(self):
-        """Create a mock normalization result for testing"""
-        return NormalizationResult(
-            normalized="test name",
-            tokens=["test", "name"],
-            trace=[],
-            errors=[],
-            language="en",
-            confidence=0.9,
-            original_length=9,
-            normalized_length=9,
-            token_count=2,
-            processing_time=0.1,
-            success=True
-        )
+@pytest.mark.parametrize("mode", [SearchMode.AC, SearchMode.VECTOR, SearchMode.HYBRID])
+@pytest.mark.parametrize("fallback", [True, False])
+@pytest.mark.parametrize("has_hits", [False, True])
+async def test_disconnected_adapter_response_is_not_a_completed_screening(mode, fallback, has_hits):
+    service = search_service(fallback=fallback)
+    adapter = service._vector_adapter if mode == SearchMode.VECTOR else service._ac_adapter
+    adapter._connected = False
+    adapter.search.return_value = [candidate(mode=mode)] if has_hits else []
+    with pytest.raises(RuntimeError, match="search is unavailable"):
+        await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=mode))
+    assert_no_local_search(service)
+    assert (await service.get_search_cache_stats())["cache_size"] == 0
 
-    @pytest.fixture
-    def mock_fallback_candidates(self):
-        """Create mock fallback search candidates"""
-        return [
-            Candidate(
-                doc_id="fallback_1",
-                score=0.85,
-                text="Fallback Test Name",
-                entity_type="person",
-                metadata={"dob": "1990-01-01"},
-                search_mode=SearchMode.FALLBACK_AC,
-                match_fields=["name"],
-                confidence=0.8
-            ),
-            Candidate(
-                doc_id="fallback_2",
-                score=0.75,
-                text="Fallback Test Name Variant",
-                entity_type="person",
-                metadata={"dob": "1990-01-01"},
-                search_mode=SearchMode.FALLBACK_VECTOR,
-                match_fields=["name"],
-                confidence=0.7
-            )
-        ]
 
-    @pytest.fixture
-    async def search_service_with_fallback(self, mock_config, mock_fallback_candidates):
-        """Create a HybridSearchService with fallback services"""
-        service = HybridSearchService(mock_config)
-        
-        # Mock the adapters (will fail)
-        service._ac_adapter = AsyncMock()
-        service._ac_adapter.search.side_effect = Exception("Elasticsearch unavailable")
-        service._ac_adapter._connected = False
-        
-        service._vector_adapter = AsyncMock()
-        service._vector_adapter.search.side_effect = Exception("Elasticsearch unavailable")
-        service._vector_adapter._connected = False
-        
-        # Mock the fallback services
-        service._fallback_watchlist_service = AsyncMock()
-        service._fallback_watchlist_service.search.return_value = mock_fallback_candidates[:1]
-        
-        service._fallback_vector_service = AsyncMock()
-        service._fallback_vector_service.search.return_value = mock_fallback_candidates[1:]
-        
-        # Mock the embedding service
-        service._embedding_service = AsyncMock()
-        service._embedding_service.generate_embedding.return_value = [0.1] * 384
-        
-        # Mock the client factory
-        service._client_factory = AsyncMock()
-        service._client_factory.health_check.return_value = {"status": "red"}
-        
-        # Initialize the service
-        service._initialized = True
-        
-        return service
+@pytest.mark.parametrize("mode", MODES)
+async def test_partial_stage_failure_discards_hits_and_does_not_cache(mode):
+    service = search_service()
+    async def incomplete_pages(*args, **kwargs):
+        yield [{"_id": "a", "_source": {"pattern": "Example Person", "entity_id": "a", "entity_type": "person", "source_list": "active-source"}}]
+        raise RuntimeError("Incomplete active source")
+    service._ac_adapter.iter_documents = incomplete_pages
+    if mode == SearchMode.AC:
+        service._ac_adapter.search.side_effect = RuntimeError("Incomplete active source")
+    elif mode == SearchMode.VECTOR:
+        service._vector_adapter.search.side_effect = RuntimeError("Incomplete active source")
+    # Hybrid receives no AC hits, then fails during its active fuzzy scan.
+    with pytest.raises(RuntimeError, match="search is unavailable"):
+        await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=mode))
+    assert_no_local_search(service)
+    assert (await service.get_search_cache_stats())["cache_size"] == 0
+    assert service.get_metrics().failed_requests == 1
 
-    @pytest.mark.asyncio
-    async def test_fallback_when_elasticsearch_unavailable(self, search_service_with_fallback, mock_normalization_result, mock_fallback_candidates):
-        """Test fallback when Elasticsearch is unavailable"""
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.7)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 1
-        assert result[0].search_mode == SearchMode.FALLBACK_AC
-        assert result[0].doc_id == "fallback_1"
-        assert result[0].score == 0.85
-        search_service_with_fallback._fallback_watchlist_service.search.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_vector_fallback_when_elasticsearch_unavailable(self, search_service_with_fallback, mock_normalization_result, mock_fallback_candidates):
-        """Test vector fallback when Elasticsearch is unavailable"""
-        opts = SearchOpts(search_mode=SearchMode.VECTOR, top_k=10, threshold=0.7)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 1
-        assert result[0].search_mode == SearchMode.FALLBACK_VECTOR
-        assert result[0].doc_id == "fallback_2"
-        assert result[0].score == 0.75
-        search_service_with_fallback._fallback_vector_service.search.assert_called_once()
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("has_hits", [False, True])
+async def test_warm_cache_cannot_bypass_source_outage(mode, has_hits):
+    service = search_service()
+    service._ac_adapter.search.return_value = [candidate()] if has_hits else []
+    service._vector_adapter.search.return_value = [candidate(mode=SearchMode.VECTOR)] if has_hits else []
+    # An AC document iterator also exercises a populated fuzzy cache.
+    async def pages(*args, **kwargs):
+        yield [{"_id": "active", "_source": {"pattern": "Example Person", "entity_id": "active", "entity_type": "person", "source_list": "active-source"}}] if has_hits else []
+    service._ac_adapter.iter_documents = pages
+    opts = SearchOpts(search_mode=mode)
+    first = await service.find_candidates(normalized(), "Example Person", opts)
+    second = await service.find_candidates(normalized(), "Example Person", opts)
+    assert first == second
+    assert bool(first) is has_hits
+    assert (await service.get_search_cache_stats())["cache_size"] == 1
+    client = await service._client_factory.get_client()
+    client.indices.get_mapping.side_effect = ConnectionError("Backend unavailable")
+    with pytest.raises(ConnectionError, match="Backend unavailable"):
+        await service.find_candidates(normalized(), "Example Person", opts)
+    assert_no_local_search(service)
+    metrics = service.get_metrics()
+    assert (metrics.total_requests, metrics.successful_requests, metrics.failed_requests) == (3, 2, 1)
 
-    @pytest.mark.asyncio
-    async def test_hybrid_fallback_when_elasticsearch_unavailable(self, search_service_with_fallback, mock_normalization_result, mock_fallback_candidates):
-        """Test hybrid fallback when Elasticsearch is unavailable"""
-        opts = SearchOpts(search_mode=SearchMode.HYBRID, top_k=10, threshold=0.7)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should have both AC and vector fallback results
-        assert len(result) == 2
-        search_modes = [c.search_mode for c in result]
-        assert SearchMode.FALLBACK_AC in search_modes
-        assert SearchMode.FALLBACK_VECTOR in search_modes
 
-    @pytest.mark.asyncio
-    async def test_fallback_threshold_filtering(self, search_service_with_fallback, mock_normalization_result):
-        """Test fallback results are filtered by threshold"""
-        # Create candidates with different scores
-        low_score_candidates = [
-            Candidate(
-                doc_id="low_1",
-                score=0.3,  # Below threshold
-                text="Low Score Name",
-                entity_type="person",
-                metadata={},
-                search_mode=SearchMode.FALLBACK_AC,
-                match_fields=["name"],
-                confidence=0.3
-            ),
-            Candidate(
-                doc_id="high_1",
-                score=0.8,  # Above threshold
-                text="High Score Name",
-                entity_type="person",
-                metadata={},
-                search_mode=SearchMode.FALLBACK_AC,
-                match_fields=["name"],
-                confidence=0.8
-            )
-        ]
-        
-        search_service_with_fallback._fallback_watchlist_service.search.return_value = low_score_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should only return high score candidate
-        assert len(result) == 1
-        assert result[0].score == 0.8
+@pytest.mark.parametrize("stage", ["readiness", "adapter", "embedding"])
+async def test_request_deadline_cancels_dependency_and_counts_one_failure(stage):
+    service = search_service()
+    cancelled = asyncio.Event()
+    async def stalled(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    mode = SearchMode.AC
+    if stage == "readiness":
+        service._client_factory.get_client.side_effect = stalled
+    elif stage == "adapter":
+        service._ac_adapter.search.side_effect = stalled
+    else:
+        service._embedding_service.encode_one_async.side_effect = stalled
+        mode = SearchMode.VECTOR
+    with pytest.raises(RuntimeError, match="exceeded its deadline"):
+        await asyncio.wait_for(service.find_candidates(normalized(), "Example Person",
+            SearchOpts(search_mode=mode, timeout_ms=100)), timeout=2)
+    assert cancelled.is_set()
+    assert_no_local_search(service)
+    metrics = service.get_metrics()
+    assert (metrics.total_requests, metrics.successful_requests, metrics.failed_requests) == (1, 0, 1)
+    assert (await service.get_search_cache_stats())["cache_size"] == 0
 
-    @pytest.mark.asyncio
-    async def test_fallback_max_results_limit(self, search_service_with_fallback, mock_normalization_result):
-        """Test fallback respects max results limit"""
-        # Create many candidates
-        many_candidates = [
-            Candidate(
-                doc_id=f"candidate_{i}",
-                score=0.8,
-                text=f"Name {i}",
-                entity_type="person",
-                metadata={},
-                search_mode=SearchMode.FALLBACK_AC,
-                match_fields=["name"],
-                confidence=0.8
-            )
-            for i in range(150)  # More than max_results (100)
-        ]
-        
-        search_service_with_fallback._fallback_watchlist_service.search.return_value = many_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should be limited to max_results
-        assert len(result) <= 100
 
-    @pytest.mark.asyncio
-    async def test_fallback_timeout_handling(self, search_service_with_fallback, mock_normalization_result):
-        """Test fallback timeout handling"""
-        # Mock slow fallback service
-        async def slow_search(*args, **kwargs):
-            await asyncio.sleep(0.1)  # Simulate slow response
-            return []
-        
-        search_service_with_fallback._fallback_watchlist_service.search.side_effect = slow_search
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should handle timeout gracefully
-        assert result == []
+@pytest.mark.parametrize("adapter_name", ["_ac_adapter", "_vector_adapter"])
+@pytest.mark.parametrize("state", [{"status": "unhealthy"}, {"status": "healthy", "connected": False}, {}, None])
+async def test_health_does_not_hide_adapter_failure(adapter_name, state):
+    service = search_service()
+    getattr(service, adapter_name).health_check.return_value = state
+    health = await service.health_check()
+    assert health["status"] == "unhealthy"
+    assert health["fallback_enabled"] is False
+    assert_no_local_search(service)
 
-    @pytest.mark.asyncio
-    async def test_fallback_service_unavailable(self, search_service_with_fallback, mock_normalization_result):
-        """Test when fallback services are unavailable"""
-        # Mock fallback service failure
-        search_service_with_fallback._fallback_watchlist_service.search.side_effect = Exception("Fallback service unavailable")
-        search_service_with_fallback._fallback_vector_service.search.side_effect = Exception("Fallback service unavailable")
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should return empty list when all services fail
-        assert result == []
 
-    @pytest.mark.asyncio
-    async def test_fallback_health_check(self, search_service_with_fallback):
-        """Test fallback service health check"""
-        # Mock health check responses
-        search_service_with_fallback._fallback_watchlist_service.health_check.return_value = {"status": "healthy"}
-        search_service_with_fallback._fallback_vector_service.health_check.return_value = {"status": "healthy"}
-        
-        health = await search_service_with_fallback.health_check()
-        
-        assert "fallback_services" in health
-        assert health["fallback_services"]["watchlist"]["status"] == "healthy"
-        assert health["fallback_services"]["vector"]["status"] == "healthy"
+async def test_health_before_initialization_is_not_healthy():
+    service = HybridSearchService(HybridSearchConfig())
+    health = await service.health_check()
+    assert health["status"] == "unhealthy"
+    assert health["initialized"] is False
 
-    @pytest.mark.asyncio
-    async def test_fallback_health_check_failure(self, search_service_with_fallback):
-        """Test fallback service health check failure"""
-        # Mock health check failure
-        search_service_with_fallback._fallback_watchlist_service.health_check.side_effect = Exception("Health check failed")
-        search_service_with_fallback._fallback_vector_service.health_check.side_effect = Exception("Health check failed")
-        
-        health = await search_service_with_fallback.health_check()
-        
-        assert "fallback_services" in health
-        assert health["fallback_services"]["watchlist"]["status"] == "error"
-        assert health["fallback_services"]["vector"]["status"] == "error"
 
-    @pytest.mark.asyncio
-    async def test_fallback_with_embedding_cache(self, search_service_with_fallback, mock_normalization_result):
-        """Test fallback with embedding cache"""
-        # First call should generate embedding
-        query_vector1 = await search_service_with_fallback._build_query_vector(mock_normalization_result, "test name")
-        
-        # Second call should use cache
-        query_vector2 = await search_service_with_fallback._build_query_vector(mock_normalization_result, "test name")
-        
-        assert query_vector1 == query_vector2
-        # Should only call embedding service once
-        search_service_with_fallback._embedding_service.generate_embedding.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_fallback_metrics_collection(self, search_service_with_fallback, mock_normalization_result, mock_fallback_candidates):
-        """Test fallback metrics collection"""
-        search_service_with_fallback._fallback_watchlist_service.search.return_value = mock_fallback_candidates[:1]
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Check that fallback metrics were updated
-        metrics = search_service_with_fallback.get_metrics()
-        assert metrics.fallback_requests > 0
-        assert metrics.avg_fallback_latency_ms > 0
-
-    @pytest.mark.asyncio
-    async def test_fallback_disabled(self, mock_config, mock_normalization_result):
-        """Test fallback when disabled"""
-        # Disable fallback
-        mock_config.enable_fallback = False
-        
-        service = HybridSearchService(mock_config)
-        
-        # Mock the adapters (will fail)
-        service._ac_adapter = AsyncMock()
-        service._ac_adapter.search.side_effect = Exception("Elasticsearch unavailable")
-        service._ac_adapter._connected = False
-        
-        # Mock the fallback services (should not be called)
-        service._fallback_watchlist_service = AsyncMock()
-        service._fallback_vector_service = AsyncMock()
-        
-        service._initialized = True
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-        result = await service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should return empty list when fallback is disabled
-        assert result == []
-        
-        # Fallback services should not be called
-        service._fallback_watchlist_service.search.assert_not_called()
-        service._fallback_vector_service.search.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_fallback_error_logging(self, search_service_with_fallback, mock_normalization_result):
-        """Test fallback error logging"""
-        # Mock fallback service failure
-        search_service_with_fallback._fallback_watchlist_service.search.side_effect = Exception("Fallback service error")
-        
-        with patch('src.ai_service.layers.search.hybrid_search_service.get_logger') as mock_logger:
-            opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.5)
-            result = await search_service_with_fallback.find_candidates(mock_normalization_result, "test name", opts)
-            
-            # Should log the error
-            mock_logger.return_value.error.assert_called()
-            assert result == []
+@pytest.mark.parametrize("adapter_name", ["_ac_adapter", "_vector_adapter"])
+async def test_health_with_missing_required_adapter_is_not_healthy(adapter_name):
+    service = search_service()
+    setattr(service, adapter_name, None)
+    assert (await service.health_check())["status"] == "unhealthy"

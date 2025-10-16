@@ -1,8 +1,8 @@
 """Smoke tests for role tagger and organizational context detection."""
 
 import pytest
-from src.ai_service.layers.normalization.lexicon_loader import Lexicons
-from src.ai_service.layers.normalization.role_tagger import RoleTagger, TokenRole
+from ai_service.layers.normalization.lexicon_loader import Lexicons
+from ai_service.layers.normalization.role_tagger import RoleTagger, TokenRole
 
 
 class TestRoleTaggerAndContext:

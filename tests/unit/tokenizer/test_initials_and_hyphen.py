@@ -4,7 +4,7 @@ Unit tests for TokenizerService initials and hyphen handling.
 """
 
 import pytest
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService
+from ai_service.layers.normalization.tokenizer_service import TokenizerService
 
 
 class TestTokenizerServiceInitialsAndHyphen:
@@ -73,7 +73,7 @@ class TestTokenizerServiceInitialsAndHyphen:
         tokenizer = TokenizerService(fix_initials_double_dot=True)
         
         tokens = ["И..", "Петрова-Сидорова", "А.", "В..."]
-        processed_tokens, traces = tokenizer._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = tokenizer._apply_post_processing_rules(tokens)
         
         # Check processed tokens
         assert processed_tokens == ["И.", "Петрова-Сидорова", "А.", "В."]
@@ -88,7 +88,7 @@ class TestTokenizerServiceInitialsAndHyphen:
         tokenizer = TokenizerService(fix_initials_double_dot=False)
         
         tokens = ["И..", "Петрова-Сидорова", "А.", "В..."]
-        processed_tokens, traces = tokenizer._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = tokenizer._apply_post_processing_rules(tokens)
         
         # Check processed tokens (should not change double dots)
         assert processed_tokens == ["И..", "Петрова-Сидорова", "А.", "В..."]
@@ -102,7 +102,7 @@ class TestTokenizerServiceInitialsAndHyphen:
         tokenizer = TokenizerService(preserve_hyphenated_case=False)
         
         tokens = ["И..", "Петрова-Сидорова", "А.", "В..."]
-        processed_tokens, traces = tokenizer._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = tokenizer._apply_post_processing_rules(tokens)
         
         # Check processed tokens
         assert processed_tokens == ["И.", "Петрова-Сидорова", "А.", "В."]
@@ -163,16 +163,16 @@ class TestTokenizerServiceInitialsAndHyphen:
         tokenizer = TokenizerService()
         
         # Empty tokens
-        tokens, traces = tokenizer._apply_post_processing_rules([])
+        tokens, traces, _token_traces = tokenizer._apply_post_processing_rules([])
         assert tokens == []
         assert traces == []
         
         # Single character tokens
-        tokens, traces = tokenizer._apply_post_processing_rules(["a", "1", "."])
+        tokens, traces, _token_traces = tokenizer._apply_post_processing_rules(["a", "1", "."])
         assert tokens == ["a", "1", "."]
         assert traces == []
         
         # Mixed case initials
-        tokens, traces = tokenizer._apply_post_processing_rules(["и..", "А..", "в..."])
+        tokens, traces, _token_traces = tokenizer._apply_post_processing_rules(["и..", "А..", "в..."])
         assert tokens == ["и.", "А.", "в."]
         assert len(traces) == 3

@@ -5,7 +5,7 @@ Unit tests for LanguageDetectionService
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
+from ai_service.layers.language.language_detection_service import LanguageDetectionService
 
 
 class TestLanguageDetectionService:

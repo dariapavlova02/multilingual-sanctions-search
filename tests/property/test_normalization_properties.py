@@ -16,8 +16,8 @@ import pytest
 from hypothesis import given, settings, strategies as st, HealthCheck
 from hypothesis.strategies import composite, text, lists, one_of, sampled_from
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.contracts.base_contracts import NormalizationResult, TokenTrace
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.contracts.base_contracts import NormalizationResult, TokenTrace
 
 
 # ============================================================================

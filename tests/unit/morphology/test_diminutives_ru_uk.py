@@ -2,8 +2,8 @@
 
 import pytest
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.utils.feature_flags import get_feature_flag_manager
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.utils.feature_flags import get_feature_flag_manager
 
 
 @pytest.fixture(autouse=True)

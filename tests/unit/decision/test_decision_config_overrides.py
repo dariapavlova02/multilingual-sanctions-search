@@ -9,9 +9,9 @@ import os
 import pytest
 from unittest.mock import patch
 
-from src.ai_service.config.settings import DecisionConfig, DECISION_CONFIG
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+from ai_service.config.settings import DecisionConfig, DECISION_CONFIG
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
 
 
 class TestDecisionConfigOverrides:
@@ -130,7 +130,7 @@ class TestDecisionConfigOverrides:
         with patch.dict(os.environ, {'AI_DECISION__THR_HIGH': '0.9'}):
             # Re-import to get fresh config with ENV overrides
             import importlib
-            from src.ai_service.config import settings
+            from ai_service.config import settings
             importlib.reload(settings)
             
             assert settings.DECISION_CONFIG.thr_high == 0.9
@@ -153,8 +153,8 @@ class TestDecisionConfigOverrides:
         with patch.dict(os.environ, {'AI_DECISION__THR_HIGH': '0.9'}):
             # Re-import to get fresh config with ENV overrides
             import importlib
-            from src.ai_service.config import settings
-            from src.ai_service.core.decision_engine import DecisionEngine
+            from ai_service.config import settings
+            from ai_service.core.decision_engine import DecisionEngine
             importlib.reload(settings)
             
             # Create custom config

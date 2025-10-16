@@ -1,120 +1,111 @@
-version: '3.8'
-
+# Supported topology: one host and one API replica. Terminate public TLS upstream.
 services:
-  ai-service:
+  elasticsearch:
+    image: ${SANCTIONS_ES_IMAGE:-hybrid-sanctions-elasticsearch:local}
     build:
       context: .
-      dockerfile: Dockerfile.prod
-    container_name: ai-service-prod
-    command: /bin/sh -c "python -m uvicorn src.ai_service.main:app --host 0.0.0.0 --port 8000"
-    ports:
-      - "${PROJECT_IP:-192.168.6.11}:8001:8000"
+      dockerfile: Dockerfile.elasticsearch
     environment:
-      - APP_ENV=production
-      - WORKERS=4
-      - DEBUG=false
-      # Project IP configuration
-      - PROJECT_IP=${PROJECT_IP:-192.168.6.11}
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - ENABLE_ELASTICSEARCH_AUTH=false
-      # 🔒 SECURITY: CRITICAL environment variables
-      - ES_HOST=${ES_HOST:-elasticsearch}
-      - ES_PORT=${ES_PORT:-9200}
-      - ES_USERNAME=${ES_USERNAME:-}
-      - ES_PASSWORD=${ES_PASSWORD:-}
-      - ES_SCHEME=${ES_SCHEME:-http}
-      - ES_VERIFY_CERTS=${ES_VERIFY_CERTS:-false}
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
-      - ENABLE_SEARCH_CACHE=true
-      - SEARCH_CACHE_SIZE=2000
-      - QUERY_CACHE_SIZE=5000
-      # Critical escalation settings
-      - ENABLE_SEARCH=true
-      - SEARCH_ESCALATION_THRESHOLD=0.6
-      - VECTOR_SEARCH_THRESHOLD=0.3
-      - ENABLE_VECTOR_FALLBACK=true
-      # Elasticsearch index configuration
-      - ES_INDEX_PREFIX=sanctions
-      - ES_AC_INDEX=sanctions_ac_patterns
-      - ES_VECTOR_INDEX=sanctions_vectors
-      # Force reload sanctions for debugging
-      - FORCE_RELOAD_SANCTIONS=true
-      # Enable ES-based fuzzy search for better performance
-      - ENABLE_ES_FUZZY_SEARCH=true
-    env_file:
-      - .env.production
-    volumes:
-      - ./logs:/app/logs
-      - ./src/ai_service/data:/app/src/ai_service/data:ro
-      - ./.env.production:/app/.env.production:ro
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: elasticsearch-prod
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.enrollment.enabled=false
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-      - cluster.name=ai-service-cluster
-      - node.name=ai-service-node
-    ports:
-      - "${PROJECT_IP:-192.168.6.11}:9200:9200"
-      - "${PROJECT_IP:-192.168.6.11}:9300:9300"
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      xpack.security.enrollment.enabled: "false"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?Set a dedicated Elasticsearch administrator password}
+      ES_JAVA_OPTS: -Xms256m -Xmx256m
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
+    networks: [backend]
+    mem_limit: 768m
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      test: [CMD-SHELL, 'curl --silent --fail --user "elastic:$${ELASTIC_PASSWORD}" http://localhost:9200/_cluster/health > /dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 12
       start_period: 60s
-    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
 
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
-    container_name: kibana-prod
+  provision:
+    image: ${SANCTIONS_IMAGE:-hybrid-sanctions:local}
+    build: .
+    entrypoint: [python, -m, ai_service.scripts.provision_elasticsearch]
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - SERVER_NAME=kibana
-    ports:
-      - "5601:5601"
+      ES_HOSTS: http://elasticsearch:9200
+      ES_USERNAME: elastic
+      ES_PASSWORD: ${ELASTIC_PASSWORD:?Set Elasticsearch administrator password}
+      ES_SERVICE_USERNAME: sanctions_service
+      ES_SERVICE_PASSWORD: ${ES_SERVICE_PASSWORD:?Set a distinct service password of at least 32 characters}
+      ES_INDEX_PREFIX: ${ES_INDEX_PREFIX:-sanctions}
+    networks: [backend]
     depends_on:
-      elasticsearch:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles:
-      - monitoring
+      elasticsearch: {condition: service_healthy}
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    mem_limit: 256m
 
-  nginx:
-    image: nginx:alpine
-    container_name: nginx-prod
+  ai-service:
+    image: ${SANCTIONS_IMAGE:-hybrid-sanctions:local}
+    build: .
     ports:
-      - "${PROJECT_IP:-192.168.6.11}:80:80"
-      - "${PROJECT_IP:-192.168.6.11}:443:443"
+      - "127.0.0.1:${API_PORT:-8001}:8000"
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      ENABLE_SEARCH: "true"
+      ENABLE_EMBEDDINGS: "true"
+      ENABLE_VARIANTS: ${ENABLE_VARIANTS:-true}
+      ES_HOSTS: http://elasticsearch:9200
+      ES_USERNAME: sanctions_service
+      ES_PASSWORD: ${ES_SERVICE_PASSWORD:?Set a dedicated service password}
+      ES_INDEX_PREFIX: ${ES_INDEX_PREFIX:-sanctions}
+      ES_STARTUP_TIMEOUT: "90"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set a random admin API key of at least 32 characters}
+      APP_STATE_DIR: /app/state
+      XDG_CACHE_HOME: /app/cache
+      CORS_ORIGINS: ${CORS_ORIGINS:-[]}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-27262976}
+      HTTP_MAX_INFLIGHT: ${HTTP_MAX_INFLIGHT:-4}
+      HTTP_BODY_TIMEOUT_SECONDS: ${HTTP_BODY_TIMEOUT_SECONDS:-30}
+      HTTP_PROCESSING_TIMEOUT_SECONDS: ${HTTP_PROCESSING_TIMEOUT_SECONDS:-30}
+      EMBEDDING_MAX_PENDING: ${EMBEDDING_MAX_PENDING:-16}
+      EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
+      INGESTION_VERIFY_TIMEOUT_SECONDS: ${INGESTION_VERIFY_TIMEOUT_SECONDS:-300}
+      VARIANTS_MAX_PENDING: ${VARIANTS_MAX_PENDING:-16}
+      VARIANTS_TIMEOUT_SECONDS: ${VARIANTS_TIMEOUT_SECONDS:-30}
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-    environment:
-      - PROJECT_IP=${PROJECT_IP:-192.168.6.11}
+      - ingestion_state:/app/state
+      - application_cache:/app/cache
+      - application_logs:/app/logs
+    networks: [backend, frontend]
     depends_on:
-      - ai-service
+      provision: {condition: service_completed_successfully}
     restart: unless-stopped
-    profiles:
-      - nginx
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    mem_limit: ${API_MEMORY_LIMIT_BYTES:-2147483648}
+    healthcheck:
+      test: [CMD, python, -m, ai_service.scripts.healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
 
+networks:
+  backend: {internal: true}
+  frontend: {}
 volumes:
-  elasticsearch_data:
-    driver: local
+  elasticsearch_data: {}
+  ingestion_state: {}
+  application_cache: {}
+  application_logs: {}

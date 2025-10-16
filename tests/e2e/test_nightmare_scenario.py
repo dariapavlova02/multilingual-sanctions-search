@@ -7,7 +7,7 @@ import pytest
 import asyncio
 from typing import Set
 
-from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator
+from ai_service.core.unified_orchestrator import UnifiedOrchestrator
 
 
 class TestNightmareScenario:

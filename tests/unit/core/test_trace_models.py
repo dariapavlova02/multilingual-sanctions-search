@@ -3,7 +3,7 @@ Unit tests for search trace models.
 """
 
 import pytest
-from src.ai_service.contracts.trace_models import (
+from ai_service.contracts.trace_models import (
     SearchStage,
     SearchTrace,
     SearchTraceBuilder,

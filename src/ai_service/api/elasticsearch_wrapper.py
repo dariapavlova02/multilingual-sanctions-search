@@ -26,17 +26,12 @@ class SimpleElasticsearchClient:
         self._closed = False
 
         if ELASTICSEARCH_AVAILABLE:
-            # Get Elasticsearch URL from environment
-            es_host = os.environ.get('ELASTICSEARCH_HOST', 'localhost')
-            es_port = int(os.environ.get('ELASTICSEARCH_PORT', '9200'))
-            es_url = f"http://{es_host}:{es_port}"
+            from ..layers.search.config import HybridSearchConfig
+            from ..layers.search.elasticsearch_client import build_client_kwargs
 
-            # Simple client configuration without deprecated parameters
-            self.client = AsyncElasticsearch(
-                hosts=[es_url],
-                verify_certs=False,
-                timeout=30
-            )
+            self.config = HybridSearchConfig.from_env()
+            self.client = AsyncElasticsearch(**build_client_kwargs(self.config.elasticsearch))
+
         else:
             raise ImportError("elasticsearch package not available")
 

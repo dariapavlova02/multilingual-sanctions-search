@@ -7,7 +7,7 @@ with proper tracing and conversion.
 """
 
 import pytest
-from src.ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
+from ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
 
 
 class TestRussianYoPolicy:

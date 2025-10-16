@@ -5,7 +5,7 @@ Unit tests for VariantGenerationService
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 
-from src.ai_service.layers.variants.variant_generation_service import VariantGenerationService
+from ai_service.layers.variants.variant_generation_service import VariantGenerationService
 
 
 class TestVariantGenerationService:
@@ -390,7 +390,7 @@ class TestVariantGenerationService:
     
     def test_variant_scores_match_config(self, variant_generation_service):
         """Тест что скоры вариантов соответствуют конфигурации VARIANT_SCORES"""
-        from config import VARIANT_SCORES
+        from ai_service.constants import VARIANT_SCORES
         
         # Arrange
         test_name = "Тест"

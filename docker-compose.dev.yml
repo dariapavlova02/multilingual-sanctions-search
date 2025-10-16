@@ -1,0 +1,9 @@
+# Use together with docker-compose.yml; this overrides the one API service.
+services:
+  ai-service:
+    environment:
+      PYTHONPATH: /app/src
+      APP_ENV: development
+    volumes:
+      - ./src:/app/src:ro
+    command: [python, -m, uvicorn, ai_service.main:app, --host, "0.0.0.0", --port, "8000", --reload, --reload-dir, /app/src]

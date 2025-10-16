@@ -1,313 +1,175 @@
-"""
-Unit tests for HybridSearchService.
+"""Public search behavior with current client, model and trace contracts."""
 
-Tests the core functionality of the hybrid search service including
-AC search, vector search, hybrid search, and fallback mechanisms.
-"""
+from dataclasses import replace
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
-from typing import List, Dict, Any
 
-from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-from src.ai_service.layers.search.config import HybridSearchConfig
-from src.ai_service.layers.search.contracts import SearchOpts, SearchMode, Candidate
-from src.ai_service.contracts.base_contracts import NormalizationResult
-from src.ai_service.exceptions import ServiceInitializationError
+from ai_service.contracts.trace_models import SearchTrace
+from ai_service.exceptions import AIServiceException
+from ai_service.layers.search.config import HybridSearchConfig
+from ai_service.layers.search.contracts import SearchMode, SearchOpts
+from ai_service.layers.search.hybrid_search_service import HybridSearchService
+from tests.search_service_support import candidate, normalized, search_service, assert_no_local_search
 
 
 class TestHybridSearchService:
-    """Test cases for HybridSearchService"""
-
     @pytest.fixture
-    def mock_config(self):
-        """Create a mock configuration for testing"""
-        return HybridSearchConfig(
-            elasticsearch={
-                "hosts": ["localhost:9200"],
-                "timeout": 10,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-                "verify_certs": False,
-                "ac_index": "test_ac",
-                "vector_index": "test_vector",
-                "smoke_test_timeout": 5
-            },
-            enable_fallback=True,
-            fallback_threshold=0.5,
-            vector_dimension=384,
-            vector_similarity_threshold=0.7,
-            enable_embedding_cache=True,
-            embedding_cache_size=100,
-            embedding_cache_ttl_seconds=3600
-        )
+    def service(self):
+        return search_service()
 
-    @pytest.fixture
-    def mock_normalization_result(self):
-        """Create a mock normalization result for testing"""
-        return NormalizationResult(
-            normalized="test name",
-            tokens=["test", "name"],
-            trace=[],
-            errors=[],
-            language="en",
-            confidence=0.9,
-            original_length=9,
-            normalized_length=9,
-            token_count=2,
-            processing_time=0.1,
-            success=True
-        )
+    def test_initialization_success(self):
+        prefix = "ai_service.layers.search.hybrid_search_service."
+        with patch(prefix + "ElasticsearchClientFactory") as factory, \
+                patch(prefix + "ElasticsearchACAdapter") as ac, \
+                patch(prefix + "ElasticsearchVectorAdapter") as vector:
+            service = HybridSearchService(HybridSearchConfig())
+            service.initialize()
+            service.initialize()
+            assert service.is_initialized()
+            factory.assert_called_once()
+            ac.assert_called_once_with(service.config, client_factory=factory.return_value)
+            vector.assert_called_once_with(service.config, client_factory=factory.return_value)
 
-    @pytest.fixture
-    def mock_candidates(self):
-        """Create mock search candidates for testing"""
-        return [
-            Candidate(
-                doc_id="1",
-                score=0.95,
-                text="Test Name",
-                entity_type="person",
-                metadata={"dob": "1990-01-01"},
-                search_mode=SearchMode.AC,
-                match_fields=["name"],
-                confidence=0.9
-            ),
-            Candidate(
-                doc_id="2",
-                score=0.85,
-                text="Test Name Variant",
-                entity_type="person",
-                metadata={"dob": "1990-01-01"},
-                search_mode=SearchMode.VECTOR,
-                match_fields=["name"],
-                confidence=0.8
-            )
+    def test_initialization_failure(self):
+        with patch("ai_service.layers.search.hybrid_search_service.ElasticsearchClientFactory",
+                   side_effect=ConnectionError("Backend unavailable")):
+            service = HybridSearchService(HybridSearchConfig())
+            with pytest.raises(AIServiceException, match="initialization failed"):
+                service.initialize()
+            assert not service.is_initialized()
+
+    async def test_find_candidates_ac_mode(self, service):
+        service._ac_adapter.search.return_value = [candidate("a", 0.95), candidate("b", 0.85)]
+        opts = SearchOpts(search_mode=SearchMode.AC)
+        result = await service.find_candidates(normalized(), "Example Person", opts)
+        assert [(r.doc_id, r.score, r.search_mode) for r in result] == [
+            ("a", 0.95, SearchMode.AC), ("b", 0.85, SearchMode.AC),
         ]
+        service._ac_adapter.search.assert_awaited_once_with(
+            query="Example Person", opts=opts, index_name="test_ac",
+        )
+        service._vector_adapter.search.assert_not_awaited()
+        assert_no_local_search(service)
 
-    @pytest.fixture
-    async def search_service(self, mock_config):
-        """Create a HybridSearchService instance for testing"""
-        service = HybridSearchService(mock_config)
-        
-        # Mock the adapters
-        service._ac_adapter = AsyncMock()
-        service._vector_adapter = AsyncMock()
-        service._client_factory = AsyncMock()
-        
-        # Mock the fallback services
-        service._fallback_watchlist_service = AsyncMock()
-        service._fallback_vector_service = AsyncMock()
-        
-        # Mock the embedding service
-        service._embedding_service = AsyncMock()
-        service._embedding_service.generate_embedding.return_value = [0.1] * 384
-        
-        # Mock the metrics service
-        service.metrics_service = AsyncMock()
-        
-        # Initialize the service
-        service._initialized = True
-        
-        return service
+    async def test_find_candidates_vector_mode(self, service):
+        service._vector_adapter.search.return_value = [candidate("v", 0.85, SearchMode.VECTOR)]
+        opts = SearchOpts(search_mode=SearchMode.VECTOR)
+        result = await service.find_candidates(normalized(), "Example Person", opts)
+        assert [(r.doc_id, r.score, r.search_mode) for r in result] == [("v", 0.85, SearchMode.VECTOR)]
+        service._embedding_service.encode_one_async.assert_awaited_once_with("Example Person")
+        service._vector_adapter.search.assert_awaited_once_with(
+            query=[0.1] * 384, opts=opts, index_name="test_vector",
+        )
+        assert_no_local_search(service)
 
-    @pytest.mark.asyncio
-    async def test_initialization_success(self, mock_config):
-        """Test successful service initialization"""
-        with patch('src.ai_service.layers.search.hybrid_search_service.ElasticsearchClientFactory') as mock_factory:
-            with patch('src.ai_service.layers.search.hybrid_search_service.ElasticsearchACAdapter') as mock_ac:
-                with patch('src.ai_service.layers.search.hybrid_search_service.ElasticsearchVectorAdapter') as mock_vector:
-                    service = HybridSearchService(mock_config)
-                    await service.initialize()
-                    
-                    assert service._initialized is True
-                    assert service._ac_adapter is not None
-                    assert service._vector_adapter is not None
+    async def test_find_candidates_hybrid_mode(self, service):
+        # AC is accepted but below the escalation threshold; the active fuzzy scan is empty.
+        service._ac_adapter.search.return_value = [candidate("a", 0.75)]
+        service._vector_adapter.search.return_value = [candidate("v", 0.85, SearchMode.VECTOR)]
+        opts = SearchOpts(search_mode=SearchMode.HYBRID, escalation_threshold=0.9)
+        result = await service.find_candidates(normalized(), "Example Person", opts)
+        assert [(r.doc_id, r.search_mode) for r in result] == [
+            ("v", SearchMode.VECTOR), ("a", SearchMode.AC),
+        ]
+        assert service.get_metrics().escalation_triggered == 1
+        assert_no_local_search(service)
 
-    @pytest.mark.asyncio
-    async def test_initialization_failure(self, mock_config):
-        """Test service initialization failure"""
-        with patch('src.ai_service.layers.search.hybrid_search_service.ElasticsearchClientFactory') as mock_factory:
-            mock_factory.side_effect = Exception("Connection failed")
-            
-            service = HybridSearchService(mock_config)
-            
-            with pytest.raises(ServiceInitializationError):
-                await service.initialize()
+    async def test_fallback_search(self, service):
+        """A failed active query must never select a different local source."""
+        service._ac_adapter.search.side_effect = ConnectionError("Elasticsearch unavailable")
+        with pytest.raises(RuntimeError, match="search is unavailable"):
+            await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=SearchMode.AC))
+        assert_no_local_search(service)
 
-    @pytest.mark.asyncio
-    async def test_find_candidates_ac_mode(self, search_service, mock_normalization_result, mock_candidates):
-        """Test AC search mode"""
-        # Mock AC adapter response
-        search_service._ac_adapter.search.return_value = mock_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.7)
-        result = await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 2
-        assert result[0].search_mode == SearchMode.AC
-        assert result[0].score == 0.95
-        search_service._ac_adapter.search.assert_called_once()
+    async def test_embedding_cache(self, service):
+        first = await service._build_query_vector(normalized(), "Example Person")
+        second = await service._build_query_vector(normalized(), "Example Person")
+        assert first == second == [0.1] * 384
+        service._embedding_service.encode_one_async.assert_awaited_once_with("Example Person")
+        # A new encoder cannot silently query the existing index with another
+        # vector space, whether the old query vector is cached or not.
+        from ai_service.config import EmbeddingConfig
+        service._embedding_service.config = EmbeddingConfig(revision="a" * 40)
+        with pytest.raises(RuntimeError, match="Embedding provider contract"):
+            await service._build_query_vector(normalized(), "Example Person")
+        service._embedding_service.encode_one_async.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_find_candidates_vector_mode(self, search_service, mock_normalization_result, mock_candidates):
-        """Test vector search mode"""
-        # Mock vector adapter response
-        search_service._vector_adapter.search.return_value = mock_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.VECTOR, top_k=10, threshold=0.7)
-        result = await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 2
-        assert result[1].search_mode == SearchMode.VECTOR
-        assert result[1].score == 0.85
-        search_service._vector_adapter.search.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_find_candidates_hybrid_mode(self, search_service, mock_normalization_result, mock_candidates):
-        """Test hybrid search mode"""
-        # Mock both adapters
-        search_service._ac_adapter.search.return_value = mock_candidates[:1]
-        search_service._vector_adapter.search.return_value = mock_candidates[1:]
-        
-        opts = SearchOpts(search_mode=SearchMode.HYBRID, top_k=10, threshold=0.7)
-        result = await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 2
-        # Should have both AC and vector results
-        search_modes = [c.search_mode for c in result]
-        assert SearchMode.AC in search_modes
-        assert SearchMode.VECTOR in search_modes
-
-    @pytest.mark.asyncio
-    async def test_fallback_search(self, search_service, mock_normalization_result, mock_candidates):
-        """Test fallback search when Elasticsearch is unavailable"""
-        # Mock AC adapter failure
-        search_service._ac_adapter.search.side_effect = Exception("Elasticsearch unavailable")
-        search_service._ac_adapter._connected = False
-        
-        # Mock fallback service
-        search_service._fallback_watchlist_service.search.return_value = mock_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.7)
-        result = await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        assert len(result) == 2
-        search_service._fallback_watchlist_service.search.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_embedding_cache(self, search_service, mock_normalization_result):
-        """Test embedding caching functionality"""
-        # First call should generate embedding
-        query_vector1 = await search_service._build_query_vector(mock_normalization_result, "test name")
-        
-        # Second call should use cache
-        query_vector2 = await search_service._build_query_vector(mock_normalization_result, "test name")
-        
-        assert query_vector1 == query_vector2
-        # Should only call embedding service once
-        search_service._embedding_service.generate_embedding.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_health_check(self, search_service):
-        """Test health check functionality"""
-        # Mock health check responses
-        search_service._ac_adapter.health_check.return_value = {"status": "healthy"}
-        search_service._vector_adapter.health_check.return_value = {"status": "healthy"}
-        search_service._client_factory.health_check.return_value = {"status": "green"}
-        
-        health = await search_service.health_check()
-        
+    async def test_health_check(self, service):
+        health = await service.health_check()
         assert health["status"] == "healthy"
-        assert "elasticsearch" in health
-        assert "adapters" in health
-        assert "fallback_services" in health
-        assert "embedding_cache" in health
+        assert health["ac_adapter"]["status"] == "healthy"
+        assert health["vector_adapter"]["status"] == "healthy"
+        assert health["embedding_cache"]["cache_size"] == 0
+        assert health["fallback_enabled"] is False
 
-    @pytest.mark.asyncio
-    async def test_metrics_collection(self, search_service, mock_normalization_result, mock_candidates):
-        """Test metrics collection"""
-        # Mock AC adapter response
-        search_service._ac_adapter.search.return_value = mock_candidates
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.7)
-        await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Check that metrics were updated
-        metrics = search_service.get_metrics()
-        assert metrics.total_requests > 0
-        assert metrics.ac_requests > 0
+    async def test_metrics_collection(self, service):
+        service._ac_adapter.search.return_value = [candidate()]
+        for _ in range(2):
+            await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=SearchMode.AC))
+        metrics = service.get_metrics()
+        assert (metrics.total_requests, metrics.successful_requests, metrics.failed_requests) == (2, 2, 0)
+        assert metrics.ac_requests == 1  # The second request uses a verified cache entry.
         assert metrics.avg_hybrid_latency_ms > 0
 
-    @pytest.mark.asyncio
-    async def test_error_handling(self, search_service, mock_normalization_result):
-        """Test error handling in search operations"""
-        # Mock adapter failure
-        search_service._ac_adapter.search.side_effect = Exception("Search failed")
-        search_service._fallback_watchlist_service.search.side_effect = Exception("Fallback failed")
-        
-        opts = SearchOpts(search_mode=SearchMode.AC, top_k=10, threshold=0.7)
-        result = await search_service.find_candidates(mock_normalization_result, "test name", opts)
-        
-        # Should return empty list on error
-        assert result == []
+    async def test_error_handling(self, service):
+        service._ac_adapter.search.side_effect = ValueError("Malformed response")
+        with pytest.raises(RuntimeError, match="search is unavailable") as exc:
+            await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=SearchMode.AC))
+        assert isinstance(exc.value.__cause__, ValueError)
+        assert_no_local_search(service)
+        assert (await service.get_search_cache_stats())["cache_size"] == 0
 
-    @pytest.mark.asyncio
-    async def test_configuration_validation(self, mock_config):
-        """Test configuration validation"""
-        # Test valid configuration
-        service = HybridSearchService(mock_config)
-        assert service.config == mock_config
-        
-        # Test invalid configuration
-        invalid_config = HybridSearchConfig(
-            elasticsearch={
-                "hosts": [],  # Invalid: empty hosts
-                "timeout": 10,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-                "verify_certs": False,
-                "ac_index": "test_ac",
-                "vector_index": "test_vector",
-                "smoke_test_timeout": 5
-            }
-        )
-        
-        with pytest.raises(ValueError):
-            service = HybridSearchService(invalid_config)
+    def test_configuration_validation(self):
+        config = HybridSearchConfig()
+        service = HybridSearchService(config)
+        assert service.config == config
+        assert service.config is not config
+        with pytest.raises(ValueError, match="hosts"):
+            HybridSearchConfig(elasticsearch={"hosts": []})
 
-    @pytest.mark.asyncio
-    async def test_clear_embedding_cache(self, search_service):
-        """Test embedding cache clearing"""
-        # Add some items to cache
-        await search_service._build_query_vector(
-            NormalizationResult(
-                normalized="test1", tokens=["test1"], trace=[], errors=[],
-                language="en", confidence=0.9, original_length=5, normalized_length=5,
-                token_count=1, processing_time=0.1, success=True
-            ),
-            "test1"
-        )
-        
-        # Clear cache
-        await search_service.clear_embedding_cache()
-        
-        # Cache should be empty
-        stats = await search_service.get_embedding_cache_stats()
-        assert stats["cache_size"] == 0
+    async def test_clear_embedding_cache(self, service):
+        await service._build_query_vector(normalized(), "Example Person")
+        assert (await service.get_embedding_cache_stats())["cache_size"] == 1
+        await service.clear_embedding_cache()
+        assert (await service.get_embedding_cache_stats())["cache_size"] == 0
+        await service._build_query_vector(normalized(), "Example Person")
+        assert service._embedding_service.encode_one_async.await_count == 2
 
-    def test_search_trace_creation(self, search_service):
-        """Test search trace creation and management"""
-        from src.ai_service.layers.search.hybrid_search_service import SearchTrace
-        
-        trace = SearchTrace(query="test", mode=SearchMode.AC)
-        assert trace.query == "test"
-        assert trace.mode == SearchMode.AC
-        assert trace.enabled is True
-        
-        # Test trace finalization
-        trace.finalize(100.0, 5)
-        assert trace.total_time_ms == 100.0
-        assert trace.total_hits == 5
+    async def test_search_trace_creation(self, service):
+        service._ac_adapter.search.return_value = [candidate()]
+        trace = SearchTrace(enabled=True)
+        await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=SearchMode.AC), trace)
+        steps = trace.get_stage_steps("AC")
+        assert len(steps) == 1
+        assert steps[0].query == "Example Person"
+        assert steps[0].hits[0].doc_id == "active"
+        assert trace.to_dict()["total_hits"] == 1
+        assert trace.get_total_time_ms() >= 0
+
+    async def test_threshold_top_k_and_entity_filters_use_active_results(self, service):
+        service._ac_adapter.search.return_value = [
+            candidate("below", 0.4), candidate("a", 0.8), candidate("b", 0.9),
+            replace(candidate("organization", 0.99), entity_type="organization"),
+        ]
+        result = await service.find_candidates(normalized(), "Example Person",
+            SearchOpts(search_mode=SearchMode.AC, threshold=0.7, top_k=1, entity_types=["person"]))
+        assert [r.doc_id for r in result] == ["b"]
+        assert_no_local_search(service)
+
+    @pytest.mark.parametrize("vector", [[0.0] * 384, [0.1] * 383, [float("nan")] * 384, [float("inf")] * 384])
+    async def test_invalid_embedding_is_not_cached_or_searched(self, service, vector):
+        service._embedding_service.encode_one_async.return_value = vector
+        with pytest.raises(RuntimeError, match="search is unavailable"):
+            await service.find_candidates(normalized(), "Example Person", SearchOpts(search_mode=SearchMode.VECTOR))
+        service._vector_adapter.search.assert_not_awaited()
+        assert (await service.get_embedding_cache_stats())["cache_size"] == 0
+        assert_no_local_search(service)
+
+    async def test_expired_embedding_is_rebuilt(self, service):
+        await service._build_query_vector(normalized(), "Example Person")
+        key = next(iter(service._embedding_cache))
+        service._embedding_cache[key] = ([0.2] * 384, datetime.now() - timedelta(days=2))
+        assert await service._build_query_vector(normalized(), "Example Person") == [0.1] * 384
+        assert service._embedding_service.encode_one_async.await_count == 2

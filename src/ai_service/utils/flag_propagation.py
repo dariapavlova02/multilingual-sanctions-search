@@ -70,6 +70,9 @@ class FlagPropagator:
             config.enable_nameparser_en = context.flags.enable_nameparser_en
             if context.flags.enable_nameparser_en:
                 context.add_reason("nameparser_en: enabled English nameparser")
+
+        if hasattr(config, 'enable_en_nicknames'):
+            config.enable_en_nicknames = context.flags.enable_en_nicknames
         
         if hasattr(config, 'strict_stopwords'):
             config.strict_stopwords = context.flags.strict_stopwords

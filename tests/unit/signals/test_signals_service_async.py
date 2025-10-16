@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.signals.signals_service import SignalsService
+from ai_service.layers.signals.signals_service import SignalsService
 
 
 class TestSignalsServiceAsync:

@@ -10,11 +10,11 @@ import pytest
 import asyncio
 from typing import List, Dict, Any
 
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, 
     NormalizationConfig
 )
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestEnglishTitles:

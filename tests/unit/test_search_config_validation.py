@@ -5,7 +5,7 @@ Unit tests for SearchConfig validation
 import pytest
 from pydantic import ValidationError
 
-from src.ai_service.config.settings import SearchConfig
+from ai_service.config.settings import SearchConfig
 
 
 class TestSearchConfigValidation:

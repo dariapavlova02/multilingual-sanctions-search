@@ -4,11 +4,11 @@ Unit tests for SearchTrace integration in decision engine and orchestrator.
 
 import pytest
 from unittest.mock import Mock, patch
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator
-from src.ai_service.contracts.trace_models import SearchTrace, SearchTraceBuilder
-from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.core.unified_orchestrator import UnifiedOrchestrator
+from ai_service.contracts.trace_models import SearchTrace, SearchTraceBuilder
+from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestSearchTraceIntegration:

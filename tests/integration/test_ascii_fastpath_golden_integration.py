@@ -2,7 +2,7 @@
 Integration tests for ASCII fastpath with golden test cases.
 
 This module tests ASCII fastpath against golden test cases to ensure
-100% semantic compatibility in shadow mode.
+semantic compatibility in a controlled side-by-side comparison.
 """
 
 import json
@@ -11,11 +11,11 @@ import asyncio
 from pathlib import Path
 from typing import List, Dict, Any
 
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, 
     NormalizationConfig
 )
-from src.ai_service.utils.ascii_utils import is_ascii_name
+from ai_service.utils.ascii_utils import is_ascii_name
 
 
 class TestAsciiFastpathGoldenIntegration:

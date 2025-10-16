@@ -8,7 +8,8 @@ entities and integrates with the normalization process.
 
 import pytest
 from unittest.mock import Mock, patch
-from src.ai_service.layers.normalization.ner_gateways.spacy_ru import SpacyRuNER, NERHints, NEREntity
+from ai_service.layers.normalization.ner_gateways.spacy_ru import SpacyRuNER, NERHints, NEREntity
+from ai_service.layers.normalization.ner_gateways.unified_spacy_gateway import UnifiedSpacyGateway, SupportedLanguage
 
 
 class TestRussianNER:
@@ -17,27 +18,27 @@ class TestRussianNER:
     @pytest.fixture
     def mock_spacy_ru_ner(self):
         """Create a mock Russian NER instance."""
-        ner = SpacyRuNER()
-        ner._model_available = True
+        ner = SpacyRuNER(UnifiedSpacyGateway())
+        ner.gateway._availability[SupportedLanguage.RUSSIAN] = True
         return ner
     
     def test_ner_initialization_without_model(self):
         """Test NER initialization when model is not available."""
         with patch('spacy.load') as mock_load:
             mock_load.side_effect = OSError("Model not found")
-            ner = SpacyRuNER()
+            ner = SpacyRuNER(UnifiedSpacyGateway())
             
             assert not ner.is_available
-            assert ner._model is None
+            assert not ner.gateway.get_model_info()["ru"]["loaded"]
     
     def test_ner_initialization_with_model(self):
         """Test NER initialization when model is available."""
         mock_model = Mock()
         with patch('spacy.load', return_value=mock_model):
-            ner = SpacyRuNER()
+            ner = SpacyRuNER(UnifiedSpacyGateway())
             
             assert ner.is_available
-            assert ner._model == mock_model
+            assert ner.gateway._models[SupportedLanguage.RUSSIAN] == mock_model
     
     def test_extract_entities_person(self, mock_spacy_ru_ner):
         """Test extraction of person entities."""
@@ -50,8 +51,8 @@ class TestRussianNER:
         mock_ent.end_char = 11
         mock_doc.ents = [mock_ent]
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         hints = mock_spacy_ru_ner.extract_entities("Иван Петров работает в компании")
         
@@ -70,17 +71,17 @@ class TestRussianNER:
         mock_ent.text = "ООО Рога и копыта"
         mock_ent.label_ = "ORG"
         mock_ent.start_char = 0
-        mock_ent.end_char = 16
+        mock_ent.end_char = 17
         mock_doc.ents = [mock_ent]
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         hints = mock_spacy_ru_ner.extract_entities("ООО Рога и копыта - это компания")
         
         assert len(hints.person_spans) == 0
         assert len(hints.org_spans) == 1
-        assert hints.org_spans[0] == (0, 16)
+        assert hints.org_spans[0] == (0, 17)
         assert len(hints.entities) == 1
         assert hints.entities[0].text == "ООО Рога и копыта"
         assert hints.entities[0].label == "ORG"
@@ -98,13 +99,13 @@ class TestRussianNER:
         mock_org = Mock()
         mock_org.text = "ООО Рога и копыта"
         mock_org.label_ = "ORG"
-        mock_org.start_char = 20
-        mock_org.end_char = 36
+        mock_org.start_char = 23
+        mock_org.end_char = 40
         
         mock_doc.ents = [mock_person, mock_org]
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         hints = mock_spacy_ru_ner.extract_entities("Иван Петров работает в ООО Рога и копыта")
         
@@ -112,7 +113,7 @@ class TestRussianNER:
         assert len(hints.org_spans) == 1
         assert len(hints.entities) == 2
         assert hints.person_spans[0] == (0, 11)
-        assert hints.org_spans[0] == (20, 36)
+        assert hints.org_spans[0] == (23, 40)
     
     def test_extract_entities_no_entities(self, mock_spacy_ru_ner):
         """Test extraction when no entities are found."""
@@ -120,8 +121,8 @@ class TestRussianNER:
         mock_doc = Mock()
         mock_doc.ents = []
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         hints = mock_spacy_ru_ner.extract_entities("Обычный текст без именованных сущностей")
         
@@ -147,8 +148,8 @@ class TestRussianNER:
     
     def test_extract_entities_model_not_available(self):
         """Test extraction when model is not available."""
-        ner = SpacyRuNER()
-        ner._model_available = False
+        ner = SpacyRuNER(UnifiedSpacyGateway())
+        ner.gateway._availability[SupportedLanguage.RUSSIAN] = False
         
         hints = ner.extract_entities("Иван Петров")
         
@@ -158,8 +159,8 @@ class TestRussianNER:
     
     def test_extract_entities_exception_handling(self, mock_spacy_ru_ner):
         """Test that exceptions during extraction are handled gracefully."""
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.side_effect = Exception("spaCy error")
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].side_effect = Exception("spaCy error")
         
         hints = mock_spacy_ru_ner.extract_entities("Иван Петров")
         
@@ -178,8 +179,8 @@ class TestRussianNER:
         mock_ent.end_char = 11
         mock_doc.ents = [mock_ent]
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         entity = mock_spacy_ru_ner.get_entity_at_position("Иван Петров работает", 0, 11)
         
@@ -195,8 +196,8 @@ class TestRussianNER:
         mock_doc = Mock()
         mock_doc.ents = []
         
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.return_value = mock_doc
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].return_value = mock_doc
         
         entity = mock_spacy_ru_ner.get_entity_at_position("Обычный текст", 0, 5)
         
@@ -204,8 +205,8 @@ class TestRussianNER:
     
     def test_get_entity_at_position_model_not_available(self):
         """Test getting entity when model is not available."""
-        ner = SpacyRuNER()
-        ner._model_available = False
+        ner = SpacyRuNER(UnifiedSpacyGateway())
+        ner.gateway._availability[SupportedLanguage.RUSSIAN] = False
         
         entity = ner.get_entity_at_position("Иван Петров", 0, 5)
         
@@ -213,8 +214,8 @@ class TestRussianNER:
     
     def test_get_entity_at_position_exception_handling(self, mock_spacy_ru_ner):
         """Test that exceptions during position lookup are handled gracefully."""
-        mock_spacy_ru_ner._model = Mock()
-        mock_spacy_ru_ner._model.side_effect = Exception("spaCy error")
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN] = Mock()
+        mock_spacy_ru_ner.gateway._models[SupportedLanguage.RUSSIAN].side_effect = Exception("spaCy error")
         
         entity = mock_spacy_ru_ner.get_entity_at_position("Иван Петров", 0, 5)
         
@@ -255,7 +256,7 @@ class TestRussianNER:
     
     def test_singleton_pattern(self):
         """Test that NER follows singleton pattern."""
-        from src.ai_service.layers.normalization.ner_gateways.spacy_ru import get_spacy_ru_ner, clear_spacy_ru_ner
+        from ai_service.layers.normalization.ner_gateways.spacy_ru import get_spacy_ru_ner, clear_spacy_ru_ner
         
         # Clear any existing instance
         clear_spacy_ru_ner()

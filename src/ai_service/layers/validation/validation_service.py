@@ -68,16 +68,5 @@ class ValidationService(ValidationServiceInterface):
             }
 
         except Exception as e:
-            text_preview = text[:50] if text else "None"
-            logger.error(f"Validation failed for text: {text_preview}... Error: {e}")
-            # Safe fallback: basic sanitization
-            sanitized = text.strip()[:1000] if text else ""
-
-            return {
-                "sanitized_text": sanitized,
-                "should_process": len(sanitized) > 0,
-                "warnings": [f"Validation error: {str(e)}"],
-                "blocked_patterns": [],
-                "risk_level": "unknown",
-                "is_valid": len(sanitized) > 0,
-            }
+            logger.error("Input validation failed")
+            raise RuntimeError("Input validation is unavailable") from e

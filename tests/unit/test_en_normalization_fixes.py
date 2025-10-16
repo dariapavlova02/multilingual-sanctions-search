@@ -11,8 +11,8 @@ Tests the four key behaviors:
 
 import pytest
 import asyncio
-from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestENNormalizationFixes:
@@ -27,7 +27,7 @@ class TestENNormalizationFixes:
         """Test that hyphenated surnames are preserved when nameparser is unavailable."""
         # Mock nameparser as unavailable
         with pytest.MonkeyPatch().context() as m:
-            m.setattr("src.ai_service.layers.normalization.nameparser_adapter.NAMEPARSER_AVAILABLE", False)
+            m.setattr("ai_service.layers.normalization.nameparser_adapter.NAMEPARSER_AVAILABLE", False)
             
             config = NormalizationConfig(
                 language="en",

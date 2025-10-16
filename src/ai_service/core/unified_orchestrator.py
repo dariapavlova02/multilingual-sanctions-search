@@ -18,11 +18,20 @@ Layers implemented:
 """
 
 import asyncio
+import logging
 import time
+import unicodedata
+import uuid
+from copy import deepcopy
+from ..data.patterns.identifiers import get_compiled_patterns_cached, normalize_identifier
+from ..layers.search.search_integrity import TAX_IDENTIFIER_TYPES, metadata_matches, source_identity, source_tax_ids
+from ..utils.source_text_view import without_format_controls
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 from ..config import SERVICE_CONFIG
-from ..utils.feature_flags import FeatureFlags
+from ..utils.feature_flags import FeatureFlags, get_feature_flag_manager, validated_feature_flags, merge_feature_flags
 from ..contracts.base_contracts import (
     EmbeddingsServiceInterface,
     LanguageDetectionInterface,
@@ -94,7 +103,7 @@ class UnifiedOrchestrator:
         enable_variants: Optional[bool] = None,
         enable_embeddings: Optional[bool] = None,
         enable_decision_engine: Optional[bool] = None,
-        enable_search: Optional[bool] = None,
+        enable_search: Optional[bool] = False,
         allow_smart_filter_skip: Optional[bool] = None,
     ):
         # Validate required services are not None
@@ -121,8 +130,13 @@ class UnifiedOrchestrator:
         self.metrics_service = metrics_service
         self.search_service = search_service
 
-        # Auto-initialize search service if enabled but not provided
-        if self.search_service is None and SERVICE_CONFIG.enable_search:
+        # Auto-initialize search only when this orchestrator instance enables it.
+        # Using the global setting here made explicitly minimal/test instances
+        # connect to Elasticsearch during construction.
+        requested_search = (
+            enable_search if enable_search is not None else SERVICE_CONFIG.enable_search
+        )
+        if self.search_service is None and requested_search:
             try:
                 from ai_service.layers.search.hybrid_search_service import HybridSearchService
                 from ai_service.layers.search.config import HybridSearchConfig
@@ -135,26 +149,19 @@ class UnifiedOrchestrator:
 
                 logger.info("[OK] Auto-initialized HybridSearchService (search enabled, no service provided)")
             except Exception as e:
-                logger.warning(f"[ERROR] Failed to auto-initialize HybridSearchService: {e}")
-                logger.info("[PROGRESS] Falling back to MockSearchService for development/testing")
+                raise ServiceInitializationError("Configured search service could not initialize") from e
 
-                # Fallback to MockSearchService
-                try:
-                    from ai_service.layers.search.mock_search_service import MockSearchService
-                    self.search_service = MockSearchService()
-                    self.search_service.initialize()
-                    logger.info("[OK] MockSearchService initialized successfully - search escalation available")
-                except Exception as mock_e:
-                    logger.error(f"[ERROR] Critical: Failed to initialize MockSearchService: {mock_e}")
-                    self.search_service = None
-
-        self.default_feature_flags = default_feature_flags or FeatureFlags()
+        self.default_feature_flags = (
+            validated_feature_flags(default_feature_flags)
+            if default_feature_flags is not None else get_feature_flag_manager().get_flags()
+        )
 
         # Initialize homoglyph detector for search query normalization
         self.homoglyph_detector = HomoglyphDetector()
 
         # Legacy compatibility attributes for old tests
         self.cache_service = getattr(self, "cache_service", None)
+        self._cache_namespace = uuid.uuid4().hex
         self.embedding_service = getattr(self, "embedding_service", None) or embeddings_service
         self.signal_service = getattr(self, "signal_service", None) or signals_service
         self.pattern_service = getattr(self, "pattern_service", None)
@@ -410,18 +417,6 @@ class UnifiedOrchestrator:
             logger.debug(f"Metrics not available in normalization layer: {e}")
             metrics = None
 
-        # Align legacy flags with feature flag directives
-        remove_stop_words = feature_flags.strict_stopwords
-        if feature_flags.preserve_hyphenated_case:
-            preserve_names = True
-
-        # Conditional morphology for performance optimization
-        token_count = len(text_u.split()) if text_u else 0
-        if token_count <= 2 and len(text_u) < 15:
-            # Skip heavy morphology for very short inputs
-            enable_advanced_features = False
-            logger.debug(f"Skipping morphology for short text: {token_count} tokens, {len(text_u)} chars")
-
         # Use unicode-normalized text for normalization
         norm_start = time.time()
         norm_result = await self._maybe_await(self.normalization_service.normalize_async(
@@ -489,7 +484,7 @@ class UnifiedOrchestrator:
             metrics = None
 
         signals_result = await self._maybe_await(self.signals_service.extract_signals(
-            text=text_u, normalization_result=norm_result, language=context.language  # Use unicode-normalized text
+            text=context.original_text, normalization_result=norm_result, language=context.language
         ))
 
         # Debug logging
@@ -530,11 +525,18 @@ class UnifiedOrchestrator:
             layer_start = time.time()
             try:
                 if self.variants_service is not None:
-                    variants = await self._maybe_await(self.variants_service.generate_variants(
-                        norm_result.normalized, context.language
-                    ))
+                    import inspect
+                    generate_async = getattr(self.variants_service, "generate_variants_async", None)
+                    if inspect.iscoroutinefunction(generate_async):
+                        generated = await generate_async(norm_result.normalized, context.language)
+                    else:
+                        generated = await self._maybe_await(self.variants_service.generate_variants(
+                            norm_result.normalized, context.language))
+                    variants = generated.get("variants") if isinstance(generated, dict) else generated
+                    if not isinstance(variants, list) or any(not isinstance(value, str) for value in variants):
+                        raise ValueError("Variant generation returned an invalid list")
                 else:
-                    logger.debug("Variants service not available - skipping variant generation")
+                    raise RuntimeError("Requested variant generation is unavailable")
                 if self.metrics_service:
                     self.metrics_service.record_timer('processing.layer.variants', time.time() - layer_start)
                     if variants:
@@ -543,7 +545,8 @@ class UnifiedOrchestrator:
                 logger.warning(f"Variant generation failed: {e}")
                 if self.metrics_service:
                     self.metrics_service.record_counter('processing.variants.failed', 1)
-                errors.append(f"Variants: {str(e)}")
+                variants = None
+                errors.append(f"Variant generation failed ({type(e).__name__})")
 
         return variants
 
@@ -569,11 +572,19 @@ class UnifiedOrchestrator:
             layer_start = time.time()
             try:
                 if self.embeddings_service is not None:
-                    embeddings = await self._maybe_await(self.embeddings_service.generate_embeddings(
-                        norm_result.normalized
-                    ))
+                    import inspect
+                    generate = self.embeddings_service.generate_embeddings
+                    generate_async = getattr(self.embeddings_service, "generate_embeddings_async", None)
+                    if inspect.iscoroutinefunction(generate_async):
+                        embeddings = await generate_async(norm_result.normalized)
+                    elif inspect.iscoroutinefunction(generate):
+                        embeddings = await generate(norm_result.normalized)
+                    else:
+                        embeddings = await asyncio.to_thread(generate, norm_result.normalized)
+                    if not embeddings:
+                        raise RuntimeError("Embedding generation returned no vector")
                 else:
-                    logger.debug("Embeddings service not available - skipping embedding generation")
+                    raise RuntimeError("Requested embedding generation is unavailable")
                 if self.metrics_service:
                     self.metrics_service.record_timer('processing.layer.embeddings', time.time() - layer_start)
                     if embeddings is not None:
@@ -582,7 +593,8 @@ class UnifiedOrchestrator:
                 logger.warning(f"Embedding generation failed: {e}")
                 if self.metrics_service:
                     self.metrics_service.record_counter('processing.embeddings.failed', 1)
-                errors.append(f"Embeddings: {str(e)}")
+                embeddings = None
+                errors.append(f"Embedding generation failed ({type(e).__name__})")
 
         return embeddings
 
@@ -593,7 +605,8 @@ class UnifiedOrchestrator:
         errors: list,
         original_text: str,
         search_trace: Optional[SearchTrace] = None,
-        signals_result: Optional[Any] = None
+        signals_result: Optional[Any] = None,
+        search_options: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Handle Layer 9: Search (optional)
@@ -637,12 +650,12 @@ class UnifiedOrchestrator:
                             query = best_org.core
                             if hasattr(best_org, 'legal_form') and best_org.legal_form:
                                 query = f"{best_org.core} {best_org.legal_form}"
-                            print(f"🏢 ORG SEARCH: Using organization parts as query: '{query}'")
+                            logger.debug("%s", " ".join(map(str, [f"🏢 ORG SEARCH: Using organization parts as query: '{query}'"])))
 
                     # Fallback to original text if no org parts
                     if not query.strip():
                         query = original_text
-                        print(f"[CHECK] FALLBACK SEARCH: Using original text as query: '{query}'")
+                        logger.debug("%s", " ".join(map(str, [f"[CHECK] FALLBACK SEARCH: Using original text as query: '{query}'"])))
 
                 # ENHANCED: Check for homoglyphs and generate permutations for better detection
                 search_queries = [query]  # Default to original query
@@ -659,43 +672,54 @@ class UnifiedOrchestrator:
                             query = normalized_query
                             is_homoglyph_case = True
                             logger.warning(f"🔧 HOMOGLYPH NORMALIZATION FOR SEARCH: '{original_query}' → '{query}' (transformations: {len(transformations)})")
-                            print(f"🔧 HOMOGLYPH SEARCH: '{original_query}' → '{query}' - normalized for search")
+                            logger.debug("%s", " ".join(map(str, [f"🔧 HOMOGLYPH SEARCH: '{original_query}' → '{query}' - normalized for search"])))
 
                             # Generate permutations for improved detection
                             from ..utils.name_permutations import generate_homoglyph_permutations
                             search_queries = generate_homoglyph_permutations(original_query, normalized_query)
-                            print(f"[PROGRESS] HOMOGLYPH PERMUTATIONS: Trying {len(search_queries)} variants: {search_queries}")
+                            logger.debug("%s", " ".join(map(str, [f"[PROGRESS] HOMOGLYPH PERMUTATIONS: Trying {len(search_queries)} variants: {search_queries}"])))
                         else:
                             logger.debug("Homoglyphs detected but no normalization needed")
                     else:
                         logger.debug("No homoglyphs detected in search query")
-                print(f"[CHECK] SEARCH DEBUG: query='{query}', search_service={self.search_service is not None}, SearchOpts={SearchOpts is not None}")
+                logger.debug("%s", " ".join(map(str, [f"[CHECK] SEARCH DEBUG: query='{query}', search_service={self.search_service is not None}, SearchOpts={SearchOpts is not None}"])))
 
                 if query.strip() and SearchOpts:
-                    print(f"[INIT] CALLING SEARCH: query='{query.strip()}'")
-                    search_opts = SearchOpts(
+                    logger.debug("%s", " ".join(map(str, [f"[INIT] CALLING SEARCH: query='{query.strip()}'"])))
+                    search_opts = search_options or SearchOpts(
                         top_k=10,
                         threshold=0.7,
                         enable_escalation=True,
-                        escalation_threshold=0.6
+                        escalation_threshold=0.6,
                     )
-                    print(f"🔧 SEARCH OPTS: escalation={search_opts.enable_escalation}, threshold={search_opts.escalation_threshold}")
+                    logger.debug("%s", " ".join(map(str, [f"🔧 SEARCH OPTS: escalation={search_opts.enable_escalation}, threshold={search_opts.escalation_threshold}"])))
 
                     search_start_time = time.time()
                     candidates = []
+
+                    require_vectors = search_opts.search_mode.value not in {"ac", "fuzzy"}
+                    dataset_version = await self.search_service.readiness(require_vectors=require_vectors)
 
                     # Check for sanctioned IDs first (critical security check)
                     id_candidates = await self._search_by_extracted_ids(signals_result, search_opts)
                     if id_candidates:
                         candidates.extend(id_candidates)
-                        print(f"🚨 SANCTIONED ID DETECTED: {len(id_candidates)} matches found")
+                        logger.debug("%s", " ".join(map(str, [f"🚨 SANCTIONED ID DETECTED: {len(id_candidates)} matches found"])))
 
-                    # Enhanced search with homoglyph permutations
-                    if self.search_service:
+                    # Identifier-only inputs have no semantic name to embed. Require
+                    # complete source-span coverage before omitting name retrieval.
+                    identifier_only = not norm_result.normalized.strip() and self._has_only_identifier_evidence(
+                        original_text, signals_result
+                    )
+                    if identifier_only:
+                        search_processing_time = (time.time() - search_start_time) * 1000
+                        if search_trace:
+                            search_trace.note("Identifier-only input: exact identifier screening completed")
+                    elif self.search_service:
                         try:
                             if is_homoglyph_case and len(search_queries) > 1:
                                 # Try all permutations for homoglyph cases
-                                print(f"[PROGRESS] HOMOGLYPH MULTI-SEARCH: Trying {len(search_queries)} permutations")
+                                logger.debug("%s", " ".join(map(str, [f"[PROGRESS] HOMOGLYPH MULTI-SEARCH: Trying {len(search_queries)} permutations"])))
                                 all_results = []
                                 best_candidates = []
                                 best_score = 0.0
@@ -708,81 +732,72 @@ class UnifiedOrchestrator:
                                         perm_candidates = await self.search_service.find_candidates(
                                             normalized=modified_norm_result,
                                             text=original_text,
-                                            opts=search_opts
+                                            opts=search_opts,
+                                            search_trace=search_trace,
                                         )
 
                                         if perm_candidates:
+                                            all_results.extend(perm_candidates)
                                             # Get best score from this permutation
                                             max_score = max((getattr(c, 'score', 0.0) or getattr(c, 'final_score', 0.0))
                                                           for c in perm_candidates)
-                                            print(f"   Permutation {i+1}: '{search_query}' → {len(perm_candidates)} results, best score: {max_score:.3f}")
+                                            logger.debug("%s", " ".join(map(str, [f"   Permutation {i+1}: '{search_query}' → {len(perm_candidates)} results, best score: {max_score:.3f}"])))
 
                                             # Keep best results
                                             if max_score > best_score:
                                                 best_score = max_score
                                                 best_candidates = perm_candidates
-                                                print(f"   🏆 NEW BEST: '{search_query}' with score {max_score:.3f}")
+                                                logger.debug("%s", " ".join(map(str, [f"   🏆 NEW BEST: '{search_query}' with score {max_score:.3f}"])))
                                         else:
-                                            print(f"   Permutation {i+1}: '{search_query}' → No results")
+                                            logger.debug("%s", " ".join(map(str, [f"   Permutation {i+1}: '{search_query}' → No results"])))
 
                                     except Exception as perm_e:
-                                        print(f"   Permutation {i+1}: '{search_query}' → Error: {perm_e}")
+                                        raise RuntimeError("A required search permutation failed") from perm_e
 
-                                candidates.extend(best_candidates)
-                                print(f"[OK] HOMOGLYPH SEARCH COMPLETED: {len(best_candidates)} candidates, best score: {best_score:.3f}")
+                                candidates.extend(all_results)
+                                logger.debug("%s", " ".join(map(str, [f"[OK] HOMOGLYPH SEARCH COMPLETED: {len(best_candidates)} candidates, best score: {best_score:.3f}"])))
                             else:
                                 # Normal search
                                 name_candidates = await self.search_service.find_candidates(
                                     normalized=norm_result,
                                     text=original_text,
-                                    opts=search_opts
+                                    opts=search_opts,
+                                            search_trace=search_trace,
                                 )
                                 candidates.extend(name_candidates)
-                                print(f"[OK] NORMAL SEARCH COMPLETED: {len(name_candidates)} candidates")
+                                logger.debug("%s", " ".join(map(str, [f"[OK] NORMAL SEARCH COMPLETED: {len(name_candidates)} candidates"])))
 
                             search_processing_time = (time.time() - search_start_time) * 1000
-                            print(f"[OK] FULL SEARCH COMPLETED: {len(candidates) - len(id_candidates)} name candidates + {len(id_candidates)} ID candidates in {search_processing_time:.2f}ms")
+                            logger.debug("%s", " ".join(map(str, [f"[OK] FULL SEARCH COMPLETED: {len(candidates) - len(id_candidates)} name candidates + {len(id_candidates)} ID candidates in {search_processing_time:.2f}ms"])))
                         except Exception as e:
                             search_processing_time = (time.time() - search_start_time) * 1000
-                            print(f"[ERROR] FULL SEARCH FAILED: {e} after {search_processing_time:.2f}ms")
-                            # Keep ID candidates even if name search fails
+                            logger.debug("%s", " ".join(map(str, [f"[ERROR] FULL SEARCH FAILED: {e} after {search_processing_time:.2f}ms"])))
+                            raise RuntimeError("Name screening is unavailable") from e
                     else:
-                        print(f"[WARN] SEARCH SERVICE IS NONE - using fallback fuzzy search")
+                        logger.debug("%s", " ".join(map(str, [f"[WARN] SEARCH SERVICE IS NONE - using fallback fuzzy search"])))
                         search_processing_time = (time.time() - search_start_time) * 1000
 
-                    # Fallback fuzzy search for critical names
-                    if len(candidates) == 0:
-                        candidates = self._emergency_fuzzy_search(query, original_text)
-                        if len(candidates) > 0:
-                            print(f"[TARGET] EMERGENCY FUZZY FOUND: {len(candidates)} matches for '{query}'")
-
-                    # Convert candidates to the expected search_results format
-                    search_results = {
-                        "query": query,
-                        "results": [candidate.to_dict() if hasattr(candidate, 'to_dict') else candidate for candidate in candidates],
-                        "total_hits": len(candidates),
-                        "search_type": "hybrid",
-                        "processing_time_ms": search_processing_time
-                    }
+                    await self.search_service._verify_dataset_version(dataset_version, require_vectors=require_vectors)
+                    serialized = [candidate.to_dict() if hasattr(candidate, "to_dict") else candidate for candidate in candidates]
+                    if search_opts.entity_types:
+                        serialized = [candidate for candidate in serialized if candidate.get("entity_type") in search_opts.entity_types]
+                    serialized = [candidate for candidate in serialized if metadata_matches(
+                        candidate.get("doc_id"), candidate.get("metadata", {}), search_opts.metadata_filters or {}
+                    )]
+                    unique = {}
+                    for candidate in serialized:
+                        identity = source_identity(candidate.get("doc_id"), candidate.get("entity_type"), candidate.get("metadata", {}))
+                        if identity not in unique or candidate.get("confidence", 0) > unique[identity].get("confidence", 0):
+                            unique[identity] = candidate
+                    serialized = sorted(unique.values(), key=lambda item: (-item.get("confidence", 0), item.get("doc_id", "")))[:search_opts.top_k]
+                    search_results = {"query": query, "results": serialized,
+                                      "total_hits": len(serialized),
+                                      "search_type": search_opts.search_mode.value,
+                                      "processing_time_ms": search_processing_time}
 
                     # Add search trace if available
                     if search_trace and search_trace.enabled:
-                        search_results["trace"] = {
-                            "steps": [
-                                {
-                                    "stage": getattr(step, 'stage', step.get('stage', '')),
-                                    "query": getattr(step, 'query', step.get('query', '')),
-                                    "took_ms": getattr(step, 'took_ms', step.get('took_ms', 0)),
-                                    "hits_count": len(getattr(step, 'hits', step.get('hits', []))),
-                                    "best_score": max((hit.score if hasattr(hit, 'score') else hit.get('score', 0) for hit in getattr(step, 'hits', step.get('hits', []))), default=0.0),
-                                    "meta": getattr(step, 'meta', step.get('meta', {}))
-                                }
-                                for step in search_trace.steps
-                            ],
-                            "total_time_ms": search_trace.get_total_time_ms(),
-                            "total_hits": search_trace.get_hit_count(),
-                            "notes": search_trace.notes
-                        }
+                        search_results["trace"] = search_trace.to_dict()
 
                     if search_trace:
                         result_count = search_results.get('total_hits', 0) if search_results else 0
@@ -877,7 +892,7 @@ class UnifiedOrchestrator:
         )
 
         # Run decision engine if enabled
-        if self.enable_decision_engine:
+        if self.enable_decision_engine and not errors:
             logger.debug("Stage 9: Decision Engine")
             layer_start = time.time()
             try:
@@ -924,11 +939,15 @@ class UnifiedOrchestrator:
         enable_advanced_features: bool = True,
         # Processing hints
         language_hint: Optional[str] = None,
+        screen: bool = True,
+        clean_unicode: bool = True,
         generate_variants: Optional[bool] = None,
         generate_embeddings: Optional[bool] = None,
         feature_flags: Optional[FeatureFlags] = None,
         # Search tracing
         search_trace_enabled: bool = True,  # Enable by default for debugging
+        search_options: Optional[Any] = None,
+        force_full_pipeline: bool = False,
         # Legacy compatibility kwargs (ignored but accepted)
         cache_result: Optional[bool] = None,
         embeddings: Optional[bool] = None,
@@ -974,10 +993,6 @@ class UnifiedOrchestrator:
         context.processing_flags["feature_flags"] = effective_flags.to_dict()
         context.metadata["feature_flags"] = effective_flags.to_dict()
 
-        # Early return for very simple cases to improve performance
-        if self._is_simple_case(text):
-            return self._create_simple_response(text, context, start_time)
-
         # Handle legacy kwargs mapping
         if embeddings is not None:
             generate_embeddings = embeddings
@@ -986,20 +1001,22 @@ class UnifiedOrchestrator:
 
         # Handle caching if enabled and cache_service is available
         cache_key = None
-        if cache_result and self.cache_service:
-            cache_key = self._generate_cache_key(text, remove_stop_words, preserve_names)
+        if cache_result and self.cache_service and not (screen and self.enable_search):
+            cache_key = self._generate_cache_key(text, remove_stop_words, preserve_names,
+                language_hint=language_hint, clean_unicode=clean_unicode,
+                enable_advanced_features=enable_advanced_features,
+                feature_flags=effective_flags.to_dict(), screen=screen,
+                generate_variants=self.enable_variants if generate_variants is None else generate_variants,
+                generate_embeddings=self.enable_embeddings if generate_embeddings is None else generate_embeddings,
+                search_trace_enabled=search_trace_enabled)
             try:
                 cached_result = self.cache_service.get(cache_key)
                 if cached_result:
                     # Update stats for cache hit
                     self.update_stats(0.001, cache_hit=True, error=False)
-                    return cached_result
+                    return deepcopy(cached_result)
             except Exception as e:
                 logger.debug(f"Cache get failed: {e}")
-
-        # Cache miss or caching disabled
-        if self.cache_service:
-            self.processing_stats["cache_misses"] += 1
 
         # Initialize metrics collection
         if self.metrics_service:
@@ -1033,7 +1050,7 @@ class UnifiedOrchestrator:
             # ================================================================
             # Layer 4: Unicode Normalization (after language detection)
             # ================================================================
-            text_u = await self._handle_unicode_normalization_layer(context)
+            text_u = await self._handle_unicode_normalization_layer(context) if clean_unicode else context.original_text
 
             # ================================================================
             # Layer 5: Name Normalization (morph) - THE CORE
@@ -1077,12 +1094,20 @@ class UnifiedOrchestrator:
             # ================================================================
             # Layer 9: Search (optional)
             # ================================================================
-            search_results = await self._handle_search_layer(norm_result, embeddings, errors, text, search_trace, signals_result)
+            search_results = None if not screen else await self._handle_search_layer(
+                norm_result,
+                embeddings,
+                errors,
+                text,
+                search_trace,
+                signals_result,
+                search_options,
+            )
 
             # ================================================================
             # Layer 10: Decision & Response
             # ================================================================
-            decision_result = await self._handle_decision_layer(
+            decision_result = None if not screen else await self._handle_decision_layer(
                 context, norm_result, signals_result, variants, embeddings, search_results, errors, search_trace
             )
 
@@ -1133,7 +1158,7 @@ class UnifiedOrchestrator:
             # Cache the result if caching is enabled and successful
             if cache_result and self.cache_service and cache_key and result.success:
                 try:
-                    self.cache_service.set(cache_key, result)
+                    self.cache_service.set(cache_key, deepcopy(result))
                 except Exception as e:
                     logger.debug(f"Cache set failed: {e}")
 
@@ -1217,96 +1242,68 @@ class UnifiedOrchestrator:
             estimated_complexity=smart_filter_info.get("classification")
         )
         
-        # Extract signals information
-        person_confidence = 0.0
-        org_confidence = 0.0
-        date_match = False
-        id_match = False
-        evidence = {}
-        
-        if signals_result.persons:
-            # Use the highest person confidence
-            person_confidence = max(p.confidence if hasattr(p, 'confidence') else p.get('confidence', 0.0) for p in signals_result.persons)
-            # Check for SANCTIONED ID matches in person data (FAST PATH logic)
-            for person in signals_result.persons:
-                # Handle both object and dict formats
-                person_ids = getattr(person, 'ids', None) if hasattr(person, 'ids') else person.get('ids', [])
-                if person_ids:
-                    # Only set id_match=True if we found sanctioned IDs (not just any IDs)
-                    for id_info in person_ids:
-                        if isinstance(id_info, dict) and id_info.get('sanctioned', False):
-                            id_match = True
-                            logger.warning(f"🚨 FAST PATH: Sanctioned person ID detected: {id_info.get('value')}")
-                            break
-                    if id_match:
-                        break
-        
-        if signals_result.organizations:
-            # Use the highest organization confidence
-            org_confidence = max(o.confidence if hasattr(o, 'confidence') else o.get('confidence', 0.0) for o in signals_result.organizations)
-            # Check for SANCTIONED ID matches in organization data (FAST PATH logic)
-            for org in signals_result.organizations:
-                # Handle both object and dict formats
-                org_ids = getattr(org, 'ids', None) if hasattr(org, 'ids') else org.get('ids', [])
-                if org_ids:
-                    # Only set id_match=True if we found sanctioned IDs (not just any IDs)
-                    for id_info in org_ids:
-                        if isinstance(id_info, dict) and id_info.get('sanctioned', False):
-                            id_match = True
-                            logger.warning(f"🚨 FAST PATH: Sanctioned org ID detected: {id_info.get('value')}")
-                            break
-                    if id_match:
-                        break
-                    if id_match:
-                        break
-        
-        if signals_result.organizations:
-            # Use the highest organization confidence
-            org_confidence = max(o.confidence if hasattr(o, 'confidence') else o.get('confidence', 0.0) for o in signals_result.organizations)
-            # Check for SANCTIONED ID matches in organization data (FAST PATH logic)
-            for org in signals_result.organizations:
-                # Handle both object and dict formats
-                org_ids = getattr(org, 'ids', None) if hasattr(org, 'ids') else org.get('ids', [])
-                if org_ids:
-                    # Only set id_match=True if we found sanctioned IDs (not just any IDs)
-                    for id_info in org_ids:
-                        if isinstance(id_info, dict) and id_info.get('sanctioned', False):
-                            id_match = True
-                            logger.warning(f"🚨 FAST PATH: Sanctioned org ID detected: {id_info.get('value')}")
-                            break
-                    if id_match:
-                        break
-        
-        # Check for date matches in extras
-        if hasattr(signals_result, 'extras') and isinstance(signals_result.extras, dict) and signals_result.extras.get('dates'):
-            date_match = True
-        
-        # Create evidence dict
-        evidence = {
-            "persons_count": self._safe_len(signals_result.persons),
-            "organizations_count": self._safe_len(signals_result.organizations),
-            "signals_confidence": signals_result.confidence
-        }
-        
-        signals = SignalsInfo(
-            person_confidence=person_confidence,
-            org_confidence=org_confidence,
-            date_match=date_match,
-            id_match=id_match,
-            evidence=evidence
-        )
-        
-        # Extract similarity information (if embeddings are available)
-        similarity = SimilarityInfo()
-        if processing_result.embeddings:
-            # For now, we don't have similarity search implemented
-            # This would be populated when similarity search is added
-            similarity = SimilarityInfo(cos_top=None, cos_p95=None)
+        def value(obj, key, default=None):
+            return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
-        # Create SearchInfo from search_results
-        search_info = None
-        if search_results:
-            search_info = self._create_search_info_from_results(search_results)
+        def dates(raw):
+            import re
+            from datetime import datetime
+            result = set()
+            for token in re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}[./]\d{2}[./]\d{4}\b", str(raw or "")):
+                for form in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+                    try:
+                        result.add(datetime.strptime(token, form).date().isoformat())
+                        break
+                    except ValueError:
+                        pass
+            return result
+
+        persons = signals_result.persons or []
+        organizations = signals_result.organizations or []
+        entities = [*persons, *organizations]
+        def tax_ids(entity):
+            return {str(item.get("value", "")).strip()
+                    for item in (value(entity, "ids", []) or [])
+                    if isinstance(item, dict) and item.get("value") and
+                    item.get("type", "").casefold() in {"inn", "inn_ua", "inn_ru", "itn", "tin", "tax_id", "edrpou"}}
+
+        identity_groups = [(tax_ids(person), dates(value(person, "dob"))) for person in persons]
+        identity_groups.extend((tax_ids(org), set()) for org in organizations)
+        query_ids = set().union(*(ids for ids, _ in identity_groups))
+        extras = value(signals_result, "extras", {}) or {}
+        unassigned_ids = tax_ids({"ids": value(extras, "unassigned_ids", [])})
+        query_ids.update(unassigned_ids)
+        query_dobs = set().union(*(dates(value(person, "dob")) for person in persons))
+        search_info = self._create_search_info_from_results(search_results) if search_results else None
+        if search_info:
+            for candidate in search_info.fusion_candidates:
+                import re
+                candidate_ids = source_tax_ids(candidate.meta)
+                candidate_dates = dates(candidate.dob or candidate.meta.get("birthdate"))
+                candidate.features["id_match"] = bool(query_ids & candidate_ids)
+                candidate.features["unassigned_id_match"] = bool(unassigned_ids & candidate_ids)
+                candidate.features["date_match"] = bool(query_dobs & candidate_dates)
+                candidate.features["identity_pair_match"] = any(
+                    bool(ids & candidate_ids) and bool(dobs & candidate_dates)
+                    for ids, dobs in identity_groups
+                )
+                candidate.features["identity_conflict"] = any(
+                    bool(ids & candidate_ids) and bool(dobs) and bool(candidate_dates)
+                    and not bool(dobs & candidate_dates)
+                    for ids, dobs in identity_groups
+                )
+        fusion = search_info.fusion_candidates if search_info else []
+        evidence = {"persons_count": len(persons), "organizations_count": len(organizations),
+                    "signals_confidence": signals_result.confidence,
+                    "extracted_ids": ["tin"] if query_ids else [],
+                    "extracted_dates": ["dob"] if query_dobs else []}
+        signals = SignalsInfo(
+            person_confidence=max((value(person, "confidence", 0.0) for person in persons), default=0.0),
+            org_confidence=max((value(org, "confidence", 0.0) for org in organizations), default=0.0),
+            id_match=any(candidate.features.get("id_match") for candidate in fusion),
+            date_match=any(candidate.features.get("date_match") for candidate in fusion), evidence=evidence,
+        )
+        similarity = SimilarityInfo()
 
         # Create normalization object with homoglyph detection
         normalization_obj = type('NormalizationObj', (), {
@@ -1332,38 +1329,36 @@ class UnifiedOrchestrator:
                 SearchResult, Candidate, SearchType, SearchInfo, create_search_info
             )
 
-            # Convert search_results dict to Candidate objects
             candidates = []
-            for r in search_results.get("results", []):
-                # Determine search type from match fields
-                search_type = SearchType.EXACT
-                match_fields = r.get("match_fields", [])
-                if "normalized_text" in match_fields:
-                    search_type = SearchType.EXACT
-                elif "phrase" in match_fields:
-                    search_type = SearchType.PHRASE
-                elif "ngram" in match_fields:
-                    search_type = SearchType.NGRAM
-                elif "vector" in match_fields:
+            query = " ".join(search_results.get("query", "").casefold().split())
+            for result in search_results.get("results", []):
+                fields = result.get("match_fields", [])
+                metadata = result.get("metadata") or {}
+                text = result.get("text", "")
+                mode = result.get("search_mode")
+                exact_text = query and query == " ".join(text.casefold().split())
+                if mode == "vector":
                     search_type = SearchType.VECTOR
-
-                # Create candidate - use real ES score, not normalized confidence
-                real_score = r.get("score", 0.0)  # Use actual ES score instead of normalized confidence
-                candidate = Candidate(
-                    entity_id=r.get("doc_id", ""),
-                    entity_type=r.get("entity_type", ""),
-                    normalized_name=r.get("text", ""),
-                    aliases=[],
-                    country="",
-                    dob=None,
-                    meta=r.get("metadata", {}),
-                    final_score=real_score,  # Use actual ES score
-                    ac_score=real_score if r.get("search_mode") != "vector" else 0.0,
-                    vector_score=real_score if r.get("search_mode") == "vector" else 0.0,
-                    features={"match_fields": match_fields},
-                    search_type=search_type
-                )
-                candidates.append(candidate)
+                elif exact_text and mode in {"ac", "hybrid", "fallback_ac"}:
+                    search_type = SearchType.EXACT
+                elif "phrase" in fields:
+                    search_type = SearchType.PHRASE
+                elif "ngram" in fields or mode == "fuzzy" or "fuzzy_name" in fields:
+                    search_type = SearchType.NGRAM
+                else:
+                    search_type = SearchType.WEAK
+                score = min(1.0, max(0.0, float(result.get("confidence", result.get("score", 0.0)))))
+                trace = result.get("trace") or {}
+                candidates.append(Candidate(
+                    entity_id=metadata.get("entity_id", result.get("doc_id", "")),
+                    entity_type=result.get("entity_type", ""), normalized_name=text,
+                    aliases=metadata.get("aliases") or [], country=metadata.get("country", ""),
+                    dob=metadata.get("dob"), meta=metadata, final_score=score,
+                    ac_score=score if mode != "vector" else 0.0,
+                    vector_score=score if mode == "vector" else 0.0,
+                    features={"match_fields": fields, "id_match": trace.get("id_match"),
+                              "date_match": trace.get("date_match")}, search_type=search_type,
+                ))
 
             # Create SearchResult
             search_result = SearchResult(
@@ -1381,16 +1376,8 @@ class UnifiedOrchestrator:
             logger.debug(f"SearchInfo created: high_confidence_matches={search_info.high_confidence_matches}")
             return search_info
 
-        except ImportError:
-            logger.warning("Search contracts not available - search module not imported")
-            # Create a basic SearchInfo with available data
-            total_hits = search_results.get("total_hits", 0)
-            return self._create_basic_search_info(total_hits > 0, total_hits)
-        except Exception as e:
-            logger.warning(f"Failed to create SearchInfo from search_results: {e}")
-            # Create a basic SearchInfo with available data
-            total_hits = search_results.get("total_hits", 0)
-            return self._create_basic_search_info(total_hits > 0, total_hits)
+        except Exception as exc:
+            raise RuntimeError("Search evidence could not be converted into a decision") from exc
 
     def _create_basic_search_info(self, has_matches: bool, total_matches: int):
         """Create basic SearchInfo when full contracts unavailable"""
@@ -1419,7 +1406,10 @@ class UnifiedOrchestrator:
 
     def _is_simple_case(self, text: str) -> bool:
         """Check if text is simple enough for fast path processing"""
-        if not text or len(text.strip()) < 3:
+        if not text or not text.strip():
+            return False
+
+        if len(text.strip()) < 3:
             return True
 
         # Single word, likely just a name
@@ -1513,11 +1503,14 @@ class UnifiedOrchestrator:
             self.cache_service.clear()
         logger.warning("clear_cache is deprecated. Use cache_service directly.")
 
-    def _generate_cache_key(self, text: str, remove_stop_words: bool, preserve_names: bool) -> str:
-        """Legacy method for cache key generation"""
+    def _generate_cache_key(self, text: str, remove_stop_words: bool, preserve_names: bool, **options) -> str:
+        """Cache only equivalent requests within this configured service instance."""
         import hashlib
-        key_data = f"{text}:{remove_stop_words}:{preserve_names}"
-        hash_part = hashlib.md5(key_data.encode()).hexdigest()
+        import json
+        key_data = json.dumps({"instance": self._cache_namespace, "text": text,
+            "remove_stop_words": remove_stop_words, "preserve_names": preserve_names,
+            **options}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        hash_part = hashlib.sha256(key_data.encode()).hexdigest()
         return f"orchestrator_{hash_part}"
 
     def _calculate_complexity_score(self, unicode_complexity, language_complexity, name_complexity) -> float:
@@ -1565,86 +1558,60 @@ class UnifiedOrchestrator:
             self.processing_stats["cache_misses"] += 1
         if error:
             self.processing_stats["errors"] += 1
+        self.processing_stats["successful" if not error else "failed"] += 1
         self.processing_stats["processing_times"].append(processing_time)
+        self.processing_stats["processing_times"] = self.processing_stats["processing_times"][-1000:]
 
     def _update_stats(self, processing_time: float, cache_hit: bool = False, error: bool = False):
         """Legacy method alias for updating statistics"""
         self.update_stats(processing_time, cache_hit, error)
 
-    async def process_batch(self, texts: List[str], **kwargs) -> List[UnifiedProcessingResult]:
-        """Legacy method for batch processing"""
-        logger.warning("process_batch is deprecated. Use individual process() calls with asyncio.gather.")
-        results = []
-        for text in texts:
-            try:
-                result = await self.process(text, **kwargs)
-                results.append(result)
-            except Exception as e:
-                # Create error result
-                error_result = UnifiedProcessingResult(
-                    original_text=text,
-                    language="en",
-                    language_confidence=0.0,
-                    normalized_text=text,
-                    success=False,
-                    errors=[str(e)]
-                )
-                results.append(error_result)
-        return results
+    async def process_batch(self, texts: List[str], max_concurrent: int = 10, **kwargs) -> List[UnifiedProcessingResult]:
+        if not 1 <= max_concurrent <= 32:
+            raise ValueError("max_concurrent must be between 1 and 32")
+        semaphore = asyncio.Semaphore(max_concurrent)
+        async def process_one(text):
+            async with semaphore:
+                try:
+                    return await self.process(text, **kwargs)
+                except Exception as exc:
+                    return UnifiedProcessingResult(original_text=text, language="en",
+                        language_confidence=0.0, normalized_text=text, success=False, errors=[str(exc)])
+        return await asyncio.gather(*(process_one(text) for text in texts))
 
     def _validate_and_normalize_flags(self, feature_flags: Optional[FeatureFlags]) -> FeatureFlags:
-        """
-        Validate and normalize feature flags with defensive handling.
-        
-        Args:
-            feature_flags: Feature flags to validate, can be None
-            
-        Returns:
-            Valid FeatureFlags instance, defaults to self.default_feature_flags if invalid
-        """
-        if feature_flags is None:
-            return self.default_feature_flags
-        
-        # Validate that it's a FeatureFlags instance
-        if not isinstance(feature_flags, FeatureFlags):
-            logger.warning(f"Invalid feature_flags type: {type(feature_flags)}, using defaults")
-            return self.default_feature_flags
-        
-        # Validate individual flag values
-        try:
-            # Check for any invalid boolean values
-            flag_dict = feature_flags.to_dict()
-            for flag_name, flag_value in flag_dict.items():
-                if not isinstance(flag_value, bool):
-                    logger.warning(f"Invalid flag value for {flag_name}: {flag_value} (type: {type(flag_value)}), using default")
-                    # Reset to default value
-                    if hasattr(self.default_feature_flags, flag_name):
-                        setattr(feature_flags, flag_name, getattr(self.default_feature_flags, flag_name))
-            
-            return feature_flags
-            
-        except Exception as e:
-            logger.warning(f"Error validating feature flags: {e}, using defaults")
-            return self.default_feature_flags
+        return merge_feature_flags(self.default_feature_flags, feature_flags)
 
-    async def search_similar_names(self, query: str, limit: int = 10, candidates: Optional[List[str]] = None, use_embeddings: bool = True, **kwargs) -> Dict[str, Any]:
-        """Legacy method for searching similar names"""
-        logger.warning("search_similar_names is deprecated. Use embeddings_service directly.")
-
-        results = []
-        method = "embeddings" if use_embeddings else "fallback"
-
-        if use_embeddings and self.embeddings_service and hasattr(self.embeddings_service, 'find_similar_texts'):
-            raw_results = await self._maybe_await(self.embeddings_service.find_similar_texts(query, limit))
-            # Convert to expected format if needed
-            if isinstance(raw_results, list):
-                results = raw_results
-
-        return {
-            "method": method,
-            "query": query,
-            "results": results[:limit] if results else []
-        }
+    async def search_similar_names(self, query: str, limit: int = 10,
+            candidates: Optional[List[str]] = None, use_embeddings: bool = True,
+            threshold: float = 0.7, top_k: Optional[int] = None, **kwargs) -> Dict[str, Any]:
+        """Compare the supplied candidate list with a query and apply all options."""
+        if not 0 <= threshold <= 1:
+            raise ValueError("threshold must be between zero and one")
+        count = top_k if top_k is not None else limit
+        if count < 1:
+            raise ValueError("top_k must be positive")
+        texts = list(candidates or [])
+        if use_embeddings and texts:
+            if self.embeddings_service is None:
+                raise RuntimeError("Configured embedding service is unavailable")
+            import inspect
+            encode_async = getattr(self.embeddings_service, "encode_batch_async", None)
+            if inspect.iscoroutinefunction(encode_async):
+                vectors = await encode_async([query, *texts])
+            else:
+                vectors = await asyncio.to_thread(self.embeddings_service.encode_batch, [query, *texts])
+            if len(vectors) != len(texts) + 1:
+                raise RuntimeError("Embedding generation did not preserve candidate rows")
+            import numpy as np
+            query_vector = np.asarray(vectors[0])
+            scores = [float(np.dot(query_vector, v) / (np.linalg.norm(query_vector) * np.linalg.norm(v))) for v in vectors[1:]]
+        else:
+            from rapidfuzz.fuzz import ratio
+            scores = [ratio(query.casefold(), text.casefold()) / 100 for text in texts]
+        results = [{"text": text, "score": score} for text, score in zip(texts, scores) if score >= threshold]
+        results.sort(key=lambda item: (-item["score"], item["text"]))
+        return {"method": "embeddings" if use_embeddings else "fuzzy", "query": query, "results": results[:count]}
 
     async def analyze_text_complexity(self, text: str) -> Dict[str, Any]:
         """Legacy method for analyzing text complexity"""
@@ -1665,199 +1632,78 @@ class UnifiedOrchestrator:
             "character_count": len(text)
         }
 
+    @staticmethod
+    def _has_only_identifier_evidence(text, signals_result) -> bool:
+        """Allow omitting name retrieval only for supported, source-verified IDs."""
+        if not signals_result:
+            return False
+        extras = getattr(signals_result, "extras", {}) or {}
+        identifiers = list(extras.get("unassigned_ids", []) if isinstance(extras, dict)
+                           else getattr(extras, "unassigned_ids", []))
+        for entity in [*(signals_result.persons or []), *(signals_result.organizations or [])]:
+            identifiers.extend(entity.get("ids", []) if isinstance(entity, dict) else getattr(entity, "ids", []))
+
+        covered = [False] * len(text)
+        for identifier in identifiers:
+            value = str(identifier.get("value") or "").strip()
+            if str(identifier.get("type") or "").lower() not in TAX_IDENTIFIER_TYPES:
+                continue
+            if value not in source_tax_ids({"tin": value}):
+                continue
+            span = identifier.get("position")
+            if not isinstance(span, (tuple, list)) or len(span) != 2 or any(type(n) is not int for n in span):
+                continue
+            start, end = span
+            if not 0 <= start < end <= len(text) or text[start:end] != identifier.get("raw"):
+                continue
+            raw = without_format_controls(text[start:end])
+            for pattern, regex in get_compiled_patterns_cached():
+                if pattern.type not in TAX_IDENTIFIER_TYPES:
+                    continue
+                match = regex.fullmatch(raw)
+                if match and normalize_identifier(match.group(1), pattern.type) == value:
+                    covered[start:end] = [True] * (end - start)
+                    break
+
+        remainder = without_format_controls("".join(char for char, included in zip(text, covered) if not included))
+        return any(covered) and all(
+            char.isspace() or unicodedata.category(char).startswith("P") or char == "|"
+            for char in remainder
+        )
+
     async def _search_by_extracted_ids(self, signals_result, search_opts) -> List[Dict[str, Any]]:
         """Search for sanctioned persons by extracted IDs (INN, EDRPOU, etc.)."""
         try:
-            if not signals_result or not signals_result.persons:
+            if not signals_result:
                 return []
 
             id_candidates = []
 
-            # Check each person's IDs
-            for person in signals_result.persons:
-                if not hasattr(person, 'ids') or not person.ids:
+            entities = [*(signals_result.persons or []), *(signals_result.organizations or [])]
+            extras = getattr(signals_result, "extras", {}) or {}
+            unassigned = extras.get("unassigned_ids", []) if isinstance(extras, dict) else getattr(extras, "unassigned_ids", [])
+            identifiers = list(unassigned)
+            for entity in entities:
+                identifiers.extend(entity.get("ids", []) if isinstance(entity, dict) else getattr(entity, "ids", []))
+            seen = set()
+            for id_info in identifiers:
+                id_value = str(id_info.get("value") or "").strip()
+                id_type = str(id_info.get("type") or "").lower()
+                if not id_value or (id_type, id_value) in seen:
                     continue
-
-                for id_info in person.ids:
-                    id_value = id_info.get('value', '').strip()
-                    id_type = id_info.get('type', '').lower()
-
-                    if not id_value:
-                        continue
-
-                    print(f"[CHECK] Checking {id_type.upper()}: {id_value}")
-
-                    # Search in mock database for this ID
-                    candidates = await self._find_candidates_by_id(id_value, id_type)
-                    if candidates:
-                        print(f"🚨 SANCTIONED {id_type.upper()} FOUND: {id_value} -> {len(candidates)} matches")
-                        id_candidates.extend(candidates)
+                seen.add((id_type, id_value))
+                id_candidates.extend(await self._find_candidates_by_id(id_value, id_type, search_opts))
 
             return id_candidates
         except Exception as e:
-            print(f"[ERROR] ID search failed: {e}")
-            return []
+            raise RuntimeError("Identifier screening failed") from e
 
-    async def _find_candidates_by_id(self, id_value: str, id_type: str) -> List[Dict[str, Any]]:
-        """Find candidates in sanctions database by specific ID using fast INN cache."""
-        try:
-            from ..layers.search.sanctioned_inn_cache import lookup_sanctioned_inn
-
-            # For INN/ITN, use fast cache lookup
-            if id_type.lower() in ['inn', 'itn', 'tax_id']:
-                sanctioned_data = lookup_sanctioned_inn(id_value)
-                if sanctioned_data:
-                    # Convert cached data to candidate format
-                    candidate = {
-                        "doc_id": f"sanctioned_inn_{id_value}",
-                        "score": 1.0,  # Perfect match on sanctioned INN
-                        "text": sanctioned_data.get('name', 'Unknown'),
-                        "entity_type": sanctioned_data.get('type', 'person'),
-                        "metadata": {
-                            'itn': id_value,
-                            'name_en': sanctioned_data.get('name_en', ''),
-                            'birthdate': sanctioned_data.get('birthdate'),
-                            'person_id': sanctioned_data.get('person_id'),
-                            'org_id': sanctioned_data.get('org_id'),
-                            'source': sanctioned_data.get('source', 'sanctioned_inn_cache'),
-                            'status': sanctioned_data.get('status', 1),
-                            'risk_level': sanctioned_data.get('risk_level', 'high')
-                        },
-                        "search_mode": "inn_cache",
-                        "match_fields": ["itn"],
-                        "confidence": 1.0
-                    }
-
-                    print(f"🚨 SANCTIONED INN CACHE HIT: {id_value} -> {sanctioned_data.get('name', 'Unknown')}")
-                    return [candidate]
-
-            # Fallback to mock search for other ID types
-            if hasattr(self.search_service, '_test_persons'):
-                candidates = []
-
-                for test_person in self.search_service._test_persons:
-                    metadata = test_person.metadata or {}
-
-                    # Check different ID field names based on type
-                    id_field_mapping = {
-                        'edrpou': ['edrpou', 'registration_id'],
-                        'ogrn': ['ogrn', 'reg_number'],
-                        'vat': ['vat', 'vat_id']
-                    }
-
-                    possible_fields = id_field_mapping.get(id_type, [id_type])
-
-                    for field_name in possible_fields:
-                        if field_name in metadata and str(metadata[field_name]) == str(id_value):
-                            # Found sanctioned person with this ID
-                            candidate = {
-                                "doc_id": test_person.doc_id,
-                                "score": 1.0,  # Perfect match on ID
-                                "text": test_person.text,
-                                "entity_type": "person",
-                                "metadata": metadata,
-                                "search_mode": "id_exact",
-                                "match_fields": [field_name],
-                                "confidence": 1.0
-                            }
-                            candidates.append(candidate)
-                            print(f"[OK] Mock match found: {test_person.text} ({field_name}: {id_value})")
-                            break
-
-                return candidates
-
-            return []
-
-        except Exception as e:
-            print(f"[ERROR] Find candidates by ID failed: {e}")
-            return []
-
-    def _emergency_fuzzy_search(self, query: str, original_text: str) -> list:
-        """Emergency fuzzy search for critical names when main search fails."""
-        try:
-            # List of high-profile names that should be found
-            known_names = [
-                "Петро Порошенко", "Володимир Зеленський", "Юлія Тимошенко",
-                "Віталій Кличко", "Ігор Коломойський", "Рінат Ахметов",
-                "Владимир Путин", "Сергей Лавров", "Михаил Мишустин"
-            ]
-
-            # Efficient fuzzy matching - replaces O(n³) algorithm
-            from ..utils.efficient_fuzzy_matcher import find_fuzzy_matches_efficient
-
-            try:
-                match_results = find_fuzzy_matches_efficient(query, known_names, min_overlap=1)
-                matches = []
-
-                for match in match_results:
-                    # Create a simple candidate-like object compatible with existing code
-                    candidate = type('Candidate', (), {
-                        'doc_id': match.doc_id,
-                        'score': match.score,  # Already scaled by 50 in the matcher
-                        'text': match.name,
-                        'entity_type': 'person',
-                        'metadata': {'emergency_match': True, 'overlap_tokens': len(match.overlap_tokens)},
-                        'search_mode': 'fuzzy',
-                        'match_fields': ['emergency'],
-                        'confidence': min(match.score / 100.0, 1.0),  # Score is scaled by 50, so /100 for normalized confidence
-                        'trace': None,
-                        'to_dict': lambda self: {
-                            'doc_id': self.doc_id,
-                            'score': self.score,
-                            'text': self.text,
-                            'entity_type': self.entity_type,
-                            'metadata': self.metadata,
-                            'search_mode': self.search_mode,
-                            'match_fields': self.match_fields,
-                            'confidence': self.confidence
-                        }
-                    })()
-                    matches.append(candidate)
-
-                return sorted(matches, key=lambda x: x.score, reverse=True)[:5]
-
-            except Exception as e:
-                # Fallback to simple matching if efficient matcher fails
-                logger.warning(f"Efficient fuzzy matcher failed, using fallback: {e}")
-
-                matches = []
-                query_tokens = set(query.lower().split())
-
-                for idx, name in enumerate(known_names):
-                    name_tokens = set(name.lower().split())
-
-                    # Simple intersection-based matching
-                    exact_matches = len(query_tokens.intersection(name_tokens))
-                    if exact_matches > 0:
-                        score = exact_matches * 50
-                        candidate = type('Candidate', (), {
-                            'doc_id': f"fallback_{idx}",
-                            'score': score,
-                            'text': name,
-                            'entity_type': 'person',
-                            'metadata': {'emergency_match': True, 'fallback': True},
-                            'search_mode': 'fallback',
-                            'match_fields': ['emergency'],
-                            'confidence': min(score / 100.0, 1.0),
-                            'trace': None,
-                            'to_dict': lambda self: {
-                                'doc_id': self.doc_id,
-                                'score': self.score,
-                                'text': self.text,
-                                'entity_type': self.entity_type,
-                                'metadata': self.metadata,
-                                'search_mode': self.search_mode,
-                                'match_fields': self.match_fields,
-                                'confidence': self.confidence
-                            }
-                        })()
-                        matches.append(candidate)
-
-                return sorted(matches, key=lambda x: x.score, reverse=True)[:5]
-
-        except Exception as e:
-            logger.error(f"Emergency fuzzy search completely failed: {e}")
-            return []
+    async def _find_candidates_by_id(self, id_value, id_type, search_opts=None):
+        """Use the configured active sanctions snapshot for identifier evidence."""
+        if self.search_service is None:
+            raise RuntimeError("Identifier screening is unavailable")
+        candidates = await self.search_service.find_by_identifier(id_value, id_type, search_opts)
+        return [{**candidate.to_dict(), "search_mode": "id_exact"} for candidate in candidates]
 
     def _create_modified_norm_result(self, norm_result, new_normalized_text):
         """

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import threading
 import unicodedata
+from collections import OrderedDict
+from ...data.resources import PACKAGE_DATA_DIR
 from dataclasses import dataclass
 from functools import lru_cache
 from ...utils.memory_aware_cache import memory_aware_lru_cache
@@ -21,7 +23,25 @@ if TYPE_CHECKING:
     from ...utils.feature_flags import FeatureFlags
 
 
-@dataclass(frozen=True)
+@lru_cache(maxsize=2)
+def _given_declensions(language: str) -> Dict[str, str]:
+    """Only unambiguous forms from the curated given-name dictionaries."""
+    from ...data.dicts.russian_names import RUSSIAN_NAMES
+    from ...data.dicts.ukrainian_names import UKRAINIAN_NAMES
+
+    dictionary = UKRAINIAN_NAMES if language == "uk" else RUSSIAN_NAMES
+    candidates: Dict[str, set] = {}
+    canonical_names = {name.casefold(): name for name in dictionary}
+    for name, data in dictionary.items():
+        for form in data.get("declensions", []):
+            candidates.setdefault(form.casefold(), set()).add(name)
+    return {
+        **{form: next(iter(names)) for form, names in candidates.items() if len(names) == 1},
+        **canonical_names,
+    }
+
+
+@dataclass(frozen=True, init=False)
 class MorphParse:
     """Lightweight representation of a morphology parse."""
 
@@ -31,6 +51,27 @@ class MorphParse:
     case: Optional[str] = None
     gender: Optional[str] = None
     nominative: Optional[str] = None
+
+    def __init__(self, normal=None, tag="", score=0.0, case=None, gender=None,
+                 nominative=None, *, normal_form=None, nominative_form=None):
+        if normal is not None and normal_form is not None and normal != normal_form:
+            raise ValueError("Conflicting normal forms")
+        if nominative is not None and nominative_form is not None and nominative != nominative_form:
+            raise ValueError("Conflicting nominative forms")
+        for key, value in dict(
+            normal=normal if normal is not None else normal_form,
+            nominative=nominative if nominative is not None else nominative_form,
+            tag=tag, score=score, case=case, gender=gender,
+        ).items():
+            object.__setattr__(self, key, value)
+
+    @property
+    def normal_form(self):
+        return self.normal
+
+    @property
+    def nominative_form(self):
+        return self.nominative
 
 
 class MorphologyAdapter:
@@ -57,6 +98,7 @@ class MorphologyAdapter:
         self._cache_size = cache_size
         self._lock = threading.RLock()
         self.cache = cache
+        self._to_nominative_cached_with_flags = OrderedDict()
         
         # Analyzers for each language
         self._analyzers: Dict[str, Any] = {}
@@ -105,7 +147,7 @@ class MorphologyAdapter:
         normalized = unicodedata.normalize("NFC", token)
         return self._to_nominative_cached(normalized, lang)
 
-    def to_nominative_cached(self, token: str, lang: str, flags: 'FeatureFlags', role: str = 'unknown') -> Tuple[str, str]:
+    def to_nominative_cached(self, token: str, lang: str, flags: 'FeatureFlags', role: str = 'unknown', *, use_cache: bool = True) -> Tuple[str, str]:
         """
         Convert token to nominative case with caching and feature flags support.
         
@@ -121,30 +163,36 @@ class MorphologyAdapter:
         if not token or not token.strip() or lang not in {"ru", "uk"}:
             return token, "morph.nominal_noop"
         
-        # Create cache key with flags
+        # Case, role and every behavior flag affect the returned form.
+        normalized = unicodedata.normalize("NFC", token)
         cache_key = (
-            lang, 
-            token.lower(), 
+            lang,
+            normalized,
+            role,
             getattr(flags, 'enforce_nominative', True),
-            getattr(flags, 'preserve_feminine_surnames', True)
+            getattr(flags, 'preserve_feminine_surnames', True),
+            getattr(flags, 'morphology_custom_rules_first', True),
+            getattr(flags, 'enable_enhanced_diminutives', True),
         )
 
-        # Check cache first
-        if hasattr(self, '_to_nominative_cached_with_flags'):
-            cached_result = self._to_nominative_cached_with_flags.get(cache_key)
+        with self._lock:
+            cached_result = self._to_nominative_cached_with_flags.get(cache_key) if use_cache else None
             if cached_result is not None:
+                self._to_nominative_cached_with_flags.move_to_end(cache_key)
                 return cached_result
 
         # Process token
-        normalized = unicodedata.normalize("NFC", token)
         result, trace_note = self._to_nominative_uncached_with_flags(
             normalized, lang, flags, role
         )
         
         # Cache result
-        if not hasattr(self, '_to_nominative_cached_with_flags'):
-            self._to_nominative_cached_with_flags = {}
-        self._to_nominative_cached_with_flags[cache_key] = (result, trace_note)
+        if use_cache:
+            with self._lock:
+                self._to_nominative_cached_with_flags[cache_key] = (result, trace_note)
+                self._to_nominative_cached_with_flags.move_to_end(cache_key)
+                while len(self._to_nominative_cached_with_flags) > self._cache_size:
+                    self._to_nominative_cached_with_flags.popitem(last=False)
         
         return result, trace_note
 
@@ -456,6 +504,7 @@ class MorphologyAdapter:
             self._parse_cached.cache_clear()
             self._to_nominative_cached.cache_clear()
             self._detect_gender_cached.cache_clear()
+            self._to_nominative_cached_with_flags.clear()
         self._logger.info("Morphology cache cleared")
 
     def get_cache_stats(self) -> Dict[str, int]:
@@ -577,8 +626,8 @@ class MorphologyAdapter:
         return results
 
     def _to_nominative_uncached(self, token: str, lang: str) -> str:
-        """Uncached nominative conversion."""
-        parses = self._parse_uncached(token, lang)
+        """Nominative conversion sharing the public parse cache."""
+        parses = self.parse(token, lang)
         
         # Look for explicit nominative case first
         for parse in parses:
@@ -604,6 +653,8 @@ class MorphologyAdapter:
 
         scripts = set()
         for char in token:
+            if not char.isalpha():
+                continue
             if ord(char) < 128:  # ASCII
                 scripts.add('Latin')
             elif '\u0400' <= char <= '\u04FF':  # Cyrillic
@@ -624,32 +675,25 @@ class MorphologyAdapter:
         if not getattr(flags, 'morphology_custom_rules_first', True):
             return token
         
-        # Load diminutive dictionaries if not already done
-        if not hasattr(self, '_diminutive_dicts'):
-            self._diminutive_dicts = {}
-            try:
-                import json
-                from pathlib import Path
-                
-                # Load Russian diminutives
-                ru_path = Path(__file__).resolve().parents[4] / "data" / "diminutives_ru.json"
-                self._logger.debug(f"Loading Russian diminutives from: {ru_path}")
-                with open(ru_path, 'r', encoding='utf-8') as f:
-                    self._diminutive_dicts['ru'] = json.load(f)
-                self._logger.debug(f"Loaded {len(self._diminutive_dicts['ru'])} Russian diminutives")
-                if 'вика' in self._diminutive_dicts['ru']:
-                    self._logger.debug(f"Found 'вика' -> '{self._diminutive_dicts['ru']['вика']}'")
-                else:
-                    self._logger.debug("'вика' not found in Russian diminutives")
-                
-                # Load Ukrainian diminutives
-                uk_path = Path(__file__).resolve().parents[4] / "data" / "diminutives_uk.json"
-                with open(uk_path, 'r', encoding='utf-8') as f:
-                    self._diminutive_dicts['uk'] = json.load(f)
-            except Exception as e:
-                self._logger.debug(f"Failed to load diminutive dictionaries: {e}")
-                return token
-        
+        if not hasattr(self, "_diminutive_dicts"):
+            self._load_diminutive_dicts()
+
+        if role == "given":
+            canonical = _given_declensions(lang).get(token.casefold())
+            if canonical:
+                return canonical
+
+            # Inflected nicknames may be absent from the flat lookup. Resolve
+            # dictionary-backed name parses before applying suffix guesses.
+            candidates = {
+                self._diminutive_dicts[lang][parse.normal.casefold()]
+                for parse in self.parse(token, lang)
+                if "Name" in parse.tag and parse.normal
+                and parse.normal.casefold() in self._diminutive_dicts.get(lang, {})
+            }
+            if len(candidates) == 1 and getattr(flags, 'enable_enhanced_diminutives', True):
+                return next(iter(candidates))
+
         # Step 0: Handle Russian names in Ukrainian context (critical fix for Петр -> Петро)
         if lang == "uk" and role == 'given':
             # Check if this is a known Russian name that has a Ukrainian equivalent
@@ -670,7 +714,8 @@ class MorphologyAdapter:
 
         # Step 1: Check diminutive dictionary for original token FIRST
         canonical = self._diminutive_dicts.get(lang, {}).get(token.lower())
-        if canonical:
+        if (getattr(flags, 'enable_enhanced_diminutives', True) and canonical
+                and canonical.casefold().replace("ё", "е") != token.casefold().replace("ё", "е")):
             self._logger.debug(f"Diminutive mapping: '{token}' -> '{canonical}'")
             return canonical
 
@@ -687,6 +732,27 @@ class MorphologyAdapter:
 
         return token
 
+    def _canonical_given_spelling(self, token: str, lang: str) -> str:
+        """Resolve unambiguous Russian е/ё spelling before any canonical return.
+
+        Dictionary aliases may use е while the analyzer uses ё. Applying the
+        same spelling rule to every given-name path avoids changing spelling on
+        a later normalization pass merely because its case or inflection changed.
+        """
+        if lang != "ru" or "е" not in token.casefold():
+            return token
+        folded = token.casefold().replace("ё", "е")
+        spellings = {
+            parse.nominative.casefold()
+            for parse in self.parse(token, lang)
+            if "Name" in parse.tag and "plur" not in parse.tag
+            and parse.case == "nomn" and parse.nominative
+            and parse.nominative.casefold().replace("ё", "е") == folded
+        }
+        if len(spellings) == 1:
+            return self._preserve_case(token, next(iter(spellings)))
+        return token
+
     def _to_nominative_uncached_with_flags(self, token: str, lang: str, flags: 'FeatureFlags', role: str = 'unknown') -> Tuple[str, str]:
         """Uncached nominative conversion with feature flags support."""
         # Check if nominative enforcement is disabled
@@ -700,6 +766,8 @@ class MorphologyAdapter:
 
         # PRE-CANON STEP: Apply our custom rules before pymorphy3
         canonical_base = self._apply_pre_canon_rules(token, lang, flags, role)
+        if role == "given":
+            canonical_base = self._canonical_given_spelling(canonical_base, lang)
         self._logger.debug(f"Pre-canon: '{token}' -> '{canonical_base}'")
         if canonical_base != token:
             # If our rules changed the token, return it directly without pymorphy3
@@ -712,6 +780,10 @@ class MorphologyAdapter:
             trace_note = None
 
         parses = self._parse_uncached(base_token, lang)
+        analyzer = self._analyzers.get(lang)
+        if ("'" in base_token and analyzer is not None
+                and not analyzer.word_is_known(base_token)):
+            return base_token, "morph.unknown_apostrophe_name"
         if not parses:
             if lang == "uk":
                 fallback = self._fallback_ukrainian_nominative(base_token)
@@ -725,6 +797,40 @@ class MorphologyAdapter:
         if best_parse.normal and best_parse.normal.lower() == base_token.lower():
             self._logger.debug(f"Idempotent: keeping '{base_token}' as is")
             return base_token, "morph.nominal_noop"
+
+        if role == "surname":
+            # An input case marked nominative is not inherently more probable
+            # than a genitive parse. Prefer the analyzer's surname evidence;
+            # otherwise a low-probability feminine parse wins for every -ова.
+            surname_parses = [
+                parse for parse in parses
+                if "Surn" in parse.tag and "plur" not in parse.tag and parse.nominative
+            ]
+            if surname_parses:
+                # Some dictionaries assign the same score to every grammatical
+                # interpretation. Selecting the first parse then makes the result
+                # depend on dictionary ordering (for example, Ukrainian
+                # ``Скрипці`` could become either ``Скрипець`` or ``Скрипка``).
+                # Aggregate evidence by nominative form and keep source order only
+                # as a deterministic final tie-breaker.
+                evidence: Dict[str, Tuple[float, int, int]] = {}
+                for index, parse in enumerate(surname_parses):
+                    key = parse.nominative.casefold()
+                    total, count, first_index = evidence.get(key, (0.0, 0, index))
+                    evidence[key] = (total + parse.score, count + 1, first_index)
+                best_key = max(
+                    evidence,
+                    key=lambda key: (
+                        evidence[key][0],
+                        evidence[key][1],
+                        -evidence[key][2],
+                    ),
+                )
+                best = next(
+                    parse for parse in surname_parses
+                    if parse.nominative.casefold() == best_key
+                )
+                return self._preserve_case(base_token, best.nominative), "morph.to_nominative"
 
         if lang == "uk":
             preferred_parse = self._prefer_ukrainian_masculine_parse(base_token, parses)
@@ -840,7 +946,7 @@ class MorphologyAdapter:
         if best_parse:
             result = self._preserve_case(base_token, best_parse.nominative)
             # Check diminutive dictionary after pymorphy3
-            diminutive_result = self._check_diminutive_dict(result, lang)
+            diminutive_result = self._check_diminutive_dict(result, lang) if getattr(flags, 'enable_enhanced_diminutives', True) else result
             if diminutive_result != result:
                 result = self._preserve_case(base_token, diminutive_result)
                 return result, trace_note or "morph.to_nominative_diminutive"
@@ -851,13 +957,22 @@ class MorphologyAdapter:
             if parse.normal:
                 result = self._preserve_case(base_token, parse.normal)
                 # Check diminutive dictionary after pymorphy3
-                diminutive_result = self._check_diminutive_dict(result, lang)
+                diminutive_result = self._check_diminutive_dict(result, lang) if getattr(flags, 'enable_enhanced_diminutives', True) else result
                 if diminutive_result != result:
                     result = self._preserve_case(base_token, diminutive_result)
                     return result, trace_note or "morph.to_nominative_diminutive"
                 return result, trace_note or "morph.to_nominative"
         
         return base_token, trace_note or "morph.nominal_noop"
+
+    def _load_diminutive_dicts(self):
+        import json
+        dictionaries = {}
+        for language in ("ru", "uk"):
+            path = PACKAGE_DATA_DIR / f"diminutives_{language}.json"
+            with path.open(encoding="utf-8") as file:
+                dictionaries[language] = json.load(file)
+        self._diminutive_dicts = dictionaries
 
     def _check_diminutive_dict(self, token: str, lang: str) -> str:
         """Check if token exists in diminutive dictionary and return canonical form."""
@@ -866,6 +981,8 @@ class MorphologyAdapter:
         
         lang_dict = self._diminutive_dicts.get(lang, {})
         canonical = lang_dict.get(token.lower())
+        if canonical and canonical.casefold().replace("ё", "е") == token.casefold().replace("ё", "е"):
+            return token
         if canonical:
             self._logger.debug(f"Diminutive dict: '{token}' -> '{canonical}'")
             return canonical
@@ -959,7 +1076,7 @@ class MorphologyAdapter:
 
     def _detect_gender_uncached(self, token: str, lang: str) -> str:
         """Uncached gender detection."""
-        parses = self._parse_uncached(token, lang)
+        parses = self.parse(token, lang)
         
         # Find best parse by score
         best_parse = self._best_parse(parses)

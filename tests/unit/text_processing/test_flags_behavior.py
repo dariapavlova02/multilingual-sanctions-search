@@ -5,7 +5,7 @@ Unit tests for flag-based behavior in normalization service.
 
 import pytest
 import asyncio
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 from ai_service.data.dicts.stopwords import STOP_ALL
 
 

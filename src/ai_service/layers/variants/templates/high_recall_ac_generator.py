@@ -1,3 +1,4 @@
+from ai_service.data.resources import PACKAGE_DATA_DIR
 """
 High-Recall AC Pattern Generator для санкционного скрининга
 ПРИОРИТЕТ: Максимальный Recall (не пропускать санкционных лиц)
@@ -1290,7 +1291,7 @@ class HighRecallACGenerator:
             from pathlib import Path
             
             # Путь к словарю диминутивов
-            data_dir = Path(__file__).resolve().parents[4] / "data"
+            data_dir = PACKAGE_DATA_DIR
             diminutives_file = data_dir / f"diminutives_{language}.json"
             
             if diminutives_file.exists():
@@ -2474,8 +2475,8 @@ class HighRecallACGenerator:
                     import json
                     from pathlib import Path
                     
-                    base_path = Path(__file__).resolve().parents[5]
-                    diminutive_file = base_path / "data" / f"diminutives_{language}.json"
+                    base_path = PACKAGE_DATA_DIR
+                    diminutive_file = base_path / f"diminutives_{language}.json"
                     
                     if diminutive_file.exists():
                         with open(diminutive_file, 'r', encoding='utf-8') as f:
@@ -2517,8 +2518,8 @@ class HighRecallACGenerator:
                     import json
                     from pathlib import Path
                     
-                    base_path = Path(__file__).resolve().parents[5]
-                    nicknames_file = base_path / "data" / "lexicons" / "en_nicknames.json"
+                    base_path = PACKAGE_DATA_DIR
+                    nicknames_file = base_path / "lexicons" / "en_nicknames.json"
                     
                     if nicknames_file.exists():
                         with open(nicknames_file, 'r', encoding='utf-8') as f:

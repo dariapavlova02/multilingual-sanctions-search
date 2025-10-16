@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_regression:
+        description: Also run the complete research suite (known failures)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONHASHSEED: "0"
+  POETRY_VERSION: "2.1.4"
+
+jobs:
+  quality:
+    name: Reference contracts (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check documentation links
+        run: python scripts/check_docs.py
+
+      - name: Install Poetry
+        run: pipx install "poetry==${POETRY_VERSION}"
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction --no-ansi
+
+      - name: Install pinned NLP models
+        run: make download-models
+
+      - name: Validate package metadata
+        run: poetry check
+
+      - name: Compile Python sources
+        run: poetry run -- python -m compileall -q src tests
+
+      - name: Build disposable regression backend
+        run: docker build -f Dockerfile.elasticsearch -t sanctions-regression-es:ci .
+
+      - name: Run reference contracts
+        run: poetry run -- python scripts/run_regression_gate.py --image sanctions-regression-es:ci --result-dir .artifacts/reference -- $(cat tests/reference_suite.txt) -m "not performance and not perf_micro"
+
+      - name: Preserve reference results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-results
+          path: .artifacts/reference/
+
+      - name: Verify test collection
+        run: poetry run -- pytest --collect-only -q
+
+      - name: Validate Compose configurations
+        run: poetry run -- python scripts/validate_compose.py
+
+      - name: Reject committed runtime secrets
+        shell: bash
+        run: |
+          test ! -f env.production
+          while IFS= read -r file; do
+            case "$file" in
+              *.example) continue ;;
+            esac
+            if grep -Eq '^ADMIN_API_KEY=.+$' "$file"; then
+              echo "A runtime ADMIN_API_KEY is tracked in $file."
+              exit 1
+            fi
+          done < <(git ls-files | grep -E '(^|/)(\.env|env\.)' || true)
+
+      - name: Build Python package
+        run: poetry build
+
+      - name: Run complete research suite when requested
+        if: github.event_name == 'workflow_dispatch' && inputs.full_regression
+        run: poetry run -- python scripts/run_regression_gate.py --image sanctions-regression-es:ci --result-dir .artifacts/regression -- tests
+
+      - name: Preserve complete regression results
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.full_regression
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-regression-results
+          path: .artifacts/regression/

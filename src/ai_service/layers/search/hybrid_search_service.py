@@ -4,11 +4,14 @@ import asyncio
 import json
 import math
 import time
+from contextlib import aclosing
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...core.base_service import BaseService
+from ...config import EmbeddingConfig
 from ...utils.logging_config import get_logger
 from ...contracts.base_contracts import NormalizationResult
 
@@ -24,15 +27,9 @@ from .config import HybridSearchConfig
 from .elasticsearch_adapters import ElasticsearchACAdapter, ElasticsearchVectorAdapter
 from .elasticsearch_client import ElasticsearchClientFactory
 from .fuzzy_search_service import FuzzySearchService, FuzzyConfig
-from .sanctions_data_loader import SanctionsDataLoader
-from ..embeddings.indexing.watchlist_index_service import WatchlistIndexService
-from ..embeddings.indexing.enhanced_vector_index_service import EnhancedVectorIndex
-
-try:  # Optional heavy dependency
-    from ..embeddings.optimized_embedding_service import OptimizedEmbeddingService
-except Exception:  # pragma: no cover - optional dependency may be unavailable
-    OptimizedEmbeddingService = None  # type: ignore
-
+from .search_integrity import (
+    TAX_IDENTIFIER_TYPES, best_per_entity, candidate_identity, source_metadata, source_tax_ids, metadata_matches,
+)
 
 class HybridSearchService(BaseService, SearchService):
     """
@@ -41,7 +38,7 @@ class HybridSearchService(BaseService, SearchService):
     Implements escalation strategy:
     - First attempt: AC search for exact/almost-exact matches
     - Escalation: If AC results are weak or empty, trigger vector search
-    - Fallback: If Elasticsearch is unavailable, use local indexes
+    - Dependency failure: propagate an error; no clearance from unrelated local indexes
     """
     
     def __init__(self, config: Optional[HybridSearchConfig] = None):
@@ -52,7 +49,7 @@ class HybridSearchService(BaseService, SearchService):
             config: Search configuration, uses default if None
         """
         super().__init__("hybrid_search")
-        self.config = config or HybridSearchConfig.from_env()
+        self.config = HybridSearchConfig.validated_copy(config)
 
         # Search adapters
         self._ac_adapter: Optional[ElasticsearchACAdapter] = None
@@ -65,17 +62,16 @@ class HybridSearchService(BaseService, SearchService):
         self._ac_request_times: List[float] = []
         self._vector_request_times: List[float] = []
 
-        # Fallback services
-        self._fallback_watchlist_service: Optional[WatchlistIndexService] = None
-        self._fallback_vector_service: Optional[EnhancedVectorIndex] = None
-
         # Service state
         self._initialized = False
         self._last_health_check = None
+        self._closed = False
+        self._close_lock = asyncio.Lock()
 
         # Embedding service for vector queries (lazy init)
         self._embedding_service = None
-        self._embedding_service_checked = False
+        self._owned_embedding_service = None
+        self._embedding_config = EmbeddingConfig()
 
         # Fuzzy search service for typo handling
         fuzzy_config = FuzzyConfig(
@@ -86,17 +82,6 @@ class HybridSearchService(BaseService, SearchService):
             name_boost_factor=1.2
         )
         self._fuzzy_service = FuzzySearchService(fuzzy_config)
-        self._fuzzy_candidates_cache: Dict[str, List[str]] = {}  # Cache for candidates
-
-        # Sanctions data loader for fuzzy candidates
-        self._sanctions_loader = SanctionsDataLoader()
-        self._sanctions_loaded = False
-
-        # Force reload sanctions in production if needed
-        import os
-        if os.getenv("FORCE_RELOAD_SANCTIONS", "false").lower() == "true":
-            self.logger.warning("[PROGRESS] FORCE_RELOAD_SANCTIONS=true, will force reload sanctions data")
-
         # Embedding cache
         self._embedding_cache: Dict[str, Tuple[List[float], datetime]] = {}
         self._cache_lock = asyncio.Lock()
@@ -121,7 +106,8 @@ class HybridSearchService(BaseService, SearchService):
         self._fusion_weights, self._fusion_boosts = self._load_fusion_weights()
     
     def _do_initialize(self) -> None:
-        """Initialize search adapters and fallback services."""
+        """Initialize adapters for the configured source snapshot."""
+        self._ensure_open()
         try:
             # Try to initialize Elasticsearch components
             try:
@@ -136,27 +122,7 @@ class HybridSearchService(BaseService, SearchService):
                 )
                 self.logger.info("[OK] Elasticsearch adapters initialized successfully")
             except Exception as es_e:
-                self.logger.warning(f"[WARN] Failed to initialize Elasticsearch adapters: {es_e}")
-                self.logger.info("[CMD] Will use fallback services for search")
-                # Don't raise - continue with fallback services
-
-            # Initialize fallback services (always try these)
-            try:
-                self._ensure_fallback_services()
-                self.logger.info("[OK] Fallback services initialized")
-            except Exception as fallback_e:
-                self.logger.warning(f"[WARN] Failed to initialize fallback services: {fallback_e}")
-
-            # Start hot-reloading if supported
-            if hasattr(self.config, 'start_hot_reload'):
-                try:
-                    # Watch for changes in environment variables
-                    from pathlib import Path
-                    watch_paths = [Path(".env"), Path("config/settings.py")]
-                    asyncio.create_task(self.config.start_hot_reload(watch_paths))
-                    self.logger.info("Hot-reloading enabled for search configuration")
-                except Exception as e:
-                    self.logger.warning(f"Failed to enable hot-reloading: {e}")
+                raise RuntimeError("Elasticsearch adapters could not initialize") from es_e
 
             self._initialized = True
             self.logger.info("[OK] Hybrid search service initialized successfully (with available components)")
@@ -166,97 +132,57 @@ class HybridSearchService(BaseService, SearchService):
             raise
 
     async def _get_embedding_service(self):
-        """Lazily initialize and return embedding service if available."""
-        if self._embedding_service_checked:
-            return self._embedding_service
-
-        self._embedding_service_checked = True
-
-        if OptimizedEmbeddingService is None:
-            self.logger.warning("OptimizedEmbeddingService not available; using pseudo embeddings")
-            self._embedding_service = None
-            return None
-
-        loop = asyncio.get_running_loop()
-
-        def _init_service():
-            return OptimizedEmbeddingService(
-                enable_batch_optimization=True,
-                enable_gpu=False,
-                precompute_common_patterns=False,
-            )
-
-        try:
-            self._embedding_service = await loop.run_in_executor(None, _init_service)
-        except Exception as exc:  # pragma: no cover - depends on environment
-            self.logger.warning(f"Failed to initialize embedding service: {exc}")
-            self._embedding_service = None
-
+        """Use the same pinned model and preprocessing as ingestion."""
+        self._ensure_open()
+        if self._embedding_service is None:
+            from ..embeddings.embedding_service import EmbeddingService
+            self._embedding_service = EmbeddingService(self._embedding_config)
+            self._owned_embedding_service = self._embedding_service
         return self._embedding_service
 
-    def _pseudo_embedding(self, text: str) -> List[float]:
-        dimension = self.config.vector_search.vector_dimension
-        if dimension <= 0:
-            return []
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("Sanctions search service is closed")
 
-        vector = [0.0] * dimension
-        encoded = text.encode("utf-8")
-        if not encoded:
-            return vector
-
-        for idx, byte in enumerate(encoded):
-            position = (byte + idx) % dimension
-            vector[position] += 1.0
-
-        norm = math.sqrt(sum(v * v for v in vector)) or 1.0
-        return [v / norm for v in vector]
+    def _verify_embedding_contract(self):
+        self._ensure_open()
+        expected = self._embedding_config.embedding_contract()
+        if EmbeddingConfig().embedding_contract() != expected:
+            raise RuntimeError("Embedding contract changed; restart and reindex before vector screening")
+        if self._embedding_service is not None:
+            actual = getattr(self._embedding_service, "config", None)
+            if not isinstance(actual, EmbeddingConfig) or actual.embedding_contract() != expected:
+                raise RuntimeError("Embedding provider contract differs from the configured index contract")
+            if getattr(self._embedding_service, "embedding_contract", expected) != expected:
+                raise RuntimeError("Embedding loader contract differs from the configured index contract")
 
     async def _build_query_vector(self, normalized: NormalizationResult, text: str) -> List[float]:
-        query_text = normalized.normalized or text
-        processed_text = self._preprocess_query_for_embedding(query_text)
-        
-        # Check cache first
-        cached_vector = await self._get_cached_embedding(processed_text)
-        if cached_vector is not None:
-            self.logger.debug(f"Using cached embedding for: {processed_text[:50]}...")
-            return cached_vector
-        
         service = await self._get_embedding_service()
-        if service is not None:
-            loop = asyncio.get_running_loop()
-
-            def _compute():
-                return service.get_embeddings_optimized(
-                    [processed_text], 
-                    batch_size=self.config.embedding_batch_size, 
-                    use_cache=True
-                )
-
-            try:
-                result = await loop.run_in_executor(None, _compute)
-                embeddings = result.get("embeddings") if isinstance(result, dict) else None
-                if embeddings and embeddings[0]:
-                    vector = list(embeddings[0])
-                    dimension = self.config.vector_search.vector_dimension
-                    if len(vector) > dimension:
-                        vector = vector[:dimension]
-                    elif len(vector) < dimension:
-                        vector.extend([0.0] * (dimension - len(vector)))
-                    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
-                    normalized_vector = [v / norm for v in vector]
-                    
-                    # Cache the result
-                    await self._cache_embedding(processed_text, normalized_vector)
-                    self.logger.debug(f"Generated and cached embedding for: {processed_text[:50]}...")
-                    
-                    return normalized_vector
-            except Exception as exc:  # pragma: no cover - depends on embedding runtime
-                self.logger.warning(f"Embedding generation failed: {exc}")
-
-        # Fallback to pseudo embedding
-        pseudo_vector = self._pseudo_embedding(processed_text)
-        await self._cache_embedding(processed_text, pseudo_vector)
-        return pseudo_vector
+        if service is None:
+            raise RuntimeError("Configured embedding service is unavailable")
+        self._verify_embedding_contract()
+        query_text = normalized.normalized or text
+        cache_key = f"{service.config.model_name}:{service.config.revision}:{service.config.preprocessing_version}:{query_text}"
+        cached = await self._get_cached_embedding(cache_key)
+        if cached is not None:
+            self._verify_embedding_contract()
+            return cached
+        import inspect
+        encode_async = getattr(service, "encode_one_async", None)
+        if inspect.iscoroutinefunction(encode_async):
+            vector = await encode_async(query_text)
+        else:
+            vector = await asyncio.to_thread(service.encode_one, query_text)
+        self._verify_embedding_contract()
+        if self._embedding_service is not service:
+            raise RuntimeError("Embedding provider changed during contract verification")
+        dimension = self.config.vector_search.vector_dimension
+        if len(vector) != dimension or not all(math.isfinite(v) for v in vector):
+            raise ValueError("Embedding does not match the configured vector contract")
+        if not any(vector):
+            raise ValueError("Zero embeddings cannot be used for screening")
+        await self._cache_embedding(cache_key, vector)
+        return vector
 
     async def _get_cached_embedding(self, text: str) -> Optional[List[float]]:
         """Get cached embedding if available and not expired."""
@@ -268,7 +194,7 @@ class HybridSearchService(BaseService, SearchService):
                 vector, timestamp = self._embedding_cache[text]
                 age_seconds = (datetime.now() - timestamp).total_seconds()
                 if age_seconds < self.config.embedding_cache_ttl_seconds:
-                    return vector
+                    return list(vector)
                 else:
                     # Remove expired entry
                     del self._embedding_cache[text]
@@ -280,6 +206,7 @@ class HybridSearchService(BaseService, SearchService):
             return
             
         async with self._cache_lock:
+            self._ensure_open()
             # Remove oldest entries if cache is full
             if len(self._embedding_cache) >= self.config.embedding_cache_size:
                 # Remove oldest entry
@@ -287,7 +214,7 @@ class HybridSearchService(BaseService, SearchService):
                                key=lambda k: self._embedding_cache[k][1])
                 del self._embedding_cache[oldest_key]
             
-            self._embedding_cache[text] = (vector, datetime.now())
+            self._embedding_cache[text] = (list(vector), datetime.now())
 
     def _preprocess_query_for_embedding(self, text: str) -> str:
         """Preprocess query text for better embedding generation."""
@@ -300,24 +227,6 @@ class HybridSearchService(BaseService, SearchService):
         processed = re.sub(r'[^\w\s\-\.]', '', processed)
         return processed
 
-    def _ensure_fallback_services(self) -> None:
-        """Initialize fallback services with proper error handling."""
-        if not self.config.enable_fallback:
-            return
-            
-        try:
-            if self._fallback_watchlist_service is None:
-                self._fallback_watchlist_service = WatchlistIndexService()
-                self.logger.debug("Initialized WatchlistIndexService fallback")
-                
-            if self._fallback_vector_service is None:
-                self._fallback_vector_service = EnhancedVectorIndex()
-                self.logger.debug("Initialized EnhancedVectorIndex fallback")
-                
-        except Exception as exc:
-            self.logger.error(f"Failed to initialize fallback services: {exc}")
-            # Don't raise - fallback should be graceful
-
     def _load_fusion_weights(self) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Load fusion weights and boosts from configuration."""
         default_weights = {"ac": 0.6, "vector": 0.4}
@@ -326,9 +235,11 @@ class HybridSearchService(BaseService, SearchService):
             "metadata_match_bonus": 0.05,
         }
 
+        from ...data.resources import CONFIG_DIR
         path_candidates = [
             Path("config/weights.json"),
             Path("weights.json"),
+            CONFIG_DIR / "weights.json",
         ]
 
         for candidate in path_candidates:
@@ -362,6 +273,34 @@ class HybridSearchService(BaseService, SearchService):
         return default_weights, default_boosts
     
     async def find_candidates(
+        self,
+        normalized: NormalizationResult,
+        text: str,
+        opts: SearchOpts,
+        search_trace: Optional[SearchTrace] = None,
+    ) -> List[Candidate]:
+        """Bound readiness, model waiting and every search stage by one deadline."""
+        started = time.perf_counter()
+        self._metrics.total_requests += 1
+        candidates = None
+        try:
+            async with asyncio.timeout(opts.timeout_ms / 1000):
+                self._ensure_open()
+                result = await self._find_candidates_within_deadline(normalized, text, opts, search_trace)
+                self._ensure_open()
+                candidates = result
+                return candidates
+        except TimeoutError as exc:
+            raise RuntimeError("Configured sanctions search exceeded its deadline") from exc
+        finally:
+            # Account for readiness failures, cancellation and verified cache hits
+            # exactly once, as well as requests that execute a search strategy.
+            success = candidates is not None
+            result_count = len(candidates) if success else 0
+            avg_score = sum(c.score for c in candidates) / result_count if result_count else 0.0
+            self._update_metrics(success, (time.perf_counter() - started) * 1000, result_count, avg_score)
+
+    async def _find_candidates_within_deadline(
         self, 
         normalized: NormalizationResult, 
         text: str, 
@@ -389,8 +328,6 @@ class HybridSearchService(BaseService, SearchService):
             search_trace = SearchTrace(enabled=False)
         
         start_time = time.time()
-        self._metrics.total_requests += 1
-        
         # Validate and sanitize query
         text = self._validate_query(text)
         
@@ -414,10 +351,15 @@ class HybridSearchService(BaseService, SearchService):
         }
         
         # Check cache first
-        cache_key = self._generate_search_cache_key(text, opts)
+        require_vectors = opts.search_mode not in {SearchMode.AC, SearchMode.FUZZY}
+        dataset_version = await self.readiness(require_vectors=require_vectors)
+        cache_key = self._generate_search_cache_key(
+            text, opts, normalized=normalized.normalized, dataset_version=dataset_version
+        )
         cached_candidates = await self._get_cached_search_result(cache_key)
         
         if cached_candidates is not None:
+            await self._verify_dataset_version(dataset_version, require_vectors=require_vectors)
             # Return cached results
             search_log_data.update({
                 "status": "cache_hit",
@@ -445,8 +387,13 @@ class HybridSearchService(BaseService, SearchService):
                 candidates = await self._ac_search_only(normalized, text, opts, search_trace)
             elif opts.search_mode == SearchMode.VECTOR:
                 candidates = await self._vector_search_only(normalized, text, opts, search_trace)
-            else:  # HYBRID mode
+            elif opts.search_mode == SearchMode.FUZZY:
+                candidates = await self._fuzzy_search(normalized.normalized or text, opts, search_trace)
+            elif opts.search_mode == SearchMode.HYBRID:
                 candidates = await self._hybrid_search(normalized, text, opts, search_trace)
+            else:
+                raise ValueError("Unsupported public search mode")
+            await self._verify_dataset_version(dataset_version, require_vectors=require_vectors)
             
             # Process and rank results
             candidates = self._process_results(candidates, opts)
@@ -460,7 +407,6 @@ class HybridSearchService(BaseService, SearchService):
             # Update metrics
             processing_time = (time.time() - start_time) * 1000  # Convert to ms
             avg_score = sum(c.score for c in candidates) / len(candidates) if candidates else 0.0
-            self._update_metrics(True, processing_time, len(candidates), avg_score)
             
             # Cache search results
             await self._cache_search_result(cache_key, candidates)
@@ -491,12 +437,11 @@ class HybridSearchService(BaseService, SearchService):
                 f"Search completed: {len(candidates)} candidates found in {processing_time:.2f}ms"
             )
 
-            print(f"[TARGET] find_candidates RESULT: {len(candidates)} candidates, {processing_time:.2f}ms")
+            self.logger.debug("%s", " ".join(map(str, [f"[TARGET] find_candidates RESULT: {len(candidates)} candidates, {processing_time:.2f}ms"])))
             return candidates
             
         except Exception as e:
             processing_time = (time.time() - start_time) * 1000
-            self._update_metrics(False, processing_time, 0)
             
             # Log failed search
             search_log_data.update({
@@ -507,8 +452,7 @@ class HybridSearchService(BaseService, SearchService):
             })
             self.logger.error("Search failed", extra=search_log_data)
 
-            # Fallback to local indexes when Elasticsearch is unavailable
-            return await self._fallback_search(normalized, text, opts, search_trace)
+            raise RuntimeError("Configured sanctions search is unavailable") from e
     
     async def _ac_search_only(
         self, 
@@ -547,6 +491,9 @@ class HybridSearchService(BaseService, SearchService):
 
             search_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
 
+            if getattr(self._ac_adapter, "_connected", True) is False:
+                raise RuntimeError("AC adapter did not complete a connected search")
+
             # Update AC-specific metrics
             self._update_ac_metrics(search_time, len(candidates))
 
@@ -580,19 +527,11 @@ class HybridSearchService(BaseService, SearchService):
                 meta={
                     "index_name": self.config.elasticsearch.ac_index,
                     "search_mode": "exact",
-                    "fallback_enabled": self.config.enable_fallback,
+                    "fallback_enabled": False,
                     "adapter_connected": getattr(self._ac_adapter, "_connected", True)
                 }
             ))
             
-            if (
-                not candidates
-                and self.config.enable_fallback
-                and not getattr(self._ac_adapter, "_connected", True)
-            ):
-                self.logger.warning("AC adapter unavailable – using fallback search")
-                return await self._fallback_search(normalized, text, opts, search_trace)
-
             # Log AC search results
             ac_log_data.update({
                 "status": "success",
@@ -614,7 +553,7 @@ class HybridSearchService(BaseService, SearchService):
             })
             self.logger.error("AC search failed", extra=ac_log_data)
             search_trace.note(f"AC search failed: {str(e)}")
-            return []
+            raise
 
     async def _vector_search_only(
         self, 
@@ -654,6 +593,9 @@ class HybridSearchService(BaseService, SearchService):
             
             search_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
 
+            if getattr(self._vector_adapter, "_connected", True) is False:
+                raise RuntimeError("Vector adapter did not complete a connected search")
+
             # Update Vector-specific metrics
             self._update_vector_metrics(search_time, len(candidates))
 
@@ -688,20 +630,12 @@ class HybridSearchService(BaseService, SearchService):
                 meta={
                     "index_name": self.config.elasticsearch.vector_index,
                     "search_mode": "vector_similarity",
-                    "fallback_enabled": self.config.enable_fallback,
+                    "fallback_enabled": False,
                     "adapter_connected": getattr(self._vector_adapter, "_connected", True),
                     "embedding_model": getattr(self._embedding_service, 'model_name', 'unknown')
                 }
             ))
             
-            if (
-                not candidates
-                and self.config.enable_fallback
-                and not getattr(self._vector_adapter, "_connected", True)
-            ):
-                self.logger.warning("Vector adapter unavailable – using fallback search")
-                return await self._fallback_search(normalized, text, opts, search_trace)
-
             # Log vector search results
             vector_log_data.update({
                 "status": "success",
@@ -723,192 +657,34 @@ class HybridSearchService(BaseService, SearchService):
             })
             self.logger.error("Vector search failed", extra=vector_log_data)
             search_trace.note(f"Vector search failed: {str(e)}")
-            return []
+            raise
     
-    async def _hybrid_search(
-        self, 
-        normalized: NormalizationResult, 
-        text: str, 
-        opts: SearchOpts,
-        search_trace: Optional[SearchTrace] = None
-    ) -> List[Candidate]:
-        """Execute hybrid search with escalation and vector fallback."""
+    async def _hybrid_search(self, normalized, text, opts, search_trace=None):
+        """Escalate once per strategy and retain every strategy's accepted matches."""
         self._metrics.hybrid_requests += 1
-        
-        # Create dummy trace if none provided
-        if search_trace is None:
-            search_trace = SearchTrace(enabled=False)
-        
+        search_trace = search_trace or SearchTrace(enabled=False)
+        started = time.perf_counter()
         query_text = normalized.normalized or text
-        hybrid_start_time = time.perf_counter()
-        
-        # Step 1: Try AC search first
-        ac_start_time = time.perf_counter()
         ac_candidates = await self._ac_search_only(normalized, text, opts, search_trace)
-        ac_time = (time.perf_counter() - ac_start_time) * 1000
-
-        # Add AC trace step
-        ac_best_score = max((c.score for c in ac_candidates), default=0.0)
-        search_trace.add_step(SearchTraceStep(
-            stage="AC",
-            query=query_text,
-            topk=opts.top_k,
-            took_ms=ac_time,
-            hits=[SearchTraceHit(doc_id=c.doc_id, score=c.score, rank=i+1, source="AC")
-                  for i, c in enumerate(ac_candidates[:10])],
-            meta={
-                "threshold": opts.threshold,
-                "best_score": ac_best_score,
-                "total_hits": len(ac_candidates)
-            }
-        ))
-
-        # Check if AC results are sufficient
-        should_escalate = self._should_escalate(ac_candidates, opts)
-        print(f"[HOT] ESCALATION DEBUG: ac_count={len(ac_candidates)}, should_escalate={should_escalate}, threshold={opts.escalation_threshold}")
-        if should_escalate:
-            print(f"[INIT] ESCALATING: AC results insufficient, trying fuzzy search first")
-            self.logger.info("AC results insufficient, trying fuzzy search first")
+        fuzzy_candidates = []
+        vector_candidates = []
+        escalate = self._should_escalate(ac_candidates, opts)
+        if escalate:
             self._metrics.escalation_triggered += 1
-
-            # Step 2: Try fuzzy search before vector search
-            fuzzy_start_time = time.perf_counter()
             fuzzy_candidates = await self._fuzzy_search(query_text, opts, search_trace)
-            fuzzy_time = (time.perf_counter() - fuzzy_start_time) * 1000
+            if not self._fuzzy_results_sufficient(fuzzy_candidates, opts):
+                vector_candidates = await self._vector_search_only(normalized, text, opts, search_trace)
+        lexical = best_per_entity(ac_candidates + fuzzy_candidates)
+        candidates = self._combine_results(lexical, vector_candidates, opts)
+        self._add_hybrid_trace_step(
+            search_trace, query_text, opts, candidates,
+            (time.perf_counter() - started) * 1000,
+            {"escalation_triggered": escalate, "fuzzy_search_used": escalate,
+             "ac_candidates": len(ac_candidates), "fuzzy_candidates": len(fuzzy_candidates),
+             "vector_candidates": len(vector_candidates), "final_candidates": len(candidates)},
+        )
+        return candidates
 
-            # Add fuzzy trace step
-            fuzzy_best_score = max((c.score for c in fuzzy_candidates), default=0.0)
-            search_trace.add_step(SearchTraceStep(
-                stage="LEXICAL",  # Fuzzy is lexical search
-                query=query_text,
-                topk=opts.top_k,
-                took_ms=fuzzy_time,
-                hits=[SearchTraceHit(doc_id=c.doc_id, score=c.score, rank=i+1, source="LEXICAL")
-                      for i, c in enumerate(fuzzy_candidates[:10])],
-                meta={
-                    "search_type": "fuzzy",
-                    "best_score": fuzzy_best_score,
-                    "total_hits": len(fuzzy_candidates),
-                    "escalation_triggered": True
-                }
-            ))
-
-            # Check if fuzzy results are good enough
-            print(f"[STATS] CHECKING FUZZY SUFFICIENCY: {len(fuzzy_candidates)} candidates")
-            if fuzzy_candidates:
-                best_fuzzy_score = max(c.score for c in fuzzy_candidates)
-                print(f"   Best fuzzy score: {best_fuzzy_score:.3f}")
-                print(f"   High confidence threshold: {self._fuzzy_service.config.high_confidence_threshold}")
-                print(f"   Min threshold: {self._fuzzy_service.config.min_score_threshold}")
-
-            is_sufficient = self._fuzzy_results_sufficient(fuzzy_candidates, opts)
-            print(f"   Is sufficient: {is_sufficient}")
-
-            if is_sufficient:
-                print("[OK] FUZZY RESULTS SUFFICIENT - returning fuzzy results")
-                self.logger.info(f"Fuzzy search found {len(fuzzy_candidates)} good matches - skipping vector search")
-                # Combine AC and fuzzy results
-                print(f"🔗 COMBINING RESULTS: ac={len(ac_candidates)}, fuzzy={len(fuzzy_candidates)}")
-                all_candidates = self._combine_results(ac_candidates, fuzzy_candidates, opts)
-                print(f"   Combined result: {len(all_candidates)} candidates")
-
-                # Add hybrid step to trace
-                hybrid_time = (time.perf_counter() - hybrid_start_time) * 1000
-                self._add_hybrid_trace_step(search_trace, query_text, opts, all_candidates, hybrid_time, {
-                    "escalation_triggered": True,
-                    "fuzzy_search_used": True,
-                    "vector_search_skipped": True,
-                    "ac_candidates": len(ac_candidates),
-                    "fuzzy_candidates": len(fuzzy_candidates),
-                    "final_candidates": len(all_candidates)
-                })
-
-                return all_candidates
-            else:
-                self.logger.info("Fuzzy search insufficient, escalating to vector search")
-
-            # Step 3: Execute vector search (fuzzy wasn't sufficient)
-            vector_start_time = time.perf_counter()
-            vector_candidates = await self._vector_search_only(normalized, text, opts, search_trace)
-            vector_time = (time.perf_counter() - vector_start_time) * 1000
-
-            # Add vector trace step
-            vector_best_score = max((c.score for c in vector_candidates), default=0.0)
-            search_trace.add_step(SearchTraceStep(
-                stage="SEMANTIC",  # Vector is semantic search
-                query=query_text,
-                topk=opts.top_k,
-                took_ms=vector_time,
-                hits=[SearchTraceHit(doc_id=c.doc_id, score=c.score, rank=i+1, source="SEMANTIC")
-                      for i, c in enumerate(vector_candidates[:10])],
-                meta={
-                    "search_type": "vector",
-                    "best_score": vector_best_score,
-                    "total_hits": len(vector_candidates),
-                    "fuzzy_insufficient": True
-                }
-            ))
-
-            # Combine all three result sets
-            all_candidates = self._combine_results(ac_candidates, fuzzy_candidates, opts)
-            all_candidates = self._combine_results(all_candidates, vector_candidates, opts)
-            
-            # Step 4: Check if vector fallback is needed
-            if self._should_use_vector_fallback(ac_candidates, vector_candidates, opts):
-                self.logger.info("Using vector fallback for better results")
-                fallback_candidates = await self._vector_fallback_search(normalized, text, opts, search_trace)
-                
-                # Combine all results
-                all_candidates = self._combine_results(ac_candidates, vector_candidates, opts)
-                all_candidates.extend(fallback_candidates)
-                
-                # Remove duplicates and rerank
-                all_candidates = self._deduplicate_and_rerank(all_candidates, opts)
-                
-                # Add hybrid step to trace
-                hybrid_time = (time.perf_counter() - hybrid_start_time) * 1000
-                self._add_hybrid_trace_step(search_trace, query_text, opts, all_candidates, hybrid_time, {
-                    "escalation_triggered": True,
-                    "fuzzy_search_used": True,
-                    "vector_fallback_used": True,
-                    "ac_candidates": len(ac_candidates),
-                    "fuzzy_candidates": len(fuzzy_candidates),
-                    "vector_candidates": len(vector_candidates),
-                    "fallback_candidates": len(fallback_candidates),
-                    "final_candidates": len(all_candidates)
-                })
-                
-                return all_candidates
-            else:
-                # Step 4: Combine and deduplicate results
-                all_candidates = self._combine_results(ac_candidates, vector_candidates, opts)
-                
-                # Add hybrid step to trace
-                hybrid_time = (time.perf_counter() - hybrid_start_time) * 1000
-                self._add_hybrid_trace_step(search_trace, query_text, opts, all_candidates, hybrid_time, {
-                    "escalation_triggered": True,
-                    "fuzzy_search_used": True,
-                    "vector_fallback_used": False,
-                    "ac_candidates": len(ac_candidates),
-                    "fuzzy_candidates": len(fuzzy_candidates),
-                    "vector_candidates": len(vector_candidates),
-                    "final_candidates": len(all_candidates)
-                })
-                
-                return all_candidates
-        else:
-            # Add hybrid step to trace (AC only)
-            hybrid_time = (time.perf_counter() - hybrid_start_time) * 1000
-            self._add_hybrid_trace_step(search_trace, query_text, opts, ac_candidates, hybrid_time, {
-                "escalation_triggered": False,
-                "vector_fallback_used": False,
-                "ac_candidates": len(ac_candidates),
-                "vector_candidates": 0,
-                "final_candidates": len(ac_candidates)
-            })
-            
-            return ac_candidates
-    
     def _should_escalate(self, ac_candidates: List[Candidate], opts: SearchOpts) -> bool:
         """Determine if escalation to vector search is needed."""
         self.logger.info(f"Checking escalation: enable={opts.enable_escalation}, ac_count={len(ac_candidates)}, threshold={opts.escalation_threshold}")
@@ -954,255 +730,44 @@ class HybridSearchService(BaseService, SearchService):
         
         return False
 
-    async def _vector_fallback_search(
-        self, 
-        normalized: NormalizationResult, 
-        text: str, 
-        opts: SearchOpts,
-        search_trace: Optional[SearchTrace] = None
-    ) -> List[Candidate]:
-        """Execute vector fallback search with kNN + BM25."""
-        try:
-            # Build query vector
-            query_vector = await self._build_query_vector(normalized, text)
-            
-            # Use vector adapter's fallback search
-            fallback_candidates = await self._vector_adapter.search_vector_fallback(
-                query_vector=query_vector,
-                query_text=text,
-                opts=opts
+    async def _vector_fallback_search(self, normalized, text, opts, search_trace=None):
+        """Vector fallback shares the main model, index and similarity contract."""
+        query_vector = await self._build_query_vector(normalized, text)
+        return await self._vector_adapter.search_vector_fallback(
+            query_vector=query_vector, query_text=text, opts=opts,
+        )
+
+    def _deduplicate_and_rerank(self, candidates, opts):
+        return best_per_entity(candidates)[:opts.top_k]
+
+    def _combine_results(self, ac_candidates, vector_candidates, opts):
+        """Fuse evidence per source entity; absence of another hit is not a penalty."""
+        combined = {candidate_identity(c): replace(c, metadata=dict(c.metadata))
+                    for c in best_per_entity(ac_candidates)}
+        for candidate in best_per_entity(vector_candidates):
+            key = candidate_identity(candidate)
+            existing = combined.get(key)
+            if existing is None:
+                combined[key] = replace(candidate, metadata=dict(candidate.metadata))
+                continue
+            # AC and fuzzy scores measure the same lexical evidence. They must
+            # not receive an agreement bonus or be counted as separate identities.
+            if candidate.search_mode != SearchMode.VECTOR:
+                combined[key] = best_per_entity([existing, candidate])[0]
+                continue
+            ac_weight = self._fusion_weights["ac"]
+            vector_weight = self._fusion_weights["vector"]
+            score = (existing.score * ac_weight + candidate.score * vector_weight) / (ac_weight + vector_weight)
+            metadata = {**candidate.metadata, **existing.metadata,
+                        "retrieval_scores": {"lexical": existing.score, "vector": candidate.score}}
+            combined[key] = replace(
+                existing, score=min(1.0, score), metadata=metadata,
+                confidence=max(existing.confidence, candidate.confidence),
+                search_mode=SearchMode.HYBRID,
+                match_fields=sorted(set(existing.match_fields + candidate.match_fields)),
             )
-            
-            # Apply RapidFuzz reranking if enabled
-            if getattr(self.config, 'enable_rapidfuzz_rerank', True):
-                fallback_candidates = self._apply_rapidfuzz_reranking(fallback_candidates, text)
-            
-            # Apply DoB/ID anchor checking if enabled
-            if getattr(self.config, 'enable_dob_id_anchors', True):
-                fallback_candidates = self._apply_anchor_boost(fallback_candidates, text)
-            
-            return fallback_candidates
-            
-        except Exception as e:
-            self.logger.error(f"Vector fallback search failed: {e}")
-            return []
+        return best_per_entity(combined.values())[:opts.top_k]
 
-    def _apply_rapidfuzz_reranking(
-        self, 
-        candidates: List[Candidate], 
-        query_text: str
-    ) -> List[Candidate]:
-        """Apply RapidFuzz reranking to vector fallback results."""
-        try:
-            from rapidfuzz import fuzz
-            
-            for candidate in candidates:
-                if hasattr(candidate, 'trace') and candidate.trace:
-                    # Calculate string similarity
-                    text = candidate.text.lower()
-                    query = query_text.lower()
-                    
-                    # Use different fuzz algorithms for better matching
-                    ratio = fuzz.ratio(query, text)
-                    partial_ratio = fuzz.partial_ratio(query, text)
-                    token_sort_ratio = fuzz.token_sort_ratio(query, text)
-                    
-                    # Use the best score
-                    fuzz_score = max(ratio, partial_ratio, token_sort_ratio)
-                    
-                    # Update trace
-                    candidate.trace["fuzz"] = fuzz_score
-                    
-                    # Boost score based on string similarity
-                    if fuzz_score > 80:
-                        candidate.score *= 1.2  # 20% boost for high similarity
-                    elif fuzz_score > 60:
-                        candidate.score *= 1.1  # 10% boost for medium similarity
-            
-            # Sort by updated scores
-            candidates.sort(key=lambda c: c.score, reverse=True)
-            
-        except ImportError:
-            self.logger.warning("RapidFuzz not available, skipping reranking")
-        except Exception as e:
-            self.logger.error(f"RapidFuzz reranking failed: {e}")
-        
-        return candidates
-
-    def _apply_anchor_boost(
-        self, 
-        candidates: List[Candidate], 
-        query_text: str
-    ) -> List[Candidate]:
-        """Apply DoB/ID anchor boost to vector fallback results."""
-        import re
-        
-        # Extract DoB patterns from query
-        dob_patterns = [
-            r'\b\d{4}-\d{2}-\d{2}\b',  # YYYY-MM-DD
-            r'\b\d{2}\.\d{2}\.\d{4}\b',  # DD.MM.YYYY
-            r'\b\d{2}/\d{2}/\d{4}\b',  # DD/MM/YYYY
-        ]
-        
-        # Extract ID patterns from query
-        id_patterns = [
-            r'\bpassport\s*\d+\b',
-            r'\bID\s*\d+\b',
-            r'\b№\s*\d+\b',
-            r'\b[A-Z]{2}\d{6}\b',  # Passport format
-        ]
-        
-        query_dobs = []
-        query_ids = []
-        
-        for pattern in dob_patterns:
-            query_dobs.extend(re.findall(pattern, query_text))
-        
-        for pattern in id_patterns:
-            query_ids.extend(re.findall(pattern, query_text))
-        
-        for candidate in candidates:
-            if hasattr(candidate, 'trace') and candidate.trace:
-                anchor_matches = []
-                
-                # Check DoB anchors
-                if query_dobs and candidate.metadata.get('dob'):
-                    candidate_dob = candidate.metadata['dob']
-                    for query_dob in query_dobs:
-                        if query_dob in candidate_dob or candidate_dob in query_dob:
-                            anchor_matches.append("dob_anchor")
-                            candidate.score *= 1.3  # 30% boost for DoB match
-                            break
-                
-                # Check ID anchors
-                if query_ids and candidate.metadata.get('doc_id'):
-                    candidate_id = candidate.metadata['doc_id']
-                    for query_id in query_ids:
-                        if query_id in candidate_id or candidate_id in query_id:
-                            anchor_matches.append("id_anchor")
-                            candidate.score *= 1.2  # 20% boost for ID match
-                            break
-                
-                # Update trace
-                candidate.trace["anchors"] = anchor_matches
-        
-        return candidates
-
-    def _deduplicate_and_rerank(
-        self, 
-        candidates: List[Candidate], 
-        opts: SearchOpts
-    ) -> List[Candidate]:
-        """Deduplicate and rerank combined results."""
-        if not candidates:
-            return []
-        
-        # Deduplicate by doc_id
-        seen_docs = set()
-        deduplicated = []
-        
-        for candidate in candidates:
-            if candidate.doc_id not in seen_docs:
-                seen_docs.add(candidate.doc_id)
-                deduplicated.append(candidate)
-        
-        # Sort by score
-        deduplicated.sort(key=lambda c: c.score, reverse=True)
-        
-        return deduplicated[:opts.top_k]
-    
-    def _combine_results(
-        self,
-        ac_candidates: List[Candidate],
-        vector_candidates: List[Candidate],
-        opts: SearchOpts
-    ) -> List[Candidate]:
-        """Combine and deduplicate results from AC and vector search."""
-        print(f"[STATS] _combine_results INPUT: ac={len(ac_candidates)}, vector={len(vector_candidates)}")
-
-        ac_weight = self._fusion_weights.get("ac", 0.6)
-        vector_weight = self._fusion_weights.get("vector", 0.4)
-
-        # If we have only vector/fuzzy candidates, don't degrade their scores
-        if not ac_candidates and vector_candidates:
-            vector_weight = 1.0
-            print(f"   No AC candidates - using full vector weight: {vector_weight}")
-        else:
-            print(f"   Weights: ac={ac_weight}, vector={vector_weight}")
-
-        combined: Dict[str, Candidate] = {}
-
-        for candidate in ac_candidates:
-            weighted_score = candidate.score * ac_weight
-            combined[candidate.doc_id] = Candidate(
-                doc_id=candidate.doc_id,
-                score=weighted_score,
-                text=candidate.text,
-                entity_type=candidate.entity_type,
-                metadata=dict(candidate.metadata),
-                search_mode=SearchMode.AC,
-                match_fields=list(candidate.match_fields),
-                confidence=candidate.confidence,
-            )
-
-        for candidate in vector_candidates:
-            weighted_score = candidate.score * vector_weight
-            if candidate.doc_id in combined:
-                existing = combined[candidate.doc_id]
-                merged_metadata = {**candidate.metadata, **existing.metadata}
-                merged_fields = sorted(set(existing.match_fields + candidate.match_fields))
-                combined_score = (
-                    existing.score
-                    + weighted_score
-                    + self._fusion_boosts.get("shared_hit_bonus", 0.0)
-                )
-                combined[candidate.doc_id] = Candidate(
-                    doc_id=candidate.doc_id,
-                    score=combined_score,
-                    text=existing.text or candidate.text,
-                    entity_type=existing.entity_type or candidate.entity_type,
-                    metadata=merged_metadata,
-                    search_mode=SearchMode.HYBRID,
-                    match_fields=merged_fields,
-                    confidence=max(existing.confidence, candidate.confidence),
-                )
-            else:
-                combined[candidate.doc_id] = Candidate(
-                    doc_id=candidate.doc_id,
-                    score=weighted_score,
-                    text=candidate.text,
-                    entity_type=candidate.entity_type,
-                    metadata=dict(candidate.metadata),
-                    search_mode=SearchMode.VECTOR,
-                    match_fields=list(candidate.match_fields),
-                    confidence=candidate.confidence,
-                )
-
-        metadata_filters = opts.metadata_filters or {}
-        metadata_bonus = self._fusion_boosts.get("metadata_match_bonus", 0.0)
-        if metadata_filters and metadata_bonus:
-            for candidate in combined.values():
-                if self._matches_metadata_filters(candidate, metadata_filters):
-                    candidate.score += metadata_bonus
-
-        results = list(combined.values())
-        results.sort(key=lambda c: c.score, reverse=True)
-
-        if self.config.enable_deduplication:
-            deduped: Dict[str, Candidate] = {}
-            for candidate in results:
-                if candidate.doc_id not in deduped:
-                    deduped[candidate.doc_id] = candidate
-            results = list(deduped.values())
-
-        final_results = results[:opts.top_k]
-        print(f"[STATS] _combine_results OUTPUT: {len(final_results)} candidates")
-        if final_results:
-            for i, candidate in enumerate(final_results[:3]):
-                print(f"   {i+1}. {candidate.text} (score: {candidate.score:.3f})")
-
-        return final_results
-    
     def _process_results(self, candidates: List[Candidate], opts: SearchOpts) -> List[Candidate]:
         """Process and filter search results."""
         # Apply threshold filtering
@@ -1225,219 +790,17 @@ class HybridSearchService(BaseService, SearchService):
                 if self._matches_metadata_filters(c, opts.metadata_filters)
             ]
         
-        # Process AC pattern hits - mark as should_process=True and apply boosts
-        for candidate in filtered_candidates:
-            if hasattr(candidate, 'should_process') and candidate.should_process:
-                # AC pattern hit - apply additional processing
-                if hasattr(candidate, 'trace') and candidate.trace:
-                    tier = candidate.trace.get('tier', 0)
-                    if tier == 0:
-                        # T0: Exact document ID - highest priority
-                        candidate.score *= 1.5
-                    elif tier == 1:
-                        # T1: Full name with context - high priority
-                        candidate.score *= 1.2
-            
-            # Process vector fallback hits
-            if hasattr(candidate, 'trace') and candidate.trace:
-                reason = candidate.trace.get('reason', '')
-                if reason == 'vector_fallback':
-                    # Apply vector fallback specific processing
-                    cosine_sim = candidate.trace.get('cosine', 0.0)
-                    fuzz_score = candidate.trace.get('fuzz', 0)
-                    anchors = candidate.trace.get('anchors', [])
-                    
-                    # Boost based on cosine similarity
-                    if cosine_sim > 0.7:
-                        candidate.score *= 1.3  # High similarity boost
-                    elif cosine_sim > 0.5:
-                        candidate.score *= 1.1  # Medium similarity boost
-                    
-                    # Additional boost for anchor matches
-                    if 'dob_anchor' in anchors:
-                        candidate.score *= 1.2
-                    if 'id_anchor' in anchors:
-                        candidate.score *= 1.1
-        
-        return filtered_candidates
-    
-    def _matches_metadata_filters(self, candidate: Candidate, filters: Dict[str, Any]) -> bool:
-        """Check if candidate matches metadata filters."""
-        for key, value in filters.items():
-            candidate_value = None
-            if key in {"country", "country_code"}:
-                candidate_value = (
-                    candidate.metadata.get("country")
-                    or candidate.metadata.get("country_code")
-                )
-            elif key in {"dob", "date_of_birth"}:
-                candidate_value = (
-                    candidate.metadata.get("dob")
-                    or candidate.metadata.get("date_of_birth")
-                )
-            elif key in {"id", "doc_id"}:
-                candidate_value = candidate.doc_id
-            elif key == "entity_id":
-                candidate_value = candidate.metadata.get("entity_id") or candidate.doc_id
-            else:
-                candidate_value = candidate.metadata.get(key)
+        return best_per_entity(filtered_candidates)[:opts.top_k]
 
-            if isinstance(value, list):
-                if candidate_value not in value:
-                    return False
-            else:
-                if candidate_value != value:
-                    return False
-        return True
-    
-    async def _fallback_search(
-        self, 
-        normalized: NormalizationResult, 
-        text: str, 
-        opts: SearchOpts,
-        search_trace: Optional[SearchTrace] = None
-    ) -> List[Candidate]:
-        """Fallback to local indexes when Elasticsearch is unavailable."""
-        self.logger.warning("Using fallback search due to Elasticsearch unavailability")
-        if not self.config.enable_fallback:
-            return []
+    def _matches_metadata_filters(self, candidate, filters):
+        return metadata_matches(candidate.doc_id, candidate.metadata, filters)
 
-        self._ensure_fallback_services()
-
-        fallback_results: List[Candidate] = []
-        query_text = normalized.normalized or text
-        max_results = min(opts.top_k, self.config.fallback_max_results)
-
-        # AC fallback search
-        if self._fallback_watchlist_service and self._fallback_watchlist_service.ready():
-            try:
-                ac_hits = self._fallback_watchlist_service.search(
-                    query_text, 
-                    top_k=max_results, 
-                    trace=search_trace
-                )
-                for doc_id, score in ac_hits:
-                    if len(fallback_results) >= max_results:
-                        break
-                        
-                    doc = self._fallback_watchlist_service.get_doc(doc_id, trace=search_trace)
-                    if not doc:
-                        continue
-                        
-                    # Apply fallback threshold
-                    if float(score) < self.config.fallback_threshold:
-                        continue
-                        
-                    fallback_results.append(
-                        Candidate(
-                            doc_id=doc_id,
-                            score=float(score),
-                            text=doc.text,
-                            entity_type=doc.entity_type,
-                            metadata=doc.metadata,
-                            search_mode=SearchMode.FALLBACK_AC,
-                            match_fields=["fallback_ac"],
-                            confidence=min(1.0, float(score)),
-                            trace={
-                                "reason": "fallback_ac",
-                                "service": "WatchlistIndexService",
-                                "threshold": self.config.fallback_threshold
-                            }
-                        )
-                    )
-            except Exception as exc:
-                self.logger.error(f"AC fallback search failed: {exc}")
-
-        # Vector fallback search if AC didn't provide enough results
-        if (len(fallback_results) < max_results and 
-            self._fallback_vector_service and 
-            self.config.enable_vector_fallback):
-            try:
-                remaining_results = min(
-                    max_results - len(fallback_results),
-                    self.config.vector_fallback_max_results
-                )
-                vector_hits = self._fallback_vector_service.search(
-                    query_text, 
-                    top_k=remaining_results
-                )
-                for doc_id, score in vector_hits:
-                    if len(fallback_results) >= max_results:
-                        break
-                        
-                    # Apply vector-specific fallback threshold
-                    if float(score) < self.config.vector_fallback_threshold:
-                        continue
-                        
-                    doc = None
-                    if self._fallback_watchlist_service:
-                        doc = self._fallback_watchlist_service.get_doc(doc_id, trace=search_trace)
-                        
-                    fallback_results.append(
-                        Candidate(
-                            doc_id=doc_id,
-                            score=float(score),
-                            text=doc.text if doc else query_text,
-                            entity_type=doc.entity_type if doc else "unknown",
-                            metadata=doc.metadata if doc else {},
-                            search_mode=SearchMode.FALLBACK_VECTOR,
-                            match_fields=["fallback_vector"],
-                            confidence=min(1.0, float(score)),
-                            trace={
-                                "reason": "fallback_vector",
-                                "service": "EnhancedVectorIndex",
-                                "threshold": self.config.vector_fallback_threshold,
-                                "max_results": self.config.vector_fallback_max_results
-                            }
-                        )
-                    )
-            except Exception as exc:
-                self.logger.error(f"Vector fallback search failed: {exc}")
-
-        self.logger.info(f"Fallback search returned {len(fallback_results)} results")
-        return fallback_results
-    
-    async def _check_fallback_health(self) -> Dict[str, Any]:
-        """Check health status of fallback services."""
-        health = {
-            "watchlist_service": {"available": False, "ready": False, "error": None},
-            "vector_service": {"available": False, "ready": False, "error": None},
-            "vector_fallback_enabled": self.config.enable_vector_fallback,
-            "vector_fallback_config": {
-                "threshold": self.config.vector_fallback_threshold,
-                "max_results": self.config.vector_fallback_max_results,
-                "timeout_ms": self.config.vector_fallback_timeout_ms
-            }
-        }
-        
-        if not self.config.enable_fallback_health_check:
-            return health
-            
-        # Check WatchlistIndexService
-        if self._fallback_watchlist_service:
-            try:
-                health["watchlist_service"]["available"] = True
-                health["watchlist_service"]["ready"] = self._fallback_watchlist_service.ready()
-            except Exception as exc:
-                health["watchlist_service"]["error"] = str(exc)
-        
-        # Check EnhancedVectorIndex
-        if self._fallback_vector_service:
-            try:
-                health["vector_service"]["available"] = True
-                # EnhancedVectorIndex doesn't have a ready() method, so we assume it's ready if available
-                health["vector_service"]["ready"] = True
-            except Exception as exc:
-                health["vector_service"]["error"] = str(exc)
-        
-        return health
-    
     async def clear_embedding_cache(self) -> None:
-        """Clear the embedding cache."""
+        """Clear cached query embeddings."""
         async with self._cache_lock:
             self._embedding_cache.clear()
             self.logger.info("Embedding cache cleared")
-    
+
     async def _get_cached_search_result(self, cache_key: str) -> Optional[List[Candidate]]:
         """Get cached search result if available and not expired."""
         if not self.config.enable_search_cache:
@@ -1465,6 +828,7 @@ class HybridSearchService(BaseService, SearchService):
             return
             
         async with self._search_cache_lock:
+            self._ensure_open()
             # Check cache size limit
             if len(self._search_cache) >= self.config.search_cache_size:
                 # Remove oldest entry
@@ -1476,24 +840,121 @@ class HybridSearchService(BaseService, SearchService):
             self._search_cache[cache_key] = (candidates, datetime.now())
             self.logger.debug(f"Cached search result for key: {cache_key[:20]}...")
     
-    def _generate_search_cache_key(self, query: str, opts: SearchOpts) -> str:
+    def _generate_search_cache_key(self, query: str, opts: SearchOpts,
+                                   *, normalized: str = "", dataset_version=None) -> str:
         """Generate cache key for search query."""
         import hashlib
         
         # Create a hash of the query and options
-        key_data = {
-            "query": query,
-            "search_mode": opts.search_mode,
-            "top_k": opts.top_k,
-            "threshold": opts.threshold,
-            "ac_boost": opts.ac_boost,
-            "vector_boost": opts.vector_boost,
-            "entity_types": opts.entity_types,
-            "metadata_filters": opts.metadata_filters
-        }
-        
-        key_string = str(sorted(key_data.items()))
-        return hashlib.md5(key_string.encode()).hexdigest()
+        key_data = {"query": query, "normalized": normalized,
+                    "options": opts.model_dump(mode="json"), "dataset": dataset_version,
+                    "config": self.config.model_dump(mode="json")}
+
+        key_string = json.dumps(key_data, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(key_string.encode()).hexdigest()
+
+    async def readiness(self, *, require_vectors: bool = True) -> Dict[str, str]:
+        """Verify the selected index generations before returning screening results."""
+        self._ensure_open()
+        from .index_schema import index_mapping, validate_mapping, SOURCE_COVERAGE_VERSION
+        if require_vectors:
+            self._verify_embedding_contract()
+        if not self._initialized:
+            self.initialize()
+        client = await self._client_factory.get_client()
+        client = client.options(request_timeout=5, max_retries=0)
+        indices = [(self.config.elasticsearch.ac_index, False)]
+        if require_vectors:
+            indices.append((self.config.elasticsearch.vector_index, True))
+        generations = {}
+        manifests = []
+        for index, vectors in indices:
+            mappings = await client.indices.get_mapping(index=index)
+            if len(mappings) != 1:
+                raise RuntimeError(f"Index {index} must resolve to one concrete source snapshot")
+            expected_mapping = index_mapping(self.config, vectors=vectors)["mappings"]
+            expected = expected_mapping["_meta"]
+            for actual_name, mapping in mappings.items():
+                validate_mapping(mapping.get("mappings", {}), expected_mapping)
+                meta = mapping.get("mappings", {}).get("_meta", {})
+                if any(meta.get(key) != value for key, value in expected.items()):
+                    raise RuntimeError(f"Index {index} has an incompatible data contract")
+                if meta.get("ingestion_status") != "completed" or not meta.get("generation"):
+                    raise RuntimeError(f"Index {index} has no completed ingestion")
+                if vectors and meta.get("source_coverage_version") != SOURCE_COVERAGE_VERSION:
+                    raise RuntimeError(f"Index {index} requires source coverage verification before screening")
+                if (await client.count(index=actual_name))["count"] == 0:
+                    raise RuntimeError(f"Index {index} is empty")
+                generations[actual_name] = meta["generation"]
+                manifests.append(meta.get("source_manifest"))
+        if require_vectors and (len(set(generations.values())) != 1 or
+                                any(manifest != manifests[0] for manifest in manifests[1:])):
+            raise RuntimeError("AC and vector indices do not share a coherent snapshot generation and source manifest")
+        if require_vectors:
+            self._verify_embedding_contract()
+        self._ensure_open()
+        return generations
+
+    async def find_by_identifier(self, value, identifier_type, opts=None):
+        """Exact tax-identifier evidence comes from the same active source as names."""
+        if identifier_type.lower() not in TAX_IDENTIFIER_TYPES:
+            return []
+        opts = opts or SearchOpts(search_mode=SearchMode.AC)
+        generation = await self.readiness(require_vectors=False)
+        candidates = []
+        async with asyncio.timeout(opts.timeout_ms / 1000):
+            async with aclosing(self._ac_adapter.iter_documents(opts)) as pages:
+                async for hits in pages:
+                    for hit in hits:
+                        source = hit["_source"]
+                        metadata = source_metadata(source)
+                        if value not in source_tax_ids(metadata):
+                            continue
+                        candidates.append(Candidate(
+                            doc_id=hit["_id"], score=1.0,
+                            text=source.get("name") or source.get("normalized_text") or source["pattern"],
+                            entity_type=source["entity_type"], metadata=metadata,
+                            search_mode=SearchMode.AC, match_fields=[identifier_type], confidence=1.0,
+                            trace={"id_match": True, "reason": "confirmed_source_identifier"},
+                        ))
+                    candidates = best_per_entity(candidates)[:opts.top_k]
+                    await asyncio.sleep(0)
+        await self._verify_dataset_version(generation, require_vectors=False)
+        return candidates
+
+    async def _verify_dataset_version(self, expected, *, require_vectors):
+        actual = await self.readiness(require_vectors=require_vectors)
+        if actual != expected:
+            raise RuntimeError("Sanctions dataset changed during screening; retry the request")
+
+    async def close(self) -> None:
+        """Permanently close this service without closing a borrowed runtime model."""
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._initialized = False
+            encoder = self._owned_embedding_service
+            self._owned_embedding_service = None
+            self._embedding_service = None
+            self._search_cache.clear()
+            self._embedding_cache.clear()
+            self._query_cache.clear()
+            self._query_performance.clear()
+            self._rate_limiter.clear()
+            failures = []
+            if encoder is not None:
+                try:
+                    encoder.close()
+                except Exception:
+                    failures.append("embedding")
+            if self._client_factory is not None:
+                try:
+                    await self._client_factory.close()
+                except Exception:
+                    failures.append("client")
+            if failures:
+                raise RuntimeError("Search service resource cleanup failed")
     
     async def clear_search_cache(self) -> None:
         """Clear the search result cache."""
@@ -1542,6 +1003,7 @@ class HybridSearchService(BaseService, SearchService):
     async def _record_query_performance(self, query: str, search_mode: str, processing_time_ms: float, result_count: int, cache_hit: bool = False) -> None:
         """Record query performance metrics."""
         async with self._performance_lock:
+            self._ensure_open()
             performance_record = {
                 "timestamp": datetime.now().isoformat(),
                 "query": query[:100],  # Truncate long queries
@@ -1630,6 +1092,7 @@ class HybridSearchService(BaseService, SearchService):
             return
             
         async with self._query_cache_lock:
+            self._ensure_open()
             # Check cache size limit
             if len(self._query_cache) >= self.config.query_cache_size:
                 # Remove oldest entry
@@ -1757,6 +1220,7 @@ class HybridSearchService(BaseService, SearchService):
                 search_mode=candidate.search_mode,
                 match_fields=candidate.match_fields,
                 confidence=candidate.confidence
+                , trace=candidate.trace
             )
             
             # Remove sensitive fields from metadata
@@ -1966,30 +1430,34 @@ class HybridSearchService(BaseService, SearchService):
     
     async def health_check(self) -> Dict[str, Any]:
         """Check search service health status."""
+        if self._closed:
+            return {
+                "service": "hybrid_search", "status": "unhealthy", "closed": True,
+                "initialized": False, "fallback_enabled": False,
+                "metrics": self._metrics.to_dict(),
+            }
         health_status = {
             "service": "hybrid_search",
-            "status": "healthy",
+            "status": "healthy" if self._initialized else "unhealthy",
             "timestamp": datetime.now().isoformat(),
             "initialized": self._initialized,
-            "metrics": self._metrics.to_dict()
+            "metrics": self._metrics.to_dict(),
+            "fallback_enabled": False,
+            "fallback_services": {"status": "disabled", "reason": "Active source snapshot required"},
         }
         
         try:
-            # Check Elasticsearch adapters
-            if self._ac_adapter:
-                ac_health = await self._ac_adapter.health_check()
-                health_status["ac_adapter"] = ac_health
-            
-            if self._vector_adapter:
-                vector_health = await self._vector_adapter.health_check()
-                health_status["vector_adapter"] = vector_health
-            
-            # Check fallback services
-            health_status["fallback_enabled"] = self.config.enable_fallback
-            if self.config.enable_fallback:
-                fallback_health = await self._check_fallback_health()
-                health_status["fallback_services"] = fallback_health
-            
+            for name, adapter in (("ac_adapter", self._ac_adapter), ("vector_adapter", self._vector_adapter)):
+                if adapter is None:
+                    adapter_health = {"status": "unhealthy", "error": "Adapter is not initialized"}
+                else:
+                    adapter_health = await adapter.health_check()
+                health_status[name] = adapter_health
+                if (not isinstance(adapter_health, dict)
+                        or adapter_health.get("status") != "healthy"
+                        or adapter_health.get("connected") is False):
+                    health_status["status"] = "unhealthy"
+
             # Add embedding cache information
             health_status["embedding_cache"] = await self.get_embedding_cache_stats()
             
@@ -2068,8 +1536,8 @@ class HybridSearchService(BaseService, SearchService):
             "metrics": self._metrics.to_dict(),
             "last_health_check": self._last_health_check,
             "fallback_services": {
-                "watchlist": self._fallback_watchlist_service is not None,
-                "vector": self._fallback_vector_service is not None,
+                "watchlist": False,
+                "vector": False,
             }
         }
     
@@ -2146,501 +1614,89 @@ class HybridSearchService(BaseService, SearchService):
         return doc_id_lower in query_lower or query_lower in doc_id_lower
     
     async def update_configuration(self, new_config: HybridSearchConfig) -> None:
-        """Update search service configuration with validation."""
-        self.logger.info("Updating search service configuration...")
-        
-        try:
-            # Validate new configuration before applying
-            self._validate_configuration(new_config)
-            
-            # Update configuration
-            old_config = self.config
-            self.config = new_config
-            
-            # Reinitialize adapters with new configuration
-            if self._client_factory:
-                self._client_factory = ElasticsearchClientFactory(self.config)
-                self._ac_adapter = ElasticsearchACAdapter(
-                    self.config,
-                    client_factory=self._client_factory,
-                )
-                self._vector_adapter = ElasticsearchVectorAdapter(
-                    self.config,
-                    client_factory=self._client_factory,
-                )
-            
-            # Update fallback services if needed
-            self._ensure_fallback_services()
-            
-            # Clear embedding cache if cache settings changed
-            if (old_config.enable_embedding_cache != new_config.enable_embedding_cache or
-                old_config.embedding_cache_size != new_config.embedding_cache_size or
-                old_config.embedding_cache_ttl_seconds != new_config.embedding_cache_ttl_seconds):
-                await self.clear_embedding_cache()
-                self.logger.info("Embedding cache cleared due to configuration changes")
-            
-            self.logger.info("Search service configuration updated successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update search service configuration: {e}")
-            # Revert to old configuration
-            self.config = old_config
-            raise
-    
-    def _validate_configuration(self, config: HybridSearchConfig) -> None:
-        """Validate configuration before applying."""
-        try:
-            # Use Pydantic validation
-            config.validate(config)
-            
-            # Additional runtime validation
-            if config.es_hosts:
-                # Test host format
-                for host in config.es_hosts:
-                    if ':' not in host:
-                        raise ValueError(f"Invalid host format: {host}")
-                    
-                    host_part, port_part = host.split(':', 1)
-                    if not host_part or not port_part:
-                        raise ValueError(f"Invalid host:port format: {host}")
-                    
-                    try:
-                        port = int(port_part)
-                        if not (1 <= port <= 65535):
-                            raise ValueError(f"Invalid port: {port}")
-                    except ValueError:
-                        raise ValueError(f"Invalid port number: {port_part}")
-            
-            # Validate thresholds
-            if config.enable_escalation and config.escalation_threshold <= 0.5:
-                raise ValueError("Escalation threshold should be greater than 0.5")
-            
-            if config.enable_fallback and config.fallback_threshold <= 0.1:
-                raise ValueError("Fallback threshold should be greater than 0.1")
-            
-            if config.vector_similarity_threshold <= 0.3:
-                raise ValueError("Vector similarity threshold should be greater than 0.3")
-            
-            # Validate cache settings
-            if config.enable_embedding_cache and config.embedding_cache_size < 100:
-                raise ValueError("Embedding cache size should be at least 100")
-            
-            self.logger.info("Configuration validation passed")
+        """Replace pending settings before initialization; live changes require restart.
 
-        except Exception as e:
-            self.logger.error(f"Configuration validation failed: {e}")
-            raise ValueError(f"Invalid configuration: {e}")
+        Adapters, clients, caches and in-flight requests must share one configuration.
+        Replacing just the config object cannot provide that guarantee at runtime.
+        """
+        self._ensure_open()
+        if self._initialized or self._client_factory is not None or self._ac_adapter is not None or self._vector_adapter is not None:
+            raise RuntimeError("Configuration changes require recreating the search service")
+        self.config = self._validate_configuration(new_config)
+
+    def _validate_configuration(self, config: HybridSearchConfig) -> HybridSearchConfig:
+        """Validate and copy the complete canonical configuration without mutation."""
+        return HybridSearchConfig.validated_copy(config)
 
     # ==========================================
     # Fuzzy Search Methods
     # ==========================================
 
-    async def _fuzzy_search(
-        self,
-        query_text: str,
-        opts: SearchOpts,
-        search_trace: Optional[SearchTrace] = None
-    ) -> List[Candidate]:
-        """
-        Execute fuzzy search for typo tolerance using Elasticsearch AC patterns.
-
-        Args:
-            query_text: The search query (potentially with typos)
-            opts: Search options
-            search_trace: Optional search trace for debugging
-
-        Returns:
-            List of fuzzy match candidates
-        """
-        start_time = time.perf_counter()
-
-        try:
-            # Try ES-based fuzzy search first (more efficient for 1M+ patterns)
-            es_fuzzy_results = await self._elasticsearch_fuzzy_search(query_text, opts)
-            if es_fuzzy_results:
-                print(f"[TARGET] ES FUZZY SEARCH: Got {len(es_fuzzy_results)} results")
-                return es_fuzzy_results
-
-            # Fallback to in-memory fuzzy search
+    async def _fuzzy_search(self, query_text, opts, search_trace=None):
+        """Screen the active index, with a deadline and no unrelated local dataset."""
+        async with asyncio.timeout(opts.timeout_ms / 1000):
             return await self._in_memory_fuzzy_search(query_text, opts, search_trace)
 
-        except Exception as e:
-            self.logger.error(f"Fuzzy search failed: {e}")
-            return []
+    async def _elasticsearch_fuzzy_search(self, query_text, opts):
+        """Compatibility entry point using the canonical AC fields and parser."""
+        if self._ac_adapter is None:
+            raise RuntimeError("AC search is unavailable")
+        candidates = await self._ac_adapter.search(query_text, opts)
+        return [replace(candidate, search_mode=SearchMode.FUZZY) for candidate in candidates]
 
-    async def _elasticsearch_fuzzy_search(
-        self,
-        query_text: str,
-        opts: SearchOpts
-    ) -> List[Candidate]:
-        """
-        Execute fuzzy search using Elasticsearch on AC patterns index.
-        Much more efficient than in-memory search for 1M+ patterns.
-        """
-        try:
-            if not hasattr(self, '_ac_adapter') or not self._ac_adapter:
-                self.logger.debug("AC adapter not available for ES fuzzy search")
-                return []
-
-            # Use ES fuzzy query on AC patterns index
-            # Note: pattern field is keyword type, canonical is text type
-            es_query = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "fuzzy": {
-                                    "pattern": {
-                                        "value": query_text,
-                                        "fuzziness": 1,  # Limit to 1 character difference
-                                        "prefix_length": 2,  # More strict prefix matching
-                                        "max_expansions": 20,  # Reduce expansions
-                                        "boost": 2.0  # Reduce boost
-                                    }
-                                }
-                            },
-                            {
-                                "fuzzy": {
-                                    "canonical": {
-                                        "value": query_text,
-                                        "fuzziness": 1,  # Limit to 1 character difference
-                                        "prefix_length": 2,  # More strict prefix matching
-                                        "max_expansions": 20,  # Reduce expansions
-                                        "boost": 1.5  # Reduce boost
-                                    }
-                                }
-                            },
-                            {
-                                "match": {
-                                    "canonical": {
-                                        "query": query_text,
-                                        "fuzziness": 1,  # Limit fuzziness
-                                        "boost": 1.2  # Reduce boost
-                                    }
-                                }
-                            }
-                        ],
-                        "minimum_should_match": 1
-                    }
-                },
-                "size": min(opts.top_k * 3, 100),
-                "_source": ["pattern", "canonical", "entity_id", "entity_type", "confidence", "tier"],
-                "timeout": "2s"
-            }
-
-            # Execute ES query through AC adapter
-            client = await self._ac_adapter._ensure_connection()
-            index_name = getattr(self._ac_adapter, 'index_name', self.config.elasticsearch.ac_index)
-            response = await client.search(
-                index=index_name,
-                body=es_query
-            )
-
-            if not response or 'hits' not in response:
-                self.logger.debug("No ES fuzzy results found")
-                return []
-
-            # Convert ES results to Candidates
-            fuzzy_candidates = []
-            for hit in response['hits']['hits']:
-                source = hit.get('_source', {})
-                score = hit.get('_score', 0.0)
-
-                # More conservative ES score normalization with edit distance check
-                # Compare with the actual pattern that was matched, not canonical
-                result_text = source.get('pattern', source.get('canonical', ''))
-
-                # Calculate edit distance (Levenshtein distance)
-                def edit_distance(s1, s2):
-                    s1, s2 = s1.lower(), s2.lower()
-                    if len(s1) > len(s2):
-                        s1, s2 = s2, s1
-                    distances = range(len(s1) + 1)
-                    for i2, c2 in enumerate(s2):
-                        distances_ = [i2 + 1]
-                        for i1, c1 in enumerate(s1):
-                            if c1 == c2:
-                                distances_.append(distances[i1])
-                            else:
-                                distances_.append(1 + min((distances[i1], distances[i1 + 1], distances_[-1])))
-                        distances = distances_
-                    return distances[-1]
-
-                # Calculate edit distance and ratio
-                edit_dist = edit_distance(query_text, result_text)
-                max_len = max(len(query_text), len(result_text))
-                edit_ratio = 1.0 - (edit_dist / max_len) if max_len > 0 else 0
-
-                # Word-level similarity for additional validation
-                query_parts = set(query_text.lower().split())
-                result_parts = set(result_text.lower().split())
-                if query_parts and result_parts:
-                    overlap = len(query_parts.intersection(result_parts))
-                    total_unique = len(query_parts.union(result_parts))
-                    word_similarity = overlap / total_unique if total_unique > 0 else 0
-                else:
-                    word_similarity = 0
-
-                # Strict filtering: require reasonable edit distance
-                # For short queries (< 15 chars): allow up to 3 edits
-                # For longer queries: allow 1 edit per 5 characters
-                if len(query_text) < 15:
-                    max_allowed_edits = 3
-                else:
-                    max_allowed_edits = max(3, len(query_text) // 5)
-
-                if edit_dist > max_allowed_edits:
-                    continue  # Skip if too many differences
-
-                # Normalize ES score more conservatively
-                es_normalized = min(score / 50.0, 1.0)
-
-                # Combine different similarity measures
-                normalized_score = (es_normalized * 0.2) + (edit_ratio * 0.5) + (word_similarity * 0.3)
-
-                # Apply penalty for low edit ratio
-                if edit_ratio < 0.6:  # Less than 60% character similarity
-                    normalized_score *= 0.7
-
-                # Skip candidates with very low similarity
-                # Lower threshold for good fuzzy matches
-                min_threshold = 0.4 if edit_ratio > 0.8 else 0.5
-                if normalized_score < min_threshold:
-                    continue
-
-                candidate = Candidate(
-                    doc_id=hit.get('_id', f"es_fuzzy_{len(fuzzy_candidates)}"),
-                    score=normalized_score,
-                    text=source.get('canonical', source.get('pattern', '')),
-                    entity_type=source.get('entity_type', 'person'),
-                    metadata={
-                        "fuzzy_algorithm": "elasticsearch",
-                        "original_query": query_text,
-                        "es_score": score,
-                        "es_normalized": es_normalized,
-                        "edit_distance": edit_dist,
-                        "edit_ratio": edit_ratio,
-                        "word_similarity": word_similarity,
-                        "pattern": source.get('pattern', ''),
-                        "canonical": source.get('canonical', ''),
-                        "tier": source.get('tier', 0),
-                        "confidence": source.get('confidence', 0.0)
-                    },
-                    search_mode=SearchMode.FUZZY,
-                    match_fields=["es_fuzzy"],
-                    confidence=normalized_score,
-                    trace={
-                        "reason": "es_fuzzy_match",
-                        "algorithm": "elasticsearch",
-                        "original_query": query_text
-                    }
-                )
-                fuzzy_candidates.append(candidate)
-
-            # Filter by score threshold
-            filtered_candidates = [
-                c for c in fuzzy_candidates
-                if c.score >= (opts.threshold * 0.8)  # Slightly lower for fuzzy
-            ]
-
-            self.logger.info(f"ES fuzzy search: {len(response['hits']['hits'])} hits, {len(filtered_candidates)} after filtering")
-            return filtered_candidates[:opts.top_k]
-
-        except Exception as e:
-            self.logger.warning(f"ES fuzzy search failed, falling back: {e}")
-            return []
-
-    async def _in_memory_fuzzy_search(
-        self,
-        query_text: str,
-        opts: SearchOpts,
-        search_trace: Optional[SearchTrace] = None
-    ) -> List[Candidate]:
-        """
-        Fallback in-memory fuzzy search using sanctions data.
-        """
-        start_time = time.perf_counter()
-
-        if not self._fuzzy_service.enabled:
-            self.logger.debug("Fuzzy search disabled - rapidfuzz not available")
-            return []
-
-        try:
-            # Get candidates for fuzzy matching (from watchlist or cache)
-            candidates = await self._get_fuzzy_candidates()
-            print(f"[CHECK] FUZZY CANDIDATES: Got {len(candidates)} candidates")
-            if candidates:
-                print(f"   Sample candidates: {candidates[:3]}")
-
-            if not candidates:
-                print("[ERROR] NO FUZZY CANDIDATES AVAILABLE")
-                self.logger.debug("No candidates available for fuzzy search")
-                return []
-
-            # Perform fuzzy search
-            print(f"[INIT] PERFORMING FUZZY SEARCH: query='{query_text}'")
-            fuzzy_results = await self._fuzzy_service.search_async(
-                query=query_text,
-                candidates=candidates,
-                doc_mapping=None,  # We'll map later
-                metadata_mapping=None
-            )
-            print(f"[OK] FUZZY SEARCH RESULTS: Got {len(fuzzy_results)} results")
-
-            # Convert fuzzy results to Candidates
-            fuzzy_candidates = []
-            for fuzzy_result in fuzzy_results:
-                candidate = Candidate(
-                    doc_id=f"fuzzy_{hash(fuzzy_result.matched_text)}",
-                    score=fuzzy_result.score,
-                    text=fuzzy_result.matched_text,
-                    entity_type="person",  # Assume person names for now
-                    metadata={
-                        "fuzzy_algorithm": fuzzy_result.algorithm,
-                        "original_query": fuzzy_result.original_query,
-                        "fuzzy_score": fuzzy_result.score
-                    },
-                    search_mode=SearchMode.FUZZY,  # Use correct SearchMode for fuzzy
-                    match_fields=["fuzzy_name"],
-                    confidence=fuzzy_result.score,
-                    trace={
-                        "reason": "fuzzy_match",
-                        "algorithm": fuzzy_result.algorithm,
-                        "original_query": query_text
-                    }
-                )
-                fuzzy_candidates.append(candidate)
-
-            # Calculate timing for logging and tracing
-            took_ms = (time.perf_counter() - start_time) * 1000
-
-            # Add trace step if tracing enabled
-            if search_trace and search_trace.enabled:
-                trace_step = SearchTraceStep(
-                    step="fuzzy_search",
-                    took_ms=took_ms,
-                    query=query_text,
-                    total_hits=len(fuzzy_candidates),
-                    candidates_count=len(candidates),
-                    details={
-                        "algorithm": "rapidfuzz",
-                        "candidate_count": len(candidates),
-                        "result_count": len(fuzzy_candidates),
-                        "min_score": min(c.score for c in fuzzy_candidates) if fuzzy_candidates else 0,
-                        "max_score": max(c.score for c in fuzzy_candidates) if fuzzy_candidates else 0
-                    }
-                )
-                search_trace.steps.append(trace_step)
-
-            self.logger.debug(f"Fuzzy search completed: {len(fuzzy_candidates)} results in {took_ms:.2f}ms")
-            return fuzzy_candidates[:opts.max_results]  # Limit results
-
-        except Exception as e:
-            self.logger.error(f"Fuzzy search failed: {e}")
-            return []
-
-    async def _get_fuzzy_candidates(self) -> List[str]:
-        """
-        Get candidates for fuzzy matching from sanctions data.
-
-        Priority:
-        1. Sanctions data (primary source)
-        2. Watchlist service (fallback)
-        3. Common names (last resort)
-
-        Returns:
-            List of candidate strings for fuzzy matching
-        """
-        # Check cache first
-        cache_key = "fuzzy_candidates"
-        if cache_key in self._fuzzy_candidates_cache:
-            return self._fuzzy_candidates_cache[cache_key]
-
+    async def _in_memory_fuzzy_search(self, query_text, opts, search_trace=None):
+        """Score bounded pages of a consistent snapshot of the active AC index."""
+        if self._ac_adapter is None or not self._fuzzy_service.enabled:
+            raise RuntimeError("Fuzzy screening is unavailable")
+        started = time.perf_counter()
         candidates = []
-
-        # Primary source: Sanctions data
-        try:
-            self.logger.info("Loading fuzzy candidates from sanctions data...")
-
-            # Check if force reload is needed
-            import os
-            force_reload = os.getenv("FORCE_RELOAD_SANCTIONS", "false").lower() == "true"
-            if force_reload:
-                await self._sanctions_loader.clear_cache()
-                self.logger.warning("[DELETE] Cleared sanctions cache due to FORCE_RELOAD_SANCTIONS")
-
-            sanctions_candidates = await self._sanctions_loader.get_fuzzy_candidates()
-
-            if sanctions_candidates:
-                candidates.extend(sanctions_candidates)
-                self._sanctions_loaded = True
-                self.logger.info(f"[OK] Loaded {len(sanctions_candidates)} names from sanctions data for fuzzy search")
-
-                # Get additional stats
-                stats = await self._sanctions_loader.get_stats()
-                self.logger.info(f"Sanctions stats: {stats['persons']} persons, {stats['organizations']} orgs from {len(stats['sources'])} sources")
-
-            else:
-                self.logger.warning("[ERROR] No sanctions candidates loaded from primary source")
-
-        except Exception as e:
-            self.logger.error(f"[ERROR] Failed to load sanctions data for fuzzy search: {e}")
-            import traceback
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-
-        # Fallback: Try watchlist service
-        if not candidates:
-            try:
-                if self._fallback_watchlist_service and self._fallback_watchlist_service.ready():
-                    all_docs = await self._get_watchlist_names()
-                    candidates.extend(all_docs)
-                    self.logger.debug(f"Fallback: loaded {len(all_docs)} names from watchlist service")
-            except Exception as e:
-                self.logger.warning(f"Failed to load watchlist names for fuzzy search: {e}")
-
-        # Last resort: Common names
-        if not candidates:
-            candidates = self._get_common_names()
-            self.logger.warning(f"Using fallback common names: {len(candidates)} entries")
-
-        # Cache the candidates (limit for performance)
-        cached_candidates = candidates[:20000]  # Increased limit for sanctions data
-        self._fuzzy_candidates_cache[cache_key] = cached_candidates
-
-        self.logger.info(f"Fuzzy search initialized with {len(cached_candidates)} candidates")
-        return cached_candidates
-
-    async def _get_watchlist_names(self) -> List[str]:
-        """Extract all names from watchlist for fuzzy matching."""
-        try:
-            # This is a placeholder - actual implementation would depend on watchlist service API
-            # You might want to extract this from your sanctioned persons data
-            return []
-        except Exception as e:
-            self.logger.warning(f"Failed to extract watchlist names: {e}")
-            return []
-
-    def _get_common_names(self) -> List[str]:
-        """Get common Ukrainian/Russian names for fuzzy matching."""
-        return [
-            # Ukrainian politicians and public figures
-            "Петро Порошенко", "Володимир Зеленський", "Юлія Тимошенко",
-            "Віталій Кличко", "Ігор Коломойський", "Рінат Ахметов",
-            "Павло Фукс", "Вадим Новинський", "Дмитро Фірташ",
-
-            # Russian names
-            "Владимир Путин", "Сергей Лавров", "Михаил Мишустин",
-            "Дмитрий Медведев", "Алексей Навальный",
-
-            # Common Ukrainian names
-            "Андрій Іванов", "Олександр Петров", "Микола Сидоров",
-            "Ігор Коваленко", "Сергій Бондаренко", "Олексій Мельник",
-            "Катерина Шевченко", "Наталія Коваль", "Марія Петренко",
-            "Оксана Ткачук", "Тетяна Білоус", "Інна Гавриленко",
-
-            # Test names for fuzzy search
-            "Ковриков Роман Валерійович", "Ковриков Роман", "Роман Ковриков"
-        ]
+        scanned = 0
+        pages = self._ac_adapter.iter_documents(
+            opts, batch_size=self._fuzzy_service.config.max_candidates
+        )
+        async with aclosing(pages):
+            async for hits in pages:
+                names = {}
+                for hit in hits:
+                    source = hit["_source"]
+                    aliases = source.get("aliases") or []
+                    if isinstance(aliases, str):
+                        aliases = [aliases]
+                    for name in [source.get("pattern"), source.get("normalized_text"),
+                                 source.get("name"), *aliases]:
+                        if isinstance(name, str) and name.strip():
+                            names.setdefault(name, {})[hit["_id"]] = hit
+                # Every matched alias is considered before selecting top entities.
+                matches = await self._fuzzy_service.search_async(
+                    query_text, list(names), max_results=len(names)
+                )
+                for match in matches:
+                    if match.score < opts.threshold:
+                        continue
+                    for hit in names[match.matched_text].values():
+                        source = hit["_source"]
+                        metadata = source_metadata(source)
+                        metadata["fuzzy_algorithm"] = match.algorithm
+                        candidates.append(Candidate(
+                            doc_id=hit["_id"], score=min(1.0, match.score),
+                            text=source.get("name") or match.matched_text,
+                            entity_type=source["entity_type"], metadata=metadata,
+                            search_mode=SearchMode.FUZZY, match_fields=["fuzzy_name"],
+                            confidence=min(1.0, match.score),
+                            trace={"reason": "fuzzy_match", "matched_alias": match.matched_text},
+                        ))
+                candidates = best_per_entity(candidates)[:opts.top_k]
+                scanned += len(hits)
+                await asyncio.sleep(0)
+        if search_trace and search_trace.enabled:
+            search_trace.add_step(SearchTraceStep(
+                stage="LEXICAL", query=query_text, topk=opts.top_k,
+                took_ms=(time.perf_counter() - started) * 1000,
+                hits=[SearchTraceHit(doc_id=c.doc_id, score=c.score, rank=i + 1, source="LEXICAL")
+                      for i, c in enumerate(candidates)],
+                meta={"index": self.config.elasticsearch.ac_index, "scanned_documents": scanned},
+            ))
+        return candidates
 
     def _fuzzy_results_sufficient(self, fuzzy_candidates: List[Candidate], opts: SearchOpts) -> bool:
         """

@@ -10,7 +10,7 @@ import pytest
 import json
 from pathlib import Path
 from pathlib import Path
-from src.ai_service.layers.normalization.morphology.diminutive_resolver import DiminutiveResolver
+from ai_service.layers.normalization.morphology.diminutive_resolver import DiminutiveResolver
 
 
 class TestRussianNicknames:
@@ -19,12 +19,14 @@ class TestRussianNicknames:
     @pytest.fixture
     def diminutive_resolver(self):
         """Create DiminutiveResolver instance."""
-        return DiminutiveResolver(base_path=Path("."))
+        return DiminutiveResolver()
     
     @pytest.fixture
     def russian_diminutives(self):
         """Load Russian diminutives dictionary."""
-        diminutives_file = Path("data/diminutives_ru.json")
+        from ai_service.data.resources import PACKAGE_DATA_DIR
+
+        diminutives_file = PACKAGE_DATA_DIR / "diminutives_ru.json"
         if diminutives_file.exists():
             with open(diminutives_file, 'r', encoding='utf-8') as f:
                 return json.load(f)

@@ -10,7 +10,7 @@ import time
 import statistics
 from typing import List, Tuple
 
-from src.ai_service.layers.normalization.morphology_adapter import (
+from ai_service.layers.normalization.morphology_adapter import (
     MorphologyAdapter,
     get_global_adapter,
     clear_global_cache,

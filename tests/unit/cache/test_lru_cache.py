@@ -229,38 +229,6 @@ class TestLruCacheWithMetrics:
         assert cache_metrics.get_size("cache2") == 1
 
 
-class TestMorphologyAdapterCache:
-    """Test LRU cache in morphology adapter."""
-    
-    def setup_method(self):
-        """Reset metrics before each test."""
-        cache_metrics.reset()
-    
-    def test_morph_nominal_caching(self):
-        """Test that _morph_nominal uses caching."""
-        from ai_service.layers.normalization.normalization_service_legacy import NormalizationService
-        
-        service = NormalizationService()
-        
-        # First call - should be a miss
-        result1 = service._morph_nominal("ивана", "ru", True, {"enable_advanced_features": True})
-        assert result1 is not None
-        hit_rate = cache_metrics.get_hit_rate("morph_nominal")
-        assert hit_rate >= 0.0
-        
-        # Second call with same parameters - should be a hit
-        result2 = service._morph_nominal("ивана", "ru", True, {"enable_advanced_features": True})
-        assert result1 == result2
-        hit_rate = cache_metrics.get_hit_rate("morph_nominal")
-        assert hit_rate >= 0.0
-        
-        # Third call with different policy flags - should be a miss
-        result3 = service._morph_nominal("ивана", "ru", True, {"enable_advanced_features": False})
-        assert result3 is not None
-        hit_rate = cache_metrics.get_hit_rate("morph_nominal")
-        assert 0.0 <= hit_rate <= 1.0
-
-
 class TestRoleClassifierCache:
     """Test LRU cache in role classifier."""
     

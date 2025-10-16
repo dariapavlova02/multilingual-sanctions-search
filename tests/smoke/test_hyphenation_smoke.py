@@ -13,11 +13,11 @@ import pytest
 import asyncio
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, NormalizationConfig
 )
-from src.ai_service.layers.normalization.token_ops import is_hyphenated_surname
-from src.ai_service.utils.feature_flags import FeatureFlagManager
+from ai_service.layers.normalization.token_ops import is_hyphenated_surname
+from ai_service.utils.feature_flags import FeatureFlagManager
 
 
 class TestHyphenationSmoke:
@@ -38,7 +38,7 @@ class TestHyphenationSmoke:
     @pytest.fixture
     def normalization_factory(self, mock_feature_flags):
         """Create normalization factory with mocked dependencies."""
-        with patch('src.ai_service.layers.normalization.processors.normalization_factory.get_feature_flag_manager', return_value=mock_feature_flags):
+        with patch('ai_service.layers.normalization.processors.normalization_factory.get_feature_flag_manager', return_value=mock_feature_flags):
             factory = NormalizationFactory()
             factory.feature_flags = mock_feature_flags
             return factory
@@ -341,15 +341,15 @@ class TestHyphenationSmoke:
     def test_hyphenated_surname_imports(self):
         """Smoke test that all hyphenated surname components can be imported."""
         # Test token_ops imports
-        from src.ai_service.layers.normalization.token_ops import (
+        from ai_service.layers.normalization.token_ops import (
             is_hyphenated_surname, normalize_hyphenated_name
         )
 
         # Test role tagger import
-        from src.ai_service.layers.normalization.role_tagger_service import RoleTaggerService
+        from ai_service.layers.normalization.role_tagger_service import RoleTaggerService
 
         # Test contract import
-        from src.ai_service.contracts.base_contracts import TokenTrace
+        from ai_service.contracts.base_contracts import TokenTrace
 
         # Test basic functionality
         assert callable(is_hyphenated_surname)

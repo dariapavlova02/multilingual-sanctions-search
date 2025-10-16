@@ -8,11 +8,11 @@ to detect regressions and ensure decision stability over time.
 import pytest
 from typing import Dict, List, Tuple
 
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.decision_contracts import (
     DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo, RiskLevel
 )
-from src.ai_service.monitoring.metrics_service import MetricsService
+from ai_service.monitoring.metrics_service import MetricsService
 
 
 class TestDecisionCanary:
@@ -307,7 +307,7 @@ class TestDecisionCanary:
     
     def test_configuration_stability(self):
         """Test that different configurations produce stable results"""
-        from src.ai_service.config.settings import DecisionConfig
+        from ai_service.config.settings import DecisionConfig
         
         # Test with custom configuration
         custom_config = DecisionConfig(

@@ -10,9 +10,9 @@ import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from typing import Dict, Any
 
-from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator
-from src.ai_service.contracts.decision_contracts import RiskLevel
-from src.ai_service.contracts.base_contracts import (
+from ai_service.core.unified_orchestrator import UnifiedOrchestrator
+from ai_service.contracts.decision_contracts import RiskLevel
+from ai_service.contracts.base_contracts import (
     UnifiedProcessingResult, 
     NormalizationResult, 
     SmartFilterResult, 
@@ -121,7 +121,7 @@ class TestFullPipelineRiskE2E:
         orchestrator.embedding_service.generate_embeddings = AsyncMock(return_value=mock_embeddings_result)
         
         # Mock decision engine (will be tested with real implementation)
-        from src.ai_service.core.decision_engine import DecisionEngine
+        from ai_service.core.decision_engine import DecisionEngine
         orchestrator.decision_engine = DecisionEngine()
         
         return orchestrator
@@ -144,7 +144,7 @@ class TestFullPipelineRiskE2E:
         mock_result.processing_time = 0.5
         
         # Mock decision result (will be calculated by real DecisionEngine)
-        from src.ai_service.contracts.decision_contracts import DecisionOutput
+        from ai_service.contracts.decision_contracts import DecisionOutput
         mock_result.decision = DecisionOutput(
             risk=RiskLevel.HIGH,
             score=0.87,  # Expected high score
@@ -199,7 +199,7 @@ class TestFullPipelineRiskE2E:
     @pytest.mark.asyncio
     async def test_decision_engine_integration_with_mock_data(self, mock_orchestrator):
         """Test DecisionEngine integration with mock data"""
-        from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+        from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
         
         # Create decision input with high-risk indicators
         decision_input = DecisionInput(
@@ -257,7 +257,7 @@ class TestFullPipelineRiskE2E:
     @pytest.mark.asyncio
     async def test_api_response_format_with_risk_fields(self, high_risk_text, mock_orchestrator):
         """Test that API response includes all risk fields"""
-        from src.ai_service.utils.response_formatter import format_processing_result
+        from ai_service.utils.response_formatter import format_processing_result
         
         # Create mock processing result with decision
         mock_result = Mock(spec=UnifiedProcessingResult)
@@ -273,7 +273,7 @@ class TestFullPipelineRiskE2E:
         mock_result.processing_time = 0.5
         
         # Mock decision result
-        from src.ai_service.contracts.decision_contracts import DecisionOutput
+        from ai_service.contracts.decision_contracts import DecisionOutput
         mock_result.decision = DecisionOutput(
             risk=RiskLevel.HIGH,
             score=0.87,
@@ -355,7 +355,7 @@ class TestFullPipelineRiskE2E:
     @pytest.mark.asyncio
     async def test_pipeline_with_different_risk_levels(self, mock_orchestrator):
         """Test pipeline with different risk level scenarios"""
-        from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+        from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
         
         # Test LOW risk scenario
         low_risk_input = DecisionInput(
@@ -400,7 +400,7 @@ class TestFullPipelineRiskE2E:
     @pytest.mark.asyncio
     async def test_pipeline_error_handling(self, mock_orchestrator):
         """Test pipeline error handling with invalid inputs"""
-        from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+        from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
         
         # Test with None values (should be handled gracefully)
         none_input = DecisionInput(

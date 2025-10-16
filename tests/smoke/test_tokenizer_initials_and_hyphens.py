@@ -12,11 +12,11 @@ import os
 import asyncio
 from typing import List
 
-from src.ai_service.layers.normalization.token_ops import (
+from ai_service.layers.normalization.token_ops import (
     collapse_double_dots,
     normalize_hyphenated_name
 )
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestTokenOpsDirectly:
@@ -90,7 +90,7 @@ class TestTokenizerIntegration:
         os.environ["PRESERVE_HYPHENATED_CASE"] = "true"
 
         # Clear any cached feature flag manager to force reload
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
         self.service = NormalizationService()
@@ -101,7 +101,7 @@ class TestTokenizerIntegration:
         os.environ.pop("PRESERVE_HYPHENATED_CASE", None)
 
         # Clear feature flag manager cache to avoid test pollution
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
     @pytest.mark.parametrize("language", ["ru", "uk", "en"])
@@ -211,8 +211,8 @@ class TestTokenizerWithoutFlags:
         self.service = NormalizationService()
 
     @pytest.mark.asyncio
-    async def test_legacy_behavior_preserved_double_dots(self):
-        """Test that legacy behavior is preserved when flags are off."""
+    async def test_default_behavior_preserved_double_dots(self):
+        """Test default behavior when flags are off."""
         text = "И.. И."
         result = await self.service.normalize_async(text, language="ru")
 
@@ -222,8 +222,8 @@ class TestTokenizerWithoutFlags:
         assert not any("collapse_double_dots" in trace_str for trace_str in trace_strings)
 
     @pytest.mark.asyncio
-    async def test_legacy_behavior_preserved_hyphens(self):
-        """Test that legacy behavior is preserved when flags are off."""
+    async def test_default_behavior_preserved_hyphens(self):
+        """Test default behavior when flags are off."""
         text = "петрова-сидорова"
         result = await self.service.normalize_async(text, language="ru")
 

@@ -7,8 +7,8 @@ when strict_stopwords=True is enabled.
 """
 
 import pytest
-from src.ai_service.layers.normalization.role_tagger_service import RoleTaggerService, RoleRules
-from src.ai_service.layers.normalization.lexicon_loader import get_lexicons
+from ai_service.layers.normalization.role_tagger_service import RoleTaggerService, RoleRules
+from ai_service.layers.normalization.lexicon_loader import get_lexicons
 
 
 class TestRussianStopwordsInitials:

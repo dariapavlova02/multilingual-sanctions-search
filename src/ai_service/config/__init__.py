@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from ..utils.feature_flags import FeatureFlags
+from ..utils.feature_flags import FeatureFlags, get_feature_flag_manager
 
 from .settings import (
     DatabaseConfig,
@@ -87,7 +87,7 @@ DEPLOYMENT_CONFIG = config.deployment
 PERFORMANCE_CONFIG = config.performance
 LOGGING_CONFIG = config.logging
 NORMALIZATION_CONFIG = NormalizationConfig()
-FEATURE_FLAGS = FeatureFlags()
+FEATURE_FLAGS = get_feature_flag_manager().get_flags()
 
 __all__ = [
     "Config",

@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import asyncio
 import hashlib
+import os
+from dataclasses import field
+
+from ...data.resources import PACKAGE_DATA_DIR
 
 try:
     import aiofiles
@@ -51,6 +55,17 @@ class SanctionsDataset:
     loaded_at: datetime
     sources: List[str]
     total_entries: int
+    source_manifest: Dict[str, str] = field(default_factory=dict)
+    name_to_entries: Dict[str, List[SanctionEntry]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # A shared name or alias must not discard another sanctioned entity.
+        self.name_to_entries = {}
+        for entry in self.persons + self.organizations:
+            for name in dict.fromkeys([entry.name, *entry.aliases]):
+                self.name_to_entries.setdefault(name, []).append(entry)
+        self.all_names = sorted(self.name_to_entries)
+        self.name_to_entry = {name: entries[0] for name, entries in self.name_to_entries.items()}
 
     def get_person_names(self) -> List[str]:
         """Get all person names including aliases."""
@@ -72,18 +87,24 @@ class SanctionsDataset:
 class SanctionsDataLoader:
     """Loads and manages sanctions data for fuzzy search."""
 
-    def __init__(self, data_dir: Optional[Path] = None, cache_ttl_hours: int = 24):
+    def __init__(self, data_dir: Optional[Path] = None, cache_ttl_hours: int = 24,
+                 *, allow_demo: bool = False, cache_dir: Optional[Path] = None):
         self.logger = get_logger(__name__)
 
-        # Data directory - default to project data folder
         if data_dir is None:
-            data_dir = Path(__file__).parent.parent.parent.parent.parent / "data" / "sanctions"
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+            data_dir = os.environ.get("SANCTIONS_DATA_DIR") or PACKAGE_DATA_DIR
+        self.data_dir = Path(data_dir).resolve()
+        self.allow_demo = allow_demo
+        self._source_state = None
+        self._source_manifest = {}
 
         self.cache_ttl = timedelta(hours=cache_ttl_hours)
         self._cached_dataset: Optional[SanctionsDataset] = None
-        self._cache_file = self.data_dir / "sanctions_cache.json"
+        cache_dir = Path(cache_dir) if cache_dir is not None else Path(
+            os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+        ) / "ai_service" / "sanctions"
+        source_key = hashlib.sha256(str(self.data_dir).encode()).hexdigest()[:24]
+        self._cache_file = cache_dir / f"{source_key}-{'demo' if allow_demo else 'real'}.json"
 
         self.logger.info(f"SanctionsDataLoader initialized with data_dir: {self.data_dir}")
 
@@ -105,9 +126,12 @@ class SanctionsDataLoader:
         Returns:
             Complete sanctions dataset
         """
-        # Check cache first
+        # Stat on every access; hash only when a source changes. Old cache files
+        # without a matching manifest can never replace current source data.
+        manifest = await asyncio.to_thread(self._get_source_manifest)
         if not force_reload and self._cached_dataset:
-            if datetime.now() - self._cached_dataset.loaded_at < self.cache_ttl:
+            if (datetime.now() - self._cached_dataset.loaded_at < self.cache_ttl
+                    and self._cached_dataset.source_manifest == manifest):
                 self.logger.debug("Using cached sanctions dataset")
                 return self._cached_dataset
 
@@ -127,6 +151,21 @@ class SanctionsDataLoader:
         self.logger.info(f"Loaded {dataset.total_entries} sanctions entries from {len(dataset.sources)} sources")
         return dataset
 
+    def _get_source_manifest(self) -> Dict[str, str]:
+        if not self.data_dir.is_dir():
+            raise FileNotFoundError(f"Sanctions data directory does not exist: {self.data_dir}")
+        names = {"sanctioned_persons.json", "sanctioned_companies.json",
+                 "terrorism_black_list.json", "ofac_sdn.json", "eu_sanctions.json",
+                 "uk_sanctions.json"}
+        files = sorted(p for p in self.data_dir.glob("*.json")
+                       if p.name in names or p.name.startswith("custom_"))
+        state = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns,
+                       p.stat().st_ctime_ns) for p in files)
+        if state != self._source_state:
+            self._source_manifest = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+            self._source_state = state
+        return dict(self._source_manifest)
+
     async def _load_from_cache(self) -> bool:
         """Try to load dataset from cache file."""
         try:
@@ -140,6 +179,10 @@ class SanctionsDataLoader:
                 with open(self._cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
 
+            if (cache_data.get('schema_version') != 2
+                    or cache_data.get('source_manifest') != self._source_manifest
+                    or cache_data.get('allow_demo') != self.allow_demo):
+                return False
             # Check cache age
             loaded_at = datetime.fromisoformat(cache_data['loaded_at'])
             if datetime.now() - loaded_at > self.cache_ttl:
@@ -157,7 +200,8 @@ class SanctionsDataLoader:
                 name_to_entry=cache_data['name_to_entry'],
                 loaded_at=loaded_at,
                 sources=cache_data['sources'],
-                total_entries=cache_data['total_entries']
+                total_entries=cache_data['total_entries'],
+                source_manifest=cache_data['source_manifest'],
             )
 
             # Rebuild name_to_entry mapping with actual objects
@@ -167,8 +211,6 @@ class SanctionsDataLoader:
                 name_to_entry[entry.name] = entry
                 for alias in entry.aliases:
                     name_to_entry[alias] = entry
-
-            self._cached_dataset.name_to_entry = name_to_entry
 
             self.logger.debug("Successfully loaded from cache")
             return True
@@ -182,6 +224,9 @@ class SanctionsDataLoader:
         try:
             # Convert to JSON-serializable format
             cache_data = {
+                'schema_version': 2,
+                'source_manifest': dataset.source_manifest,
+                'allow_demo': self.allow_demo,
                 'persons': [self._entry_to_dict(entry) for entry in dataset.persons],
                 'organizations': [self._entry_to_dict(entry) for entry in dataset.organizations],
                 'all_names': dataset.all_names,
@@ -191,12 +236,21 @@ class SanctionsDataLoader:
                 'total_entries': dataset.total_entries
             }
 
-            if AIOFILES_AVAILABLE:
-                async with aiofiles.open(self._cache_file, 'w', encoding='utf-8') as f:
-                    await f.write(json.dumps(cache_data, indent=2, ensure_ascii=False))
-            else:
-                with open(self._cache_file, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            # Atomic replacement prevents readers from seeing partial JSON.
+            def write_cache():
+                import tempfile
+                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                        dir=self._cache_file.parent, delete=False) as f:
+                    temporary = Path(f.name)
+                    try:
+                        json.dump(cache_data, f, ensure_ascii=False)
+                        f.flush()
+                        os.fsync(f.fileno())
+                        os.replace(temporary, self._cache_file)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            await asyncio.to_thread(write_cache)
 
             self.logger.debug("Successfully saved to cache")
 
@@ -226,12 +280,13 @@ class SanctionsDataLoader:
             self._load_sanctioned_persons,   # Ukrainian sanctions persons
             self._load_sanctioned_companies, # Ukrainian sanctions companies
             self._load_terrorism_blacklist,  # Terrorism blacklist
-            self._load_sample_data,          # Sample data for testing
             self._load_ofac_sdn,             # OFAC SDN list
             self._load_eu_sanctions,         # EU sanctions
             self._load_uk_sanctions,         # UK sanctions
             self._load_custom_lists,         # Custom sanctions lists
         ]
+        if self.allow_demo:
+            loaders.append(self._load_sample_data)
 
         for loader in loaders:
             try:
@@ -243,7 +298,7 @@ class SanctionsDataLoader:
                 else:
                     self.logger.debug(f"No entries from {loader.__name__}")
             except Exception as e:
-                self.logger.warning(f"Failed to load from {loader.__name__}: {e}")
+                raise ValueError(f"Failed to load sanctions source {loader.__name__}") from e
 
         # Split by type
         persons = [e for e in all_entries if e.entity_type == "person"]
@@ -264,11 +319,12 @@ class SanctionsDataLoader:
         dataset = SanctionsDataset(
             persons=persons,
             organizations=organizations,
-            all_names=list(set(all_names)),  # Remove duplicates
+            all_names=sorted(set(all_names)),
             name_to_entry=name_to_entry,
             loaded_at=datetime.now(),
             sources=sources,
-            total_entries=len(all_entries)
+            total_entries=len(all_entries),
+            source_manifest=dict(self._source_manifest),
         )
 
         return dataset
@@ -374,7 +430,7 @@ class SanctionsDataLoader:
 
             for item in data:
                 # Extract aliases from different name fields
-                aliases = []
+                aliases = list(item.get('aliases') or [])
                 if item.get('name_ru') and item['name_ru'] != item['name']:
                     aliases.append(item['name_ru'])
                 if item.get('name_en') and item['name_en'] != item['name']:
@@ -386,12 +442,14 @@ class SanctionsDataLoader:
                     entity_type="person",
                     source="ukrainian_sanctions",
                     list_name="Ukrainian Sanctioned Persons",
-                    aliases=aliases,
+                    aliases=sorted({a.strip() for a in aliases if isinstance(a, str) and a.strip()}),
                     birth_date=item.get('birthdate'),
                     nationality=None,  # Not provided in this format
                     metadata={
+                        'source_id': item.get('id', item.get('person_id')),
                         'person_id': item.get('person_id'),
                         'itn': item.get('itn'),
+                        'itn_import': item.get('itn_import'),
                         'status': item.get('status')
                     }
                 )
@@ -403,7 +461,7 @@ class SanctionsDataLoader:
             self.logger.info(f"Loaded {len(entries)} Ukrainian sanctioned persons")
 
         except Exception as e:
-            self.logger.error(f"Error loading Ukrainian sanctioned persons: {e}")
+            raise ValueError(f"Invalid sanctions source: {persons_file.name}") from e
 
         return entries, "Ukrainian Persons"
 
@@ -431,10 +489,13 @@ class SanctionsDataLoader:
                     entity_type="organization",
                     source="ukrainian_sanctions",
                     list_name="Ukrainian Sanctioned Companies",
-                    aliases=[],  # No aliases in this format
+                    aliases=sorted({a.strip() for a in [*(item.get('aliases') or []),
+                                   item.get('name_en'), item.get('name_ru')]
+                                   if isinstance(a, str) and a.strip()}),
                     birth_date=None,  # Not applicable for companies
                     nationality=None,  # Could extract from address
                     metadata={
+                        'source_id': item.get('id', item.get('person_id')),
                         'person_id': item.get('person_id'),
                         'tax_number': item.get('tax_number'),
                         'reg_number': item.get('reg_number'),
@@ -450,7 +511,7 @@ class SanctionsDataLoader:
             self.logger.info(f"Loaded {len(entries)} Ukrainian sanctioned companies")
 
         except Exception as e:
-            self.logger.error(f"Error loading Ukrainian sanctioned companies: {e}")
+            raise ValueError(f"Invalid sanctions source: {companies_file.name}") from e
 
         return entries, "Ukrainian Companies"
 
@@ -496,7 +557,7 @@ class SanctionsDataLoader:
             self.logger.info(f"Loaded {len(entries)} terrorism blacklist entries")
 
         except Exception as e:
-            self.logger.error(f"Error loading terrorism blacklist: {e}")
+            raise ValueError(f"Invalid sanctions source: {blacklist_file.name}") from e
 
         return entries, "Terrorism Blacklist"
 
@@ -531,7 +592,7 @@ class SanctionsDataLoader:
                 entries.append(entry)
 
         except Exception as e:
-            self.logger.error(f"Error loading OFAC SDN data: {e}")
+            raise ValueError(f"Invalid sanctions source: {sdn_file.name}") from e
 
         return entries, "OFAC SDN"
 
@@ -544,10 +605,7 @@ class SanctionsDataLoader:
             self.logger.debug("EU sanctions file not found, skipping")
             return entries, "EU Sanctions"
 
-        # Similar implementation to OFAC
-        # TODO: Implement EU sanctions parsing
-
-        return entries, "EU Sanctions"
+        raise ValueError("EU source format is unsupported; convert to the documented custom entries schema")
 
     async def _load_uk_sanctions(self) -> Tuple[List[SanctionEntry], str]:
         """Load UK sanctions list."""
@@ -558,17 +616,14 @@ class SanctionsDataLoader:
             self.logger.debug("UK sanctions file not found, skipping")
             return entries, "UK Sanctions"
 
-        # Similar implementation to OFAC
-        # TODO: Implement UK sanctions parsing
-
-        return entries, "UK Sanctions"
+        raise ValueError("UK source format is unsupported; convert to the documented custom entries schema")
 
     async def _load_custom_lists(self) -> Tuple[List[SanctionEntry], str]:
         """Load custom sanctions lists."""
         entries = []
 
         # Look for custom JSON files in data directory
-        custom_files = list(self.data_dir.glob("custom_*.json"))
+        custom_files = sorted(self.data_dir.glob("custom_*.json"))
 
         for custom_file in custom_files:
             try:
@@ -595,7 +650,7 @@ class SanctionsDataLoader:
                 self.logger.debug(f"Loaded {len(data.get('entries', []))} entries from {custom_file}")
 
             except Exception as e:
-                self.logger.error(f"Error loading custom sanctions from {custom_file}: {e}")
+                raise ValueError(f"Invalid sanctions source: {custom_file.name}") from e
 
         return entries, "Custom Lists"
 
@@ -623,6 +678,11 @@ class SanctionsDataLoader:
         dataset = await self.load_dataset()
         return dataset.name_to_entry.get(name)
 
+    async def find_entries(self, name: str) -> List[SanctionEntry]:
+        """Return all entities sharing an exact name or alias."""
+        dataset = await self.load_dataset()
+        return list(dataset.name_to_entries.get(name, []))
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get loader statistics."""
         if not self._cached_dataset:
@@ -636,6 +696,8 @@ class SanctionsDataLoader:
             'organizations': len(dataset.organizations),
             'unique_names': len(dataset.all_names),
             'sources': dataset.sources,
+            'source_manifest': dataset.source_manifest,
+            'demo_enabled': self.allow_demo,
             'loaded_at': dataset.loaded_at.isoformat(),
             'cache_age_hours': (datetime.now() - dataset.loaded_at).total_seconds() / 3600,
             'data_dir': str(self.data_dir)

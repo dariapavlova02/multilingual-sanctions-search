@@ -1,0 +1,9 @@
+# Establishment descriptors followed by a capitalized name.
+cafe
+café
+restaurant
+hotel
+кафе
+ресторан
+готель
+отель

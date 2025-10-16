@@ -1,279 +1,259 @@
-#!/usr/bin/env python3
-"""
-Unified spaCy NER gateway for all languages.
-
-Provides Named Entity Recognition using spaCy models for Russian, Ukrainian, and English
-to extract person and organization entities from text. This replaces the separate
-language-specific gateways with a single parametrized implementation.
-"""
-
-import logging
-from typing import Dict, List, Optional, Set, Tuple, Any
-from dataclasses import dataclass
+"""Shared spaCy models, character-span contracts and bounded NER execution."""
+from dataclasses import dataclass, field
 from enum import Enum
+import threading
+import unicodedata
+from typing import Any
 
+from ....utils.inference_queue import InferenceQueue
 from ....utils.logging_config import get_logger
 
-logger = get_logger(__name__)
 
-
-class SupportedLanguage(Enum):
-    """Supported languages for NER processing."""
-    RUSSIAN = "ru"
-    UKRAINIAN = "uk"
-    ENGLISH = "en"
+class SupportedLanguage(str, Enum):
+    RUSSIAN = 'ru'
+    UKRAINIAN = 'uk'
+    ENGLISH = 'en'
 
 
 @dataclass
 class NEREntity:
-    """Named Entity Recognition result."""
     text: str
-    label: str  # PER, ORG, etc.
+    label: str
     start: int
     end: int
-    confidence: float = 1.0
+    # spaCy does not expose a calibrated probability for each entity.
+    confidence: float | None = None
 
 
 @dataclass
 class NERHints:
-    """NER hints for role tagging."""
-    persons: Set[str]
-    organizations: Set[str]
-    locations: Set[str]
-    confidence: float
+    """Spans refer to the exact text passed to the gateway, including duplicates."""
+    person_spans: list[tuple[int, int]] = field(default_factory=list)
+    org_spans: list[tuple[int, int]] = field(default_factory=list)
+    entities: list[NEREntity] = field(default_factory=list)
+
+    @property
+    def persons(self) -> set[str]:
+        return {e.text.lower() for e in self.entities if e.label in {'PER', 'PERSON'}}
+
+    @property
+    def organizations(self) -> set[str]:
+        return {e.text.lower() for e in self.entities if e.label == 'ORG'}
+
+    @property
+    def locations(self) -> set[str]:
+        return {e.text.lower() for e in self.entities if e.label == 'LOC'}
+
+    @property
+    def confidence(self) -> None:
+        """Entity counts are not recognition probabilities."""
+        return None
+
+
+class NERUnavailableError(RuntimeError):
+    """Requested NER could not complete; empty hints would hide that failure."""
 
 
 class UnifiedSpacyGateway:
-    """
-    Unified spaCy NER gateway supporting multiple languages.
-
-    This class provides a single interface for NER processing across
-    Russian, Ukrainian, and English using appropriate spaCy models.
-    """
-
-    # Model configurations for each language
+    # The pinned small pipelines have an independent NER tok2vec submodel.
+    # Exclude other components instead of loading and merely disabling them.
+    NON_NER_COMPONENTS = ['tok2vec', 'tagger', 'morphologizer', 'parser',
+                          'senter', 'attribute_ruler', 'lemmatizer']
     MODEL_CONFIG = {
-        SupportedLanguage.RUSSIAN: {
-            "model_name": "ru_core_news_sm",
-            "download_cmd": "python -m spacy download ru_core_news_sm"
-        },
-        SupportedLanguage.UKRAINIAN: {
-            "model_name": "uk_core_news_sm",
-            "download_cmd": "python -m spacy download uk_core_news_sm"
-        },
-        SupportedLanguage.ENGLISH: {
-            "model_name": "en_core_web_sm",
-            "download_cmd": "python -m spacy download en_core_web_sm"
-        }
+        SupportedLanguage.RUSSIAN: {'model_name': 'ru_core_news_sm'},
+        SupportedLanguage.UKRAINIAN: {'model_name': 'uk_core_news_sm'},
+        SupportedLanguage.ENGLISH: {'model_name': 'en_core_web_sm'},
     }
 
-    def __init__(self):
-        """Initialize the unified spaCy gateway."""
+    def __init__(self, *, max_pending: int = 8, timeout: float = 10.0):
         self.logger = get_logger(__name__)
-        self._models: Dict[SupportedLanguage, Any] = {}  # Loaded models cache
-        self._availability: Dict[SupportedLanguage, bool] = {}  # Model availability cache
+        self._models: dict[SupportedLanguage, Any] = {}
+        self._availability: dict[SupportedLanguage, bool] = {}
+        self._validated_models: dict[SupportedLanguage, Any] = {}
+        self._model_lock = threading.RLock()
+        self._queue = InferenceQueue(max_pending, timeout, label='NER')
 
-    def _load_spacy_model(self, language: SupportedLanguage) -> Tuple[Any, bool]:
-        """
-        Lazy load spaCy model for the specified language.
-
-        Args:
-            language: Target language for NER processing
-
-        Returns:
-            Tuple of (model, is_available)
-        """
-        # Check cache first
-        if language in self._availability:
-            return self._models.get(language), self._availability[language]
-
-        try:
-            import spacy
-            model_name = self.MODEL_CONFIG[language]["model_name"]
-
-            # Try to load the model
-            nlp = spacy.load(model_name)
-
-            # Cache successful load
-            self._models[language] = nlp
-            self._availability[language] = True
-
-            self.logger.info(f"spaCy model {model_name} loaded successfully")
-            return nlp, True
-
-        except (ImportError, OSError) as e:
-            # Cache failure
-            self._models[language] = None
-            self._availability[language] = False
-
-            download_cmd = self.MODEL_CONFIG[language]["download_cmd"]
-            self.logger.warning(
-                f"spaCy {language.value} model not available. "
-                f"Install with: {download_cmd}. Error: {e}"
-            )
-            return None, False
+    def _load_spacy_model(self, language: SupportedLanguage):
+        language = SupportedLanguage(language)
+        with self._model_lock:
+            if language in self._availability:
+                return self._models.get(language), self._availability[language]
+            try:
+                import spacy
+                model = spacy.load(self.MODEL_CONFIG[language]['model_name'],
+                                   exclude=self.NON_NER_COMPONENTS)
+            except (ImportError, OSError):
+                model = None
+                self.logger.warning('Required NER model unavailable for %s; run make download-models', language.value)
+            self._models[language] = model
+            self._availability[language] = model is not None
+            return model, model is not None
 
     def is_available(self, language: SupportedLanguage) -> bool:
-        """
-        Check if spaCy model is available for the specified language.
-
-        Args:
-            language: Language to check
-
-        Returns:
-            True if model is available, False otherwise
-        """
-        _, available = self._load_spacy_model(language)
-        return available
-
-    def extract_entities(self, text: str, language: SupportedLanguage) -> List[NEREntity]:
-        """
-        Extract named entities from text using spaCy NER.
-
-        Args:
-            text: Text to process
-            language: Language of the text
-
-        Returns:
-            List of extracted entities
-        """
-        nlp, available = self._load_spacy_model(language)
-
-        if not available:
-            self.logger.warning(f"spaCy model not available for {language.value}")
-            return []
-
-        if not text or not text.strip():
-            return []
-
-        try:
-            doc = nlp(text)
-            entities = []
-
-            for ent in doc.ents:
-                # Map spaCy labels to our standard labels
-                label = self._normalize_label(ent.label_)
-
-                entity = NEREntity(
-                    text=ent.text,
-                    label=label,
-                    start=ent.start_char,
-                    end=ent.end_char,
-                    confidence=1.0  # spaCy doesn't provide confidence scores by default
-                )
-                entities.append(entity)
-
-            return entities
-
-        except Exception as e:
-            self.logger.error(f"NER processing failed for {language.value}: {e}")
-            return []
-
-    def get_ner_hints(self, text: str, language: SupportedLanguage) -> NERHints:
-        """
-        Get NER hints for role tagging.
-
-        Args:
-            text: Text to analyze
-            language: Language of the text
-
-        Returns:
-            NER hints with persons, organizations, and locations
-        """
-        entities = self.extract_entities(text, language)
-
-        persons = set()
-        organizations = set()
-        locations = set()
-
-        for entity in entities:
-            if entity.label == "PERSON":
-                persons.add(entity.text.lower())
-            elif entity.label == "ORG":
-                organizations.add(entity.text.lower())
-            elif entity.label == "LOC":
-                locations.add(entity.text.lower())
-
-        # Calculate overall confidence based on entity count
-        confidence = min(len(entities) / 10.0, 1.0) if entities else 0.0
-
-        return NERHints(
-            persons=persons,
-            organizations=organizations,
-            locations=locations,
-            confidence=confidence
-        )
+        return self._load_spacy_model(language)[1]
 
     @staticmethod
-    def _normalize_label(spacy_label: str) -> str:
-        """
-        Normalize spaCy entity labels to standard format.
+    def _normalize_label(label: str) -> str:
+        label = label.upper()
+        return {'PERSON': 'PER', 'ORGANIZATION': 'ORG', 'LOCATION': 'LOC', 'GPE': 'LOC'}.get(label, label)
 
-        Args:
-            spacy_label: Original spaCy label
+    @staticmethod
+    def _languages_for_text(text, preferred):
+        names = {unicodedata.name(c, "") for c in text if c.isalpha()}
+        selected = set()
+        if any("LATIN" in name for name in names):
+            selected.add(SupportedLanguage.ENGLISH)
+        if any("CYRILLIC" in name for name in names):
+            if any(c.lower() in "іїєґ" for c in text):
+                selected.add(SupportedLanguage.UKRAINIAN)
+            elif preferred in {"ru", "uk"}:
+                selected.add(SupportedLanguage(preferred))
+            else:
+                selected.update((SupportedLanguage.RUSSIAN, SupportedLanguage.UKRAINIAN))
+        return selected
 
-        Returns:
-            Normalized label
-        """
-        # Map various spaCy labels to our standard labels
-        label_mapping = {
-            # Person labels
-            "PER": "PERSON", "PERSON": "PERSON",
+    def _extract_entities(self, text: str, language, required: bool):
+        if not text or not text.strip():
+            return []
+        try:
+            languages = self._languages_for_text(text, language)
+            if not languages and any(c.isalpha() for c in text):
+                raise NERUnavailableError("NER does not support this script")
+            entities, seen = [], set()
+            for selected in sorted(languages, key=lambda item:item.value):
+                model, available = self._load_spacy_model(selected)
+                if not available:
+                    raise NERUnavailableError("Requested NER model is unavailable")
+                try:
+                    model_entities = list(model(text).ents)
+                    if any(not (0 <= e.start_char < e.end_char <= len(text))
+                           or text[e.start_char:e.end_char] != e.text for e in model_entities):
+                        raise NERUnavailableError("NER returned inconsistent source positions")
+                except Exception:
+                    self._validated_models.pop(selected, None)
+                    raise
+                self._validated_models[selected] = model
+                for entity in model_entities:
+                    start, end = entity.start_char, entity.end_char
+                    if not (0 <= start < end <= len(text)) or text[start:end] != entity.text:
+                        raise NERUnavailableError("NER returned inconsistent source positions")
+                    # A Cyrillic model must not classify a Latin name (or vice
+                    # versa) merely because both occur in one payment string.
+                    if selected not in self._languages_for_text(entity.text, language):
+                        continue
+                    key = (self._normalize_label(entity.label_), start, end)
+                    if key not in seen:
+                        seen.add(key)
+                        entities.append(NEREntity(entity.text, key[0], start, end))
+            return sorted(entities, key=lambda entity:(entity.start, entity.end, entity.label))
+        except Exception as exc:
+            self.logger.warning("NER extraction failed for %s", language)
+            if required:
+                raise NERUnavailableError("Requested NER extraction failed") from exc
+            return []
 
-            # Organization labels
-            "ORG": "ORG", "ORGANIZATION": "ORG",
+    @staticmethod
+    def _hints(entities: list[NEREntity]) -> NERHints:
+        return NERHints(
+            person_spans=[(e.start, e.end) for e in entities if e.label == 'PER'],
+            org_spans=[(e.start, e.end) for e in entities if e.label == 'ORG'],
+            entities=entities,
+        )
 
-            # Location labels
-            "LOC": "LOC", "LOCATION": "LOC", "GPE": "LOC",
+    def extract_entities(self, text: str, language: SupportedLanguage, *, required=False) -> list[NEREntity]:
+        return self._queue.run(self._extract_entities, text, language, required)
 
-            # Other common labels
-            "MISC": "MISC", "DATE": "DATE", "TIME": "TIME"
-        }
+    def get_ner_hints(self, text: str, language: SupportedLanguage, *, required=False) -> NERHints:
+        return self._hints(self.extract_entities(text, language, required=required))
 
-        return label_mapping.get(spacy_label.upper(), spacy_label.upper())
+    async def get_ner_hints_async(self, text: str, language: SupportedLanguage) -> NERHints:
+        entities = await self._queue.run_async(self._extract_entities, text, language, True)
+        return self._hints(entities)
 
-    def get_supported_languages(self) -> List[SupportedLanguage]:
-        """Get list of supported languages."""
+    async def initialize_runtime(self):
+        """Exercise each supported pipeline before the API accepts traffic."""
+        probes = {"en": "Model readiness verification.",
+                  "ru": "Проверка готовности модели.",
+                  "uk": "Перевірка готовності моделі."}
+        for language, text in probes.items():
+            await self._queue.run_async(self._verify_language, text, SupportedLanguage(language))
+        if self.runtime_health_check()["status"] != "healthy":
+            raise NERUnavailableError("Required NER pipelines are not ready")
+
+    def _verify_language(self, text, language):
+        model, available = self._load_spacy_model(language)
+        if not available or "ner" not in model.pipe_names:
+            self._validated_models.pop(language, None)
+            raise NERUnavailableError("Required NER component is unavailable")
+        self._extract_entities(text, language, True)
+
+    def runtime_health_check(self):
+        """Read completed inference state without waiting for a loading model."""
+        models = {}
+        for language in SupportedLanguage:
+            model = self._models.get(language)
+            models[language.value] = {
+                "loaded": model is not None,
+                "validated": model is not None and self._validated_models.get(language) is model,
+            }
+        queue = self._queue.health_check()
+        ready = queue["status"] == "healthy" and all(m["validated"] for m in models.values())
+        return {"status": "healthy" if ready else "unhealthy", "models": models, "queue": queue}
+
+    def get_supported_languages(self):
         return list(SupportedLanguage)
 
-    def get_model_info(self) -> Dict[str, Any]:
-        """
-        Get information about loaded models.
+    def get_model_info(self):
+        """Diagnostics must not load models as a side effect."""
+        with self._model_lock:
+            return {lang.value: {'model_name': data['model_name'],
+                    'available': self._availability.get(lang),
+                    'loaded': self._models.get(lang) is not None}
+                    for lang, data in self.MODEL_CONFIG.items()}
 
-        Returns:
-            Dictionary with model information
-        """
-        info = {}
-        for language in SupportedLanguage:
-            model, available = self._load_spacy_model(language)
-            info[language.value] = {
-                "available": available,
-                "model_name": self.MODEL_CONFIG[language]["model_name"],
-                "loaded": language in self._models
-            }
-        return info
+    def clear_cache(self, language=None):
+        """Clear models in the same serial queue as inference."""
+        return self._queue.run(self._clear_cached_models, language)
 
+    def _clear_cached_models(self, language):
+        with self._model_lock:
+            languages = [SupportedLanguage(language)] if language is not None else list(SupportedLanguage)
+            for lang in languages:
+                self._models.pop(lang, None)
+                self._availability.pop(lang, None)
+                self._validated_models.pop(lang, None)
 
-# Convenience functions for backward compatibility
-def create_russian_gateway() -> UnifiedSpacyGateway:
-    """Create gateway configured for Russian processing."""
-    return UnifiedSpacyGateway()
-
-def create_ukrainian_gateway() -> UnifiedSpacyGateway:
-    """Create gateway configured for Ukrainian processing."""
-    return UnifiedSpacyGateway()
-
-def create_english_gateway() -> UnifiedSpacyGateway:
-    """Create gateway configured for English processing."""
-    return UnifiedSpacyGateway()
+    def close(self):
+        self._queue.close()
 
 
-# Global instance for shared use
 _global_gateway = None
+_global_lock = threading.Lock()
 
-def get_global_gateway() -> UnifiedSpacyGateway:
-    """Get shared global spaCy gateway instance."""
+
+def get_global_gateway():
     global _global_gateway
-    if _global_gateway is None:
-        _global_gateway = UnifiedSpacyGateway()
-    return _global_gateway
+    with _global_lock:
+        if _global_gateway is None:
+            _global_gateway = UnifiedSpacyGateway()
+        return _global_gateway
+
+
+def close_global_gateway():
+    global _global_gateway
+    with _global_lock:
+        if _global_gateway is not None:
+            _global_gateway.close()
+            _global_gateway = None
+
+
+def create_russian_gateway():
+    return UnifiedSpacyGateway()
+
+
+def create_ukrainian_gateway():
+    return UnifiedSpacyGateway()
+
+
+def create_english_gateway():
+    return UnifiedSpacyGateway()

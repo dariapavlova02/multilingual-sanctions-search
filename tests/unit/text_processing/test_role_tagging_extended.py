@@ -1,6 +1,6 @@
 """Tests for extended role tagging functionality."""
 import pytest
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestExtendedRoleTagging:

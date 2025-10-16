@@ -8,10 +8,10 @@ Ensures that trace entries have the correct shape and required fields.
 import pytest
 from unittest.mock import Mock
 
-from src.ai_service.layers.normalization.role_tagger_service import (
+from ai_service.layers.normalization.role_tagger_service import (
     RoleTaggerService, RoleRules
 )
-from src.ai_service.layers.normalization.lexicon_loader import Lexicons
+from ai_service.layers.normalization.lexicon_loader import Lexicons
 
 
 class TestRolesTraceShape:

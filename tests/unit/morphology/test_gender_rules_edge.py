@@ -1,5 +1,5 @@
 import pytest
-from src.ai_service.layers.normalization.morphology.gender_rules import (
+from ai_service.layers.normalization.morphology.gender_rules import (
     convert_given_name_to_nominative_ru, convert_patronymic_to_nominative_ru,
     convert_given_name_to_nominative_uk, to_feminine_nominative_ru,
     to_feminine_nominative_uk, is_invariable_surname

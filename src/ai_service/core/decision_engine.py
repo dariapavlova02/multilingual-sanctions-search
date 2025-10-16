@@ -70,11 +70,13 @@ class DecisionEngine:
             smartfilter=smartfilter,
             signals=signals,
             similarity=similarity,
-            search=inp.search
+            search=inp.search,
+            normalization=inp.normalization,
         )
         
         # Calculate weighted score
-        score = self._calculate_weighted_score(safe_input)
+        raw_score = self._calculate_weighted_score(safe_input)
+        score = max(0.0, min(1.0, raw_score))
         
         # Determine risk level based on thresholds and special conditions
         risk = self._determine_risk_level(score, inp)
@@ -84,6 +86,8 @@ class DecisionEngine:
         
         # Extract details with used features and weights
         details = self._extract_details(safe_input, score)
+        if raw_score != score:
+            details["raw_score"] = raw_score
         
         # Apply business gates (TIN/DOB requirement)
         review_required, required_fields = self._should_request_additional_fields(safe_input, risk, score)
@@ -194,6 +198,32 @@ class DecisionEngine:
 
         return score
     
+    @staticmethod
+    def _has_unassigned_id_match(inp: DecisionInput) -> bool:
+        """A sanctions identifier hit whose owner in the submitted text is unresolved."""
+        return bool(inp.search and any(
+            candidate.features.get("unassigned_id_match") is True
+            for candidate in inp.search.fusion_candidates
+        ))
+
+    @staticmethod
+    def _has_confirmed_identity_match(inp: DecisionInput, candidate: Any) -> bool:
+        """Only query-to-candidate comparisons can establish an identity match.
+
+        The mere presence of an identifier or birth date on a sanctions record
+        is not evidence that the query describes that person.
+        """
+        features = getattr(candidate, "features", {}) or {}
+        return (
+            inp.signals is not None
+            and inp.signals.id_match is not False
+            and inp.signals.date_match is not False
+            and features.get("id_match") is True
+            and features.get("date_match") is True
+            and features.get("identity_pair_match") is not False
+            and not features.get("identity_conflict", False)
+        )
+
     def _determine_risk_level(self, score: float, inp: Optional[DecisionInput] = None) -> RiskLevel:
         """Determine risk level based on score and special conditions"""
 
@@ -214,12 +244,7 @@ class DecisionEngine:
         if inp and inp.search and inp.search.fusion_candidates:
             for candidate in inp.search.fusion_candidates:
                 # Check if candidate has both TIN-like ID and DOB that match our signals
-                candidate_has_tin = any(
-                    key in candidate.meta for key in ['inn', 'itn', 'tin', 'edrpou', 'taxpayer_id']
-                )
-                candidate_has_dob = candidate.dob is not None
-
-                if candidate_has_tin and candidate_has_dob and candidate.final_score >= 0.8:
+                if self._has_confirmed_identity_match(inp, candidate):
                     self.logger.warning(
                         f"🚨 TIN+DOB SANCTIONS MATCH - forcing HIGH RISK "
                         f"(candidate: {candidate.entity_id}, score: {candidate.final_score:.3f}, "
@@ -268,17 +293,14 @@ class DecisionEngine:
         # PRIORITY 1: ID match reasons
         if inp.signals.id_match:
             reasons.append("🚨 SANCTIONED ID MATCH CONFIRMED - HIGH RISK")
+        if self._has_unassigned_id_match(inp):
+            reasons.append("Matching sanctions identifier has unresolved ownership in the input")
 
         # PRIORITY 2: TIN+DOB combination match
         tin_dob_match_found = False
         if inp.search and inp.search.fusion_candidates and risk == RiskLevel.HIGH:
             for candidate in inp.search.fusion_candidates:
-                candidate_has_tin = any(
-                    key in candidate.meta for key in ['inn', 'itn', 'tin', 'edrpou', 'taxpayer_id']
-                )
-                candidate_has_dob = candidate.dob is not None
-
-                if candidate_has_tin and candidate_has_dob and candidate.final_score >= 0.8:
+                if self._has_confirmed_identity_match(inp, candidate):
                     reasons.append(f"🚨 TIN+DOB SANCTIONS MATCH - HIGH RISK (candidate: {candidate.entity_id})")
                     tin_dob_match_found = True
                     break
@@ -388,6 +410,7 @@ class DecisionEngine:
             "similarity_cos_top": similarity_value,
             "date_match": inp.signals.date_match,
             "id_match": inp.signals.id_match,
+            "unassigned_id_match": self._has_unassigned_id_match(inp),
             "search_exact_matches": inp.search.has_exact_matches if inp.search else False,
             "search_exact_confidence": inp.search.exact_confidence if inp.search else 0.0,
             "search_total_matches": inp.search.total_matches if inp.search else 0
@@ -633,6 +656,15 @@ class DecisionEngine:
         if not getattr(self.config, 'require_tin_dob_gate', True):
             return False, []
 
+        if inp.search and any(candidate.features.get("identity_conflict", False)
+                              for candidate in inp.search.fusion_candidates):
+            return True, []
+
+        # An exact number match cannot establish which submitted entity owns it.
+        # A confirmed hit for another entity must not clear this review condition.
+        if self._has_unassigned_id_match(inp):
+            return True, []
+
         # EXCEPTION 1: If ID match already confirmed, no additional fields needed
         if inp.signals.id_match:
             self.logger.debug("ID match confirmed - no additional fields required")
@@ -641,12 +673,7 @@ class DecisionEngine:
         # EXCEPTION 2: If we already found TIN+DOB match in search candidates, no additional fields needed
         if inp.search and inp.search.fusion_candidates:
             for candidate in inp.search.fusion_candidates:
-                candidate_has_tin = any(
-                    key in candidate.meta for key in ['inn', 'itn', 'tin', 'edrpou', 'taxpayer_id']
-                )
-                candidate_has_dob = candidate.dob is not None
-
-                if candidate_has_tin and candidate_has_dob and candidate.final_score >= 0.8:
+                if self._has_confirmed_identity_match(inp, candidate):
                     self.logger.debug(
                         f"TIN+DOB match confirmed in candidate {candidate.entity_id} - no additional fields required"
                     )
@@ -696,9 +723,9 @@ class DecisionEngine:
         )
 
         if sanction_has_no_identifiers:
-            # Allow reject by full name - no additional fields required
-            self.logger.debug("Sanction record has no identifiers - allowing name-only match")
-            return False, []
+            # A name alone cannot establish identity. Keep manual review even
+            # when the source offers no identifiers for further comparison.
+            return True, []
 
         # Request missing fields for strong name matches
         required_fields = []
@@ -709,8 +736,8 @@ class DecisionEngine:
 
         # If we have both TIN and DOB, no additional fields needed
         if has_tin_evidence and has_dob_evidence:
-            self.logger.debug("Both TIN and DOB evidence found - no additional fields required")
-            return False, []
+            self.logger.debug("Identifiers supplied but no confirmed identity match; manual review required")
+            return True, []
 
         # If no additional fields needed (shouldn't happen, but safety check)
         if not required_fields:

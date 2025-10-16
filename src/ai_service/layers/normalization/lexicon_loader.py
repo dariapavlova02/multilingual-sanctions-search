@@ -4,6 +4,10 @@ Lexicon loader for role classification.
 Loads stopwords, legal forms, and payment context words from lexicon files.
 """
 
+from ...utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 import os
 import json
 from pathlib import Path
@@ -33,17 +37,9 @@ def load_lexicons(base_path: Optional[Path] = None) -> Lexicons:
         Lexicons object with loaded data.
     """
     if base_path is None:
-        # Default to project root/data/lexicons
-        # Try to find the project root by looking for pyproject.toml
-        current_path = Path(__file__).parent
-        while current_path != current_path.parent:
-            if (current_path / "pyproject.toml").exists():
-                base_path = current_path / "data" / "lexicons"
-                break
-            current_path = current_path.parent
-        else:
-            # Fallback to relative path from current file
-            base_path = Path(__file__).parent.parent.parent.parent / "data" / "lexicons"
+        from ai_service.data.resources import LEXICONS_DIR
+
+        base_path = LEXICONS_DIR
     
     stopwords = {}
     stopwords_init = {}
@@ -125,7 +121,7 @@ def _load_word_list(file_path: Path) -> Set[str]:
                     words.add(line.lower())
     except Exception as e:
         # Log error but don't fail - return empty set
-        print(f"Warning: Could not load {file_path}: {e}")
+        logger.warning(f"Could not load {file_path}: {e}")
     
     return words
 
@@ -150,7 +146,7 @@ def _load_json_word_list(file_path: Path, lang: str) -> Set[str]:
                 words = set(word.lower() for word in data[lang] if isinstance(word, str))
     except Exception as e:
         # Log error but don't fail - return empty set
-        print(f"Warning: Could not load {file_path}: {e}")
+        logger.warning(f"Could not load {file_path}: {e}")
     
     return words
 

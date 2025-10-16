@@ -6,6 +6,8 @@ import pytest
 from ai_service.config import EmbeddingConfig
 from ai_service.layers.embeddings.embedding_service import EmbeddingService
 
+pytestmark = pytest.mark.model
+
 
 class TestEmbeddingModelSwitch:
     """Test embedding model switching functionality"""
@@ -43,10 +45,9 @@ class TestEmbeddingModelSwitch:
         assert all(len(emb) == 384 for emb in results)
 
     def test_invalid_model_raises_error(self):
-        """Test that invalid model names work (no validation)"""
-        # Since we removed validation, this should work
-        config = EmbeddingConfig(model_name="invalid-model-name")
-        assert config.model_name == "invalid-model-name"
+        """Reject an ambiguous repository ID before downloading a model."""
+        with pytest.raises(ValueError, match="namespace/model"):
+            EmbeddingConfig(model_name="invalid-model-name")
 
     def test_extra_models_allowlist(self):
         """Test that extra_models can be added to allowlist"""
@@ -59,10 +60,9 @@ class TestEmbeddingModelSwitch:
         assert "sentence-transformers/paraphrase-MiniLM-L6-v2" in config.extra_models
 
     def test_config_validation_error_messages(self):
-        """Test that config works without validation"""
-        # Since we removed validation, this should work
-        config = EmbeddingConfig(model_name="completely-invalid-model")
-        assert config.model_name == "completely-invalid-model"
+        """An unknown repository needs its own complete immutable contract."""
+        with pytest.raises(ValueError, match="explicit revision and dimension"):
+            EmbeddingConfig(model_name="custom/unpinned-model")
 
     def test_model_switch_preserves_functionality(self):
         """Test that model switching preserves all functionality"""

@@ -6,14 +6,15 @@ to ensure they are preserved during normalization.
 """
 
 import pytest
-from src.ai_service.layers.normalization.nameparser_adapter import NameparserAdapter
+from ai_service.layers.normalization.nameparser_adapter import NameparserAdapter
 from pathlib import Path
+from ai_service.data.resources import LEXICONS_DIR
 
 
 @pytest.fixture
 def nameparser_adapter():
     """Create a nameparser adapter for testing."""
-    lexicons_path = Path(__file__).resolve().parents[3] / "data" / "lexicons"
+    lexicons_path = LEXICONS_DIR
     return NameparserAdapter(lexicons_path)
 
 
@@ -72,7 +73,7 @@ def test_apostrophe_and_hyphen_combined(nameparser_adapter):
 def test_title_case_with_apostrophes(nameparser_adapter):
     """Test that title case is applied correctly with apostrophes."""
     # Test the internal title case function from NormalizationFactory
-    from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
+    from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
     factory = NormalizationFactory()
     
     test_cases = [
@@ -89,7 +90,7 @@ def test_title_case_with_apostrophes(nameparser_adapter):
 
 def test_title_case_with_hyphens(nameparser_adapter):
     """Test that title case is applied correctly with hyphens."""
-    from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
+    from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
     factory = NormalizationFactory()
     
     test_cases = [
@@ -106,7 +107,7 @@ def test_title_case_with_hyphens(nameparser_adapter):
 
 def test_title_case_with_apostrophes_and_hyphens(nameparser_adapter):
     """Test title case with both apostrophes and hyphens."""
-    from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
+    from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory
     factory = NormalizationFactory()
     
     test_cases = [
@@ -122,7 +123,7 @@ def test_title_case_with_apostrophes_and_hyphens(nameparser_adapter):
 
 def test_normalize_english_name_token(nameparser_adapter):
     """Test the normalize_english_name_token method."""
-    from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
+    from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
     
     factory = NormalizationFactory()
     config = NormalizationConfig()

@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Set, Union
 from ...utils.logging_config import get_logger
 from ...core.base_service import BaseService
 from ..language.language_detection_service import LanguageDetectionService
+from .config import VariantExecutionConfig
+from ...utils.inference_queue import InferenceQueue
 
 # Import configuration
 try:
@@ -48,6 +50,9 @@ class VariantGenerationService(BaseService):
 
     def __init__(self):
         super().__init__("VariantGenerationService")
+        self.execution_config = VariantExecutionConfig()
+        self._generation_queue = InferenceQueue(self.execution_config.max_pending,
+            self.execution_config.timeout_seconds, label="Variants")
         """
         Initialize the variant generation service with comprehensive transliteration support.
 
@@ -414,6 +419,33 @@ class VariantGenerationService(BaseService):
             )
 
     def generate_variants(
+        self, text: str, language: str = "auto", include_transliteration: bool = True,
+        include_phonetic: bool = True, include_abbreviations: bool = True,
+        include_visual_similarities: bool = True, include_typo_variants: bool = True,
+        max_variants: int = 50, prioritize_quality: bool = True, max_time_ms: int = 100,
+    ) -> Dict[str, Any]:
+        """Generate variants through the shared bounded worker."""
+        return self._generation_queue.run(self._generate_variants, text, language,
+            include_transliteration, include_phonetic, include_abbreviations,
+            include_visual_similarities, include_typo_variants, max_variants,
+            prioritize_quality, max_time_ms)
+
+    async def generate_variants_async(self, text: str, language: str = "auto", **kwargs) -> Dict[str, Any]:
+        return await self._generation_queue.run_async(self._generate_variants, text, language, **kwargs)
+
+    def get_generation_stats(self):
+        return self._generation_queue.snapshot()
+
+    def runtime_health_check(self):
+        queue = self._generation_queue.health_check()
+        ready = self._initialized and queue["status"] == "healthy"
+        return {**self.get_generation_stats(), "status": "healthy" if ready else "unhealthy",
+                "initialized": self._initialized, "queue": queue}
+
+    def close(self):
+        self._generation_queue.close()
+
+    def _generate_variants(
         self,
         text: str,
         language: str = "auto",
@@ -899,7 +931,7 @@ class VariantGenerationService(BaseService):
         """Generation of visually similar variants"""
         variants = set()
 
-        for char in text.lower():
+        for char in dict.fromkeys(text.lower()):
             if char in self.visual_similarities:
                 for similar_char in self.visual_similarities[char]:
                     new_text = text.lower().replace(char, similar_char)
@@ -921,6 +953,8 @@ class VariantGenerationService(BaseService):
                 for typo_char in self.typo_patterns[char]:
                     new_text = text[:i] + typo_char + text[i + 1 :]
                     variants.add(new_text)
+                    if len(variants) >= max_typos:
+                        return variants
 
         # Add Cyrillic typos
         cyrillic_typo_patterns = {
@@ -941,9 +975,11 @@ class VariantGenerationService(BaseService):
                 for typo_char in cyrillic_typo_patterns[char]:
                     new_text = text[:i] + typo_char + text[i + 1 :]
                     variants.add(new_text)
+                    if len(variants) >= max_typos:
+                        return variants
 
         # Limit the number of variants
-        return set(list(variants)[:max_typos])
+        return variants
 
     def _generate_automatic_morphological_variants(
         self, text: str, language: str

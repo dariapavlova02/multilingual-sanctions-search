@@ -8,7 +8,7 @@ import json
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import asdict
 
-from src.ai_service.contracts.trace_models import SearchTrace, SearchTraceStep, SearchTraceHit
+from ai_service.contracts.trace_models import SearchTrace, SearchTraceStep, SearchTraceHit
 
 
 def normalize_trace_for_snapshot(trace: SearchTrace, max_hits: int = 3) -> Dict[str, Any]:

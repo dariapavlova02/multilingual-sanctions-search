@@ -34,6 +34,7 @@ Usage:
 """
 
 import logging
+import threading
 import time
 from typing import List, Union, Optional, Dict, Any
 
@@ -43,6 +44,7 @@ from ...config import EmbeddingConfig
 from ...core.base_service import BaseService
 from ...services.embedding_preprocessor import EmbeddingPreprocessor
 from ...utils.logging_config import get_logger
+from ...utils.inference_queue import InferenceQueue, InferenceUnavailableError
 
 # Public API - only expose vector generation methods
 __all__ = [
@@ -61,13 +63,16 @@ class EmbeddingService(BaseService):
             config: Embedding configuration
         """
         super().__init__("EmbeddingService")
-        self.config = config
+        self._config = EmbeddingConfig.model_validate(config.model_dump())
         self._model = None  # SentenceTransformer instance, loaded lazily
+        self._runtime_model = None
+        self._model_lock = threading.Lock()
+        self._inference = InferenceQueue(config.max_pending_calls, config.inference_timeout)
         self.preprocessor = EmbeddingPreprocessor()
 
         # Add expected attributes for backward compatibility
-        self.model_cache: Dict[str, Any] = {}  # SentenceTransformer models, loaded lazily
-        self.default_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        self.model_cache: Dict[tuple, Any] = {}  # Each entry belongs to one pinned vector space.
+        self.default_model = config.model_name
 
         # Performance optimizations
         self._preprocessing_cache: Dict[str, str] = {}
@@ -77,6 +82,15 @@ class EmbeddingService(BaseService):
         self.logger.info(
             f"EmbeddingService initialized with model: {config.model_name}"
         )
+
+    @property
+    def config(self) -> EmbeddingConfig:
+        return self._config
+
+    @property
+    def embedding_contract(self) -> Dict[str, Any]:
+        """Return a copy of the immutable specification used by the loader."""
+        return self._config.embedding_contract()
 
     def _do_initialize(self) -> None:
         """Service-specific initialization logic"""
@@ -91,6 +105,39 @@ class EmbeddingService(BaseService):
         """Initialize the embedding service asynchronously"""
         self.logger.info("EmbeddingService initialization completed")
 
+    async def initialize_runtime(self) -> None:
+        await self._inference.run_async(self._verify_runtime)
+
+    def _verify_runtime(self):
+        self._runtime_model = None
+        vector = np.asarray(self._encode_one("Model readiness verification"))
+        if (vector.shape != (self.config.dimension,) or not np.isfinite(vector).all()
+                or not np.any(vector)):
+            raise InferenceUnavailableError("Embedding model did not produce a valid probe vector")
+        if self._model is None:
+            raise InferenceUnavailableError("Embedding model is unavailable")
+        self._runtime_model = self._model
+
+    def runtime_health_check(self):
+        """Inspect the validated model and worker without loading or encoding."""
+        queue = self._inference.health_check()
+        validated = self._model is not None and self._runtime_model is self._model
+        ready = validated and queue["status"] == "healthy"
+        return {**self.get_inference_stats(), "status": "healthy" if ready else "unhealthy",
+                "model_validated": validated, "queue": queue}
+
+    def _record_runtime_result(self, model, vectors, count):
+        """Only a finite, nonzero result from the configured model proves health."""
+        if model is not self._model:
+            return
+        try:
+            array = np.asarray(vectors)
+            valid = (array.shape == (count, self.config.dimension)
+                     and np.isfinite(array).all() and np.any(array != 0, axis=1).all())
+        except (ValueError, TypeError):
+            valid = False
+        self._runtime_model = model if valid else None
+
     # Interface-compatible method used by UnifiedOrchestrator
     def generate_embeddings(self, text: str) -> List[float]:
         """
@@ -101,42 +148,47 @@ class EmbeddingService(BaseService):
         """
         try:
             return self.encode_one(text)
+        except InferenceUnavailableError:
+            raise
         except Exception as e:
-            self.logger.error(f"generate_embeddings failed: {e}")
+            self.logger.error("generate_embeddings failed")
             return []
 
     def _load_model(self, model_name: Optional[str] = None):
         """Lazy load the SentenceTransformer model with caching"""
-        model_name = model_name or self.config.model_name
+        with self._model_lock:
+            return self._load_model_unlocked(model_name)
 
-        # Check cache first
-        if model_name in self.model_cache:
-            return self.model_cache[model_name]
+    def _load_model_unlocked(self, model_name: Optional[str] = None):
+        selected = self._selected_model_config(model_name)
+        model_name = selected.model_name
+        cache_key = (selected.model_name, selected.revision, selected.dimension, selected.preprocessing_version)
 
-        # Lazy import of heavy ML dependencies
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            self.logger.error("sentence-transformers not installed. Install with: pip install sentence-transformers")
-            raise
+        if cache_key in self.model_cache:
+            return self.model_cache[cache_key]
 
-        # Load new model
+        from .models.loader import load_embedding_model
         self.logger.info(f"Loading embedding model: {model_name}")
-        model = SentenceTransformer(model_name, device=self.config.device)
-        
-        # Cache the model
-        self.model_cache[model_name] = model
-        
-        # Set as default model if it's the config model
+        model = load_embedding_model(selected)
+        self.model_cache[cache_key] = model
         if model_name == self.config.model_name:
             self._model = model
-            
-        self.logger.info(
-            f"Model loaded successfully on device: {self.config.device}"
-        )
         return model
 
+    def _selected_model_config(self, model_name: Optional[str] = None):
+        model_name = model_name or self.config.model_name
+        if model_name == self.config.model_name:
+            selected = self.config
+        elif model_name in self.config.extra_models:
+            selected = EmbeddingConfig(model_name=model_name, device=self.config.device)
+        else:
+            raise ValueError("Embedding model is not in the configured allowlist")
+        return selected
+
     def _warmup(self):
+        return self._inference.run(self._warmup_model)
+
+    def _warmup_model(self):
         """
         Warmup the embedding service by pre-loading model and running dummy encoding.
         This reduces latency for the first real request.
@@ -172,7 +224,7 @@ class EmbeddingService(BaseService):
             self.logger.info(f"Embedding service warmup completed in {warmup_time:.2f}ms")
 
         except Exception as e:
-            self.logger.warning(f"Warmup failed, will continue with lazy loading: {e}")
+            self.logger.warning("Warmup failed; model remains unvalidated")
 
     def _get_cached_preprocessing(self, text: str) -> str:
         """
@@ -198,6 +250,15 @@ class EmbeddingService(BaseService):
         return normalized
 
     def encode_one(self, text: str) -> List[float]:
+        return self._inference.run(self._encode_one, text)
+
+    async def encode_one_async(self, text: str) -> List[float]:
+        return await self._inference.run_async(self._encode_one, text)
+
+    async def generate_embeddings_async(self, text: str) -> List[float]:
+        return await self.encode_one_async(text)
+
+    def _encode_one(self, text: str) -> List[float]:
         """
         Encode a single text to embedding vector
 
@@ -232,13 +293,21 @@ class EmbeddingService(BaseService):
             if isinstance(embedding, np.ndarray):
                 embedding = embedding.astype(np.float32).tolist()
 
+            self._record_runtime_result(model, embedding, 1)
             return embedding[0] if len(embedding) > 0 else []
 
         except Exception as e:
-            self.logger.error(f"Failed to encode text: {e}")
+            self._runtime_model = None
+            self.logger.error("Failed to encode text")
             raise
 
-    def encode_batch(self, texts: List[str]) -> List[List[float]]:
+    def encode_batch(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
+        return self._inference.run(self._encode_batch, texts, batch_size)
+
+    async def encode_batch_async(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
+        return await self._inference.run_async(self._encode_batch, texts, batch_size)
+
+    def _encode_batch(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         """
         Encode multiple texts to embedding vectors
 
@@ -249,6 +318,9 @@ class EmbeddingService(BaseService):
             List of embedding vectors as 32-bit floats
         """
         start_time = time.perf_counter()
+
+        if batch_size is not None and (type(batch_size) is not int or batch_size < 1):
+            raise ValueError("Embedding batch size must be a positive integer")
 
         if not texts:
             return []
@@ -271,7 +343,7 @@ class EmbeddingService(BaseService):
             # Generate embeddings
             embeddings = model.encode(
                 normalized_texts,
-                batch_size=self.config.batch_size,
+                batch_size=self.config.batch_size if batch_size is None else batch_size,
                 show_progress_bar=False,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
@@ -290,13 +362,20 @@ class EmbeddingService(BaseService):
                     f"Slow encode_batch({len(texts)} texts): {duration_ms:.2f}ms > 100ms"
                 )
 
+            self._record_runtime_result(model, embeddings, len(normalized_texts))
             return embeddings
 
         except Exception as e:
-            self.logger.error(f"Failed to encode texts: {e}")
+            self._runtime_model = None
+            self.logger.error("Failed to encode texts")
             raise
 
-    def encode(
+    def encode(self, texts, normalize=False, batch_size=None, to_numpy=True,
+               model_name=None, normalize_embeddings=True):
+        return self._inference.run(self._encode, texts, normalize, batch_size,
+                                   to_numpy, model_name, normalize_embeddings)
+
+    def _encode(
         self, 
         texts: Union[str, List[str]], 
         normalize: bool = False, 
@@ -370,6 +449,7 @@ class EmbeddingService(BaseService):
                 embeddings = embeddings.astype(np.float32).tolist()
             
             processing_time = time.perf_counter() - start_time
+            self._record_runtime_result(model, embeddings, len(normalized_texts))
             
             # Return just the embeddings for backward compatibility
             if is_single:
@@ -378,7 +458,9 @@ class EmbeddingService(BaseService):
                 return embeddings
                 
         except Exception as e:
-            self.logger.error(f"Failed to encode texts: {e}")
+            if model_name is None or model_name == self.config.model_name:
+                self._runtime_model = None
+            self.logger.error("Failed to encode texts")
             # Return empty result on error
             return [] if not is_single else []
 
@@ -388,6 +470,13 @@ class EmbeddingService(BaseService):
         Useful for pre-loading the model before processing starts.
         """
         self._warmup()
+
+    def close(self):
+        self._inference.close()
+
+    def get_inference_stats(self):
+        """Return capacity counters without loading a model or exposing inputs."""
+        return self._inference.snapshot()
 
     def clear_preprocessing_cache(self):
         """
@@ -436,18 +525,7 @@ class EmbeddingService(BaseService):
             "max_seq_length": getattr(model, "max_seq_length", 512),
         }
 
-    # Hide inherited methods from BaseService and LoggingMixin to maintain clean API
-    # These are made private to pass contract tests that expect only vector generation methods
+    # Retain legacy aliases; normal introspection also exposes inherited lifecycle methods.
     _get_stats = BaseService.get_stats
     _reset_stats = BaseService.reset_stats
     _health_check = BaseService.health_check
-
-    def __dir__(self):
-        # Override dir() to hide inherited methods from introspection
-        all_attrs = super().__dir__()
-        hidden_methods = {
-            'log_entry', 'log_performance', 'log_error', 'log_exit', 'get_stats',
-            'reset_stats', 'health_check', 'is_initialized', 'generate_embeddings'
-        }
-        # Filter out hidden methods from dir() results
-        return [attr for attr in all_attrs if attr not in hidden_methods]

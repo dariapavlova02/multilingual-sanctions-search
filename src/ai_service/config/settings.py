@@ -4,7 +4,8 @@ Structured configuration classes with validation and type hints
 """
 
 import os
-import secrets
+import re
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,9 +20,6 @@ from ..constants import (
 )
 
 
-def generate_secure_api_key() -> str:
-    """Generate a cryptographically secure API key"""
-    return secrets.token_urlsafe(32)
 from ..constants import INTEGRATION_CONFIG as INT_CONSTANTS
 from ..constants import LOGGING_CONFIG as LOG_CONSTANTS
 from ..constants import PERFORMANCE_CONFIG as PERF_CONSTANTS
@@ -30,6 +28,7 @@ from ..constants import (
     SUPPORTED_LANGUAGES,
 )
 from .hot_reload import HotReloadableConfig
+from .env_values import environment_boolean
 
 
 @dataclass
@@ -159,9 +158,10 @@ class SecurityConfig:
     sanitize_input: bool = True
     rate_limit_enabled: bool = True
     max_requests_per_minute: int = 100
-    admin_api_key: str = field(
-        default_factory=lambda: os.getenv("ADMIN_API_KEY") or generate_secure_api_key()
-    )
+    # Administrative endpoints fail closed when the key is not configured.
+    # Generating an unknown key at import time made deployments non-deterministic
+    # and hid configuration mistakes.
+    admin_api_key: str = field(default_factory=lambda: os.getenv("ADMIN_API_KEY", ""))
     enable_cors: bool = True
     allowed_origins: List[str] = field(
         default_factory=lambda: ["http://localhost:3000", "http://localhost:8080"]
@@ -311,28 +311,72 @@ class DeploymentConfig:
         }
 
 
+from ..data.resources import CONFIG_DIR
+import json
+
+_EMBEDDING_DEFAULTS = json.loads((CONFIG_DIR / "embedding_model.json").read_text())
+_EMBEDDING_MODELS = json.loads((CONFIG_DIR / "embedding_alternatives.json").read_text())
+_EMBEDDING_MODELS[_EMBEDDING_DEFAULTS["model_name"]] = _EMBEDDING_DEFAULTS
+
+
 class EmbeddingConfig(BaseModel):
-    """Embedding configuration settings"""
+    """An immutable model contract; changing vector spaces requires a new instance."""
 
-    model_config = {"validate_assignment": True}
+    model_config = {"frozen": True, "validate_default": True, "extra": "forbid"}
 
-    model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    model_name: str
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    dimension: int = Field(ge=1)
+    preprocessing_version: str = _EMBEDDING_DEFAULTS["preprocessing_version"]
     device: str = "cpu"
-    batch_size: int = 64
+    batch_size: int = Field(default=64, ge=1)
     enable_index: bool = False  # индексацию оставляем как опцию
-    extra_models: List[str] = []  # опционально разрешённые альтернативы
+    extra_models: tuple[str, ...] = ()  # Additional pinned catalog models for legacy encode.
     warmup_on_init: bool = False  # Pre-load model and run dummy encoding on initialization
+    max_pending_calls: int = Field(default_factory=lambda: int(os.getenv("EMBEDDING_MAX_PENDING", "16")), ge=0, le=128)
+    inference_timeout: float = Field(default_factory=lambda: float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "30")), gt=0, le=300)
     
-    def model_dump(self) -> Dict[str, Any]:
-        """Return model as dictionary"""
-        return {
-            "model_name": self.model_name,
-            "device": self.device,
-            "batch_size": self.batch_size,
-            "enable_index": self.enable_index,
-            "extra_models": self.extra_models,
-            "warmup_on_init": self.warmup_on_init
-        }
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_model_contract(cls, raw):
+        if not isinstance(raw, dict):
+            return raw
+        values = dict(raw)
+        # Environment fields form one model specification. An explicit model
+        # must never inherit a revision/dimension belonging to that other pair.
+        use_environment = "model_name" not in values
+        name = values.setdefault("model_name", os.getenv("EMBEDDING_MODEL", _EMBEDDING_DEFAULTS["model_name"]))
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise ValueError("Embedding model must be a namespace/model repository ID")
+        known = _EMBEDDING_MODELS.get(name, {})
+        for field_name, variable in (("revision", "EMBEDDING_MODEL_REVISION"), ("dimension", "ES_VECTOR_DIMENSION")):
+            if field_name not in values:
+                if use_environment and variable in os.environ:
+                    values[field_name] = os.environ[variable]
+                elif field_name in known:
+                    values[field_name] = known[field_name]
+                else:
+                    raise ValueError("Unknown embedding model requires an explicit revision and dimension")
+        return values
+
+    @field_validator("extra_models")
+    @classmethod
+    def validate_extra_models(cls, names):
+        if any(name not in _EMBEDDING_MODELS for name in names):
+            raise ValueError("Embedding allowlist entries require a pinned catalog contract")
+        return tuple(dict.fromkeys(names))
+
+    @field_validator("preprocessing_version")
+    @classmethod
+    def validate_preprocessing_version(cls, value):
+        if value != _EMBEDDING_DEFAULTS["preprocessing_version"]:
+            raise ValueError("Unsupported embedding preprocessing version")
+        return value
+
+    def embedding_contract(self) -> Dict[str, Any]:
+        return {key: getattr(self, key) for key in (
+            "model_name", "revision", "dimension", "preprocessing_version"
+        )}
 
 
 class NormalizationConfig(BaseModel):
@@ -364,7 +408,8 @@ class NormalizationConfig(BaseModel):
 class SearchConfig(BaseModel, HotReloadableConfig):
     """Search layer configuration settings with hot-reloading support"""
     
-    model_config = {"validate_assignment": True}
+    model_config = {"validate_assignment": True, "validate_default": True,
+        "extra": "forbid", "hide_input_in_errors": True}
     
     # Hot reload configuration
     config_path: Optional[Path] = Field(default=None, exclude=True)
@@ -374,16 +419,16 @@ class SearchConfig(BaseModel, HotReloadableConfig):
     es_username: Optional[str] = Field(default_factory=lambda: os.getenv("ES_USERNAME"))
     es_password: Optional[str] = Field(default_factory=lambda: os.getenv("ES_PASSWORD"))
     es_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("ES_API_KEY"))
-    es_verify_certs: bool = Field(default_factory=lambda: os.getenv("ES_VERIFY_CERTS", "true").lower() == "true")
+    es_verify_certs: bool = Field(default_factory=lambda: environment_boolean("ES_VERIFY_CERTS", True))
     es_timeout: int = Field(default_factory=lambda: int(os.getenv("ES_TIMEOUT", "30")))
     
     # Search settings
-    enable_hybrid_search: bool = Field(default_factory=lambda: os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true")
-    enable_escalation: bool = Field(default_factory=lambda: os.getenv("ENABLE_ESCALATION", "true").lower() == "true")
+    enable_hybrid_search: bool = Field(default_factory=lambda: environment_boolean("ENABLE_HYBRID_SEARCH", True))
+    enable_escalation: bool = Field(default_factory=lambda: environment_boolean("ENABLE_ESCALATION", True))
     escalation_threshold: float = Field(default_factory=lambda: float(os.getenv("ESCALATION_THRESHOLD", "0.8")))
     
     # Fallback settings
-    enable_fallback: bool = Field(default_factory=lambda: os.getenv("ENABLE_FALLBACK", "true").lower() == "true")
+    enable_fallback: bool = Field(default_factory=lambda: environment_boolean("ENABLE_FALLBACK", True))
     fallback_threshold: float = Field(default_factory=lambda: float(os.getenv("FALLBACK_THRESHOLD", "0.3")))
     
     # Vector search settings
@@ -395,7 +440,7 @@ class SearchConfig(BaseModel, HotReloadableConfig):
     request_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("REQUEST_TIMEOUT_MS", "5000")))
     
     # Cache settings
-    enable_embedding_cache: bool = Field(default_factory=lambda: os.getenv("ENABLE_EMBEDDING_CACHE", "true").lower() == "true")
+    enable_embedding_cache: bool = Field(default_factory=lambda: environment_boolean("ENABLE_EMBEDDING_CACHE", True))
     embedding_cache_size: int = Field(default_factory=lambda: int(os.getenv("EMBEDDING_CACHE_SIZE", "1000")))
     embedding_cache_ttl_seconds: int = Field(default_factory=lambda: int(os.getenv("EMBEDDING_CACHE_TTL_SECONDS", "3600")))
     
@@ -403,7 +448,7 @@ class SearchConfig(BaseModel, HotReloadableConfig):
         super().__init__(**data)
         # Initialize HotReloadableConfig attributes to avoid _watcher errors
         self._watcher = None
-        self._last_reload = None
+        self._last_reload = datetime.now()
         self._reload_count = 0
 
     @property
@@ -422,32 +467,9 @@ class SearchConfig(BaseModel, HotReloadableConfig):
     @field_validator('es_hosts')
     @classmethod
     def validate_hosts(cls, v: List[str]) -> List[str]:
-        """Validate Elasticsearch hosts"""
-        if not v:
-            raise ValueError("At least one Elasticsearch host must be specified")
-        
-        # Validate host format
-        for host in v:
-            if not host or not isinstance(host, str):
-                raise ValueError(f"Invalid host format: {host}")
-            
-            # Basic host validation (host:port format)
-            if ':' not in host:
-                raise ValueError(f"Host must include port: {host}")
-            
-            host_part, port_part = host.split(':', 1)
-            if not host_part or not port_part:
-                raise ValueError(f"Invalid host:port format: {host}")
-            
-            try:
-                port = int(port_part)
-                if not (1 <= port <= 65535):
-                    raise ValueError(f"Port must be between 1 and 65535: {port}")
-            except ValueError as e:
-                raise ValueError(f"Invalid port number: {port_part}")
-        
-        return v
-    
+        from .elasticsearch_hosts import validate_elasticsearch_hosts
+        return validate_elasticsearch_hosts(v)
+
     @field_validator('es_timeout')
     @classmethod
     def validate_timeout(cls, v: int) -> int:
@@ -519,59 +541,34 @@ class SearchConfig(BaseModel, HotReloadableConfig):
     @model_validator(mode='after')
     def validate_configuration_consistency(self) -> 'SearchConfig':
         """Validate configuration consistency"""
+        errors = []
         # Validate that escalation threshold is reasonable
         if self.enable_escalation and self.escalation_threshold <= 0.5:
-            raise ValueError("Escalation threshold should be greater than 0.5 for meaningful escalation")
+            errors.append("Escalation threshold should be greater than 0.5 for meaningful escalation")
         
         # Validate that fallback threshold is reasonable
         if self.enable_fallback and self.fallback_threshold <= 0.1:
-            raise ValueError("Fallback threshold should be greater than 0.1 for meaningful fallback")
+            errors.append("Fallback threshold should be greater than 0.1 for meaningful fallback")
         
         # Validate that vector similarity threshold is reasonable
         if self.vector_similarity_threshold <= 0.3:
-            raise ValueError("Vector similarity threshold should be greater than 0.3 for meaningful similarity")
+            errors.append("Vector similarity threshold should be greater than 0.3 for meaningful similarity")
         
         # Validate that cache settings are reasonable
         if self.enable_embedding_cache and self.embedding_cache_size < 100:
-            raise ValueError("Embedding cache size should be at least 100 for meaningful caching")
+            errors.append("Embedding cache size should be at least 100 for meaningful caching")
+
+        if errors:
+            raise ValueError("; ".join(errors))
         
         return self
     
     def _reload_configuration(self) -> None:
-        """Reload configuration from environment variables."""
-        # Re-read all environment variables
-        self.es_hosts = os.getenv("ES_HOSTS", "localhost:9200").split(",")
-        self.es_username = os.getenv("ES_USERNAME")
-        self.es_password = os.getenv("ES_PASSWORD")
-        self.es_api_key = os.getenv("ES_API_KEY")
-        self.es_verify_certs = os.getenv("ES_VERIFY_CERTS", "true").lower() == "true"
-        self.es_timeout = int(os.getenv("ES_TIMEOUT", "30"))
-        
-        self.enable_hybrid_search = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
-        self.enable_escalation = os.getenv("ENABLE_ESCALATION", "true").lower() == "true"
-        self.escalation_threshold = float(os.getenv("ESCALATION_THRESHOLD", "0.8"))
-        
-        self.enable_fallback = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
-        self.fallback_threshold = float(os.getenv("FALLBACK_THRESHOLD", "0.3"))
-        
-        self.vector_dimension = int(os.getenv("VECTOR_DIMENSION", "384"))
-        self.vector_similarity_threshold = float(os.getenv("VECTOR_SIMILARITY_THRESHOLD", "0.7"))
-        
-        self.max_concurrent_requests = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
-        self.request_timeout_ms = int(os.getenv("REQUEST_TIMEOUT_MS", "5000"))
-        
-        self.enable_embedding_cache = os.getenv("ENABLE_EMBEDDING_CACHE", "true").lower() == "true"
-        self.embedding_cache_size = int(os.getenv("EMBEDDING_CACHE_SIZE", "1000"))
-        self.embedding_cache_ttl_seconds = int(os.getenv("EMBEDDING_CACHE_TTL_SECONDS", "3600"))
-        
-        # Validate the reloaded configuration
-        try:
-            self.validate(self)
-        except Exception as e:
-            logger.error(f"Invalid configuration after reload: {e}")
-            # Revert to previous values or use defaults
-            # This is a simplified approach - in production, you might want more sophisticated rollback
-    
+        """Validate the complete replacement before publishing any changed field."""
+        replacement = type(self)(config_path=self.config_path)
+        fields = {name: getattr(replacement, name) for name in type(self).model_fields}
+        object.__setattr__(self, "__dict__", {**self.__dict__, **fields})
+
     def model_dump(self) -> Dict[str, Any]:
         """Return model as dictionary"""
         return {
@@ -629,8 +626,8 @@ class DecisionConfig(BaseModel):
     bonus_exact_match: float = Field(default_factory=lambda: float(os.getenv("AI_DECISION__BONUS_EXACT_MATCH", "0.2")))
     
     # Thresholds for risk levels (with ENV overrides)
-    thr_high: float = Field(default_factory=lambda: float(os.getenv("AI_DECISION__THR_HIGH", "0.7")))
-    thr_medium: float = Field(default_factory=lambda: float(os.getenv("AI_DECISION__THR_MEDIUM", "0.5")))
+    thr_high: float = Field(default_factory=lambda: float(os.getenv("AI_DECISION__THR_HIGH", "0.85")))
+    thr_medium: float = Field(default_factory=lambda: float(os.getenv("AI_DECISION__THR_MEDIUM", "0.65")))
     
     # Business gates
     require_tin_dob_gate: bool = Field(default_factory=lambda: os.getenv("AI_DECISION__REQUIRE_TIN_DOB_GATE", "true").lower() == "true")

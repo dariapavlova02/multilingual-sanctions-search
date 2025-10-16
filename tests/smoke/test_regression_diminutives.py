@@ -2,7 +2,7 @@
 
 import os
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestDiminutiveRegression:
@@ -12,7 +12,7 @@ class TestDiminutiveRegression:
         os.environ["USE_DIMINUTIVES_DICTIONARY_ONLY"] = "true"
         os.environ["DIMINUTIVES_ALLOW_CROSS_LANG"] = "false"
 
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
         self.service = NormalizationService()
@@ -21,7 +21,7 @@ class TestDiminutiveRegression:
         os.environ.pop("USE_DIMINUTIVES_DICTIONARY_ONLY", None)
         os.environ.pop("DIMINUTIVES_ALLOW_CROSS_LANG", None)
 
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
     def test_russian_vova_petrov(self):

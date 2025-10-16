@@ -17,7 +17,7 @@ class TestEmbeddingServiceCore:
 
     def setup_method(self):
         """Set up test fixtures"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         self.service = EmbeddingService(config)
 
@@ -37,16 +37,17 @@ class TestEmbeddingServiceCore:
     def test_load_model_success(self, mock_sentence_transformer):
         """Test successful model loading"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_sentence_transformer.return_value = mock_model
         
-        from src.ai_service.config import EmbeddingConfig
-        config = EmbeddingConfig()
-        config.model_name = "all-MiniLM-L6-v2"  # Set model name to match
+        from ai_service.config import EmbeddingConfig
+        config = EmbeddingConfig(model_name="sentence-transformers/all-MiniLM-L6-v2")
         service = EmbeddingService(config)
         
         # Load model explicitly
-        service._load_model("all-MiniLM-L6-v2")
+        service._load_model(config.model_name)
         assert service._model is not None
+        assert mock_sentence_transformer.call_args.kwargs["revision"] == config.revision
 
     @patch('sentence_transformers.SentenceTransformer')
     def test_load_model_error(self, mock_sentence_transformer):
@@ -58,7 +59,7 @@ class TestEmbeddingServiceCore:
 
     def test_model_caching(self):
         """Test model caching functionality"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         
         # Test that the same model instance is reused
@@ -73,6 +74,7 @@ class TestEmbeddingServiceCore:
     def test_encode_single_text(self, mock_sentence_transformer):
         """Test getting embeddings for single text"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -86,6 +88,7 @@ class TestEmbeddingServiceCore:
     def test_encode_multiple_texts(self, mock_sentence_transformer):
         """Test getting embeddings for multiple texts"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384, [0.4] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -100,7 +103,8 @@ class TestEmbeddingServiceCore:
     def test_encode_with_normalization(self, mock_sentence_transformer):
         """Test getting embeddings with L2 normalization"""
         mock_model = Mock()
-        mock_embeddings = np.array([[3.0] * 384])  # Will be normalized
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_embeddings = np.full((1, 384), 1.0 / np.sqrt(384))  # Model returns normalized vectors
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
 
@@ -109,6 +113,7 @@ class TestEmbeddingServiceCore:
         assert isinstance(result, list)
         assert len(result) == 384  # Single text returns 384-dimensional vector
         # Check that the embedding is normalized (magnitude should be close to 1)
+        assert mock_model.encode.call_args.kwargs["normalize_embeddings"] is True
         magnitude = np.linalg.norm(result)
         assert abs(magnitude - 1.0) < 0.01
 
@@ -116,6 +121,7 @@ class TestEmbeddingServiceCore:
     def test_encode_batch_processing(self, mock_sentence_transformer):
         """Test batch processing of embeddings"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384, [0.3] * 384, [0.5] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -141,6 +147,7 @@ class TestEmbeddingServiceCore:
     def test_embedding_result_format(self, mock_sentence_transformer):
         """Test that embedding results have consistent format"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -157,19 +164,20 @@ class TestEmbeddingServiceErrorHandling:
 
     def setup_method(self):
         """Set up test fixtures"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         self.service = EmbeddingService(config)
 
-    @patch('src.ai_service.layers.embeddings.embedding_service.SentenceTransformer')
+    @patch('ai_service.layers.embeddings.embedding_service.SentenceTransformer')
     def test_model_encode_error(self, mock_sentence_transformer):
         """Test handling of model encoding errors"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_model.encode.side_effect = Exception("Encoding failed")
         mock_sentence_transformer.return_value = mock_model
         
         # Create a new service instance with the mocked model
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         service = EmbeddingService(config)
 
@@ -177,15 +185,16 @@ class TestEmbeddingServiceErrorHandling:
         result = service.encode("test text")
         assert result == []
 
-    @patch('src.ai_service.layers.embeddings.embedding_service.SentenceTransformer')
+    @patch('ai_service.layers.embeddings.embedding_service.SentenceTransformer')
     def test_memory_error_handling(self, mock_sentence_transformer):
         """Test handling of memory errors with large inputs"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_model.encode.side_effect = MemoryError("Out of memory")
         mock_sentence_transformer.return_value = mock_model
         
         # Create a new service instance with the mocked model
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         service = EmbeddingService(config)
 
@@ -197,6 +206,7 @@ class TestEmbeddingServiceErrorHandling:
     def test_nan_embedding_handling(self, mock_sentence_transformer):
         """Test handling of NaN embeddings"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[np.nan] + [0.2] * 383])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -213,7 +223,7 @@ class TestEmbeddingServicePerformance:
 
     def setup_method(self):
         """Set up test fixtures"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         self.service = EmbeddingService(config)
 
@@ -221,6 +231,7 @@ class TestEmbeddingServicePerformance:
     def test_batch_size_optimization(self, mock_sentence_transformer):
         """Test that batch size affects processing"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384, [0.3] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -235,6 +246,7 @@ class TestEmbeddingServicePerformance:
     def test_processing_time_tracking(self, mock_sentence_transformer):
         """Test that processing time is tracked"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -246,7 +258,7 @@ class TestEmbeddingServicePerformance:
 
     def test_model_cache_efficiency(self):
         """Test that model caching improves efficiency"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         
         # Test that multiple service instances can be created efficiently
@@ -266,7 +278,7 @@ class TestEmbeddingServiceIntegration:
 
     def setup_method(self):
         """Set up test fixtures"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         self.service = EmbeddingService(config)
 
@@ -274,7 +286,8 @@ class TestEmbeddingServiceIntegration:
     def test_multilingual_support(self, mock_sentence_transformer):
         """Test support for multilingual text"""
         mock_model = Mock()
-        mock_embeddings = np.array([[0.1] * 384])
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_embeddings = np.array([[0.1] * 384] * 3)
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
 
@@ -290,6 +303,7 @@ class TestEmbeddingServiceIntegration:
     def test_real_world_embedding_scenarios(self, mock_sentence_transformer):
         """Test real-world embedding scenarios"""
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         mock_embeddings = np.array([[0.1] * 384, [0.4] * 384])
         mock_model.encode.return_value = mock_embeddings
         mock_sentence_transformer.return_value = mock_model
@@ -311,7 +325,7 @@ class TestEmbeddingServiceErrorHandling:
 
     def setup_method(self):
         """Set up test fixtures"""
-        from src.ai_service.config import EmbeddingConfig
+        from ai_service.config import EmbeddingConfig
         config = EmbeddingConfig()
         self.service = EmbeddingService(config)
 
@@ -320,6 +334,7 @@ class TestEmbeddingServiceErrorHandling:
         # Mock the model to raise an exception during encode
         with patch.object(self.service, '_load_model') as mock_load_model:
             mock_model = Mock()
+            mock_model.get_sentence_embedding_dimension.return_value = 384
             mock_model.encode.side_effect = Exception("Model encode error")
             mock_load_model.return_value = mock_model
             
@@ -334,6 +349,7 @@ class TestEmbeddingServiceErrorHandling:
         # Mock the model to raise a memory error during encode
         with patch.object(self.service, '_load_model') as mock_load_model:
             mock_model = Mock()
+            mock_model.get_sentence_embedding_dimension.return_value = 384
             mock_model.encode.side_effect = MemoryError("Out of memory")
             mock_load_model.return_value = mock_model
             

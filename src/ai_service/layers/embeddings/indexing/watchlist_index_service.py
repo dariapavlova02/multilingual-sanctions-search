@@ -1,462 +1,604 @@
-"""
-Watchlist index manager: persistent char TF-IDF kNN index with atomic swap.
-
-Supports active base index + optional delta overlay. Provides load/save snapshot,
-atomic reload, and combined search. Stores per-doc metadata and entity_type.
-"""
+"""Atomic active/overlay watchlists and bounded, data-only snapshot persistence."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 import json
-import os
-import pickle
+import math
+from pathlib import Path
+import re
+import threading
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import uuid
 
-import numpy as np
-
-from ....utils.logging_config import get_logger
 from ....contracts.trace_models import SearchTrace, SearchTraceHit, SearchTraceStep
-from .vector_index_service import CharTfidfVectorIndex, VectorIndexConfig
-from .enhanced_vector_index_service import EnhancedVectorIndex, EnhancedVectorIndexConfig
+from ....utils.inference_queue import InferenceQueue, InferenceUnavailableError
+from ....utils.logging_config import get_logger
+from ....utils.source_text_view import without_format_controls
+from .enhanced_vector_index_service import (
+    EnhancedVectorIndex,
+    EnhancedVectorIndexConfig,
+    new_embedding_service,
+)
+from .local_index_snapshot import (
+    FORMAT,
+    VERSION,
+    FILENAME,
+    canonical_bytes,
+    read_json,
+    read_snapshot,
+    write_snapshot,
+)
 
 
-@dataclass
+@dataclass(frozen=True)
 class WatchlistDoc:
     doc_id: str
     text: str
     entity_type: str
-    metadata: Dict
+    metadata: dict
+
+
+class _LegacySnapshot(ValueError):
+    pass
 
 
 class WatchlistIndexService:
-    """Manages active + overlay indexes and metadata with atomic swaps."""
-
-    def __init__(self, cfg: Optional[EnhancedVectorIndexConfig] = None) -> None:
+    def __init__(self, cfg=None):
+        if cfg is not None and not isinstance(cfg, EnhancedVectorIndexConfig):
+            raise TypeError("Expected EnhancedVectorIndexConfig")
+        self._cfg = replace(cfg) if cfg is not None else EnhancedVectorIndexConfig()
         self.logger = get_logger(__name__)
-        self.cfg = cfg or EnhancedVectorIndexConfig()
-        self._active = EnhancedVectorIndex(self.cfg)
-        self._overlay: Optional[EnhancedVectorIndex] = None
-        self._docs: Dict[str, WatchlistDoc] = {}
-        self._overlay_docs: Dict[str, WatchlistDoc] = {}
-        self._active_id: Optional[str] = None
-        self._overlay_id: Optional[str] = None
-
-    def ready(self) -> bool:
-        return bool(self._active and len(self._docs) > 0)
-
-    def build_from_corpus(
-        self, corpus: List[Tuple[str, str, str, Dict]], index_id: Optional[str] = None
-    ) -> None:
-        """Rebuild active index from corpus of (id, text, entity_type, metadata)."""
-        docs = [(doc_id, text) for (doc_id, text, _et, _md) in corpus]
-        self._active.rebuild(docs)
-        self._docs = {
-            doc_id: WatchlistDoc(doc_id, text, et, md)
-            for (doc_id, text, et, md) in corpus
-        }
-        self._active_id = index_id or "in-memory"
-        self.logger.info(
-            f"Watchlist active index built: {len(self._docs)} docs, id={self._active_id}"
+        self._lock = threading.RLock()
+        self._closed = False
+        self._operations = InferenceQueue(
+            self.cfg.max_pending_operations,
+            self.cfg.operation_timeout,
+            label="Watchlist",
         )
-
-    def set_overlay_from_corpus(
-        self, corpus: List[Tuple[str, str, str, Dict]], overlay_id: Optional[str] = None
-    ) -> None:
-        idx = EnhancedVectorIndex(self.cfg)
-        docs = [(doc_id, text) for (doc_id, text, _et, _md) in corpus]
-        idx.rebuild(docs)
-        self._overlay = idx
-        self._overlay_docs = {
-            doc_id: WatchlistDoc(doc_id, text, et, md)
-            for (doc_id, text, et, md) in corpus
-        }
-        self._overlay_id = overlay_id or "overlay"
-        self.logger.info(
-            f"Watchlist overlay set: {len(self._overlay_docs)} docs, id={self._overlay_id}"
+        # One owned encoder serves active, overlay and unpublished candidate indices.
+        self._embedding_service = (
+            new_embedding_service(self.cfg)
+            if self.cfg.use_semantic_embeddings
+            else None
         )
-
-    def clear_overlay(self) -> None:
+        self._active = self._new_index()
         self._overlay = None
-        self._overlay_docs = {}
-        self._overlay_id = None
+        self._docs, self._overlay_docs = {}, {}
+        self._active_id = self._overlay_id = None
 
-    def search(self, query: str, top_k: int = 50, trace: Optional[SearchTrace] = None) -> List[Tuple[str, float]]:
-        """Search overlay then active; merge unique doc_ids preserving best score."""
-        # Create dummy trace if none provided
-        if trace is None:
-            trace = SearchTrace(enabled=False)
-        
-        try:
-            # Check if index is ready
-            if not self.ready():
-                trace.note("Watchlist index not ready - empty index")
-                return []
-            
-            results: Dict[str, float] = {}
-            all_hits: List[SearchTraceHit] = []
-            
-            # Overlay search
-            if self._overlay is not None:
-                start_time = time.perf_counter()
-                overlay_results = self._overlay.search(query, top_k=min(top_k, 200))
-                overlay_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
-                
-                # Convert overlay results to SearchTraceHit with signals
-                overlay_hits = []
-                for rank, (doc_id, score) in enumerate(overlay_results, 1):
-                    results[doc_id] = max(results.get(doc_id, 0.0), float(score))
-                    
-                    # Extract signals from metadata if available
-                    doc_metadata = self._overlay_docs.get(doc_id, WatchlistDoc("", "", "", {}))
-                    signals = self._extract_signals(doc_id, doc_metadata, query)
-                    
-                    hit = SearchTraceHit(
-                        doc_id=doc_id,
-                        score=float(score),
-                        rank=rank,
-                        source="LEXICAL",
-                        signals=signals
-                    )
-                    overlay_hits.append(hit)
-                    all_hits.append(hit)
-                
-                # Add overlay step to trace
-                trace.add_step(SearchTraceStep(
-                    stage="LEXICAL",
-                    query=query,
-                    topk=min(top_k, 200),
-                    took_ms=overlay_time,
-                    hits=overlay_hits,
-                    meta={
-                        "overlay_id": self._overlay_id,
-                        "active_id": None,
-                        "search_type": "overlay",
-                        "index_type": "char_tfidf"
-                    }
-                ))
-            else:
-                trace.note("No overlay index available")
-            
-            # Active search
-            start_time = time.perf_counter()
-            active_results = self._active.search(query, top_k=min(top_k, 200))
-            active_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
-            
-            # Convert active results to SearchTraceHit with signals
-            active_hits = []
-            for rank, (doc_id, score) in enumerate(active_results, 1):
-                results[doc_id] = max(results.get(doc_id, 0.0), float(score))
-                
-                # Extract signals from metadata if available
-                doc_metadata = self._docs.get(doc_id, WatchlistDoc("", "", "", {}))
-                signals = self._extract_signals(doc_id, doc_metadata, query)
-                
-                hit = SearchTraceHit(
-                    doc_id=doc_id,
-                    score=float(score),
-                    rank=rank,
-                    source="LEXICAL",
-                    signals=signals
-                )
-                active_hits.append(hit)
-                all_hits.append(hit)
-            
-            # Add active step to trace
-            trace.add_step(SearchTraceStep(
-                stage="LEXICAL",
-                query=query,
-                topk=min(top_k, 200),
-                took_ms=active_time,
-                hits=active_hits,
-                meta={
-                    "overlay_id": None,
-                    "active_id": self._active_id,
-                    "search_type": "active",
-                    "index_type": "char_tfidf"
-                }
-            ))
-            
-            # Merge and rerank results
-            start_time = time.perf_counter()
-            items = sorted(results.items(), key=lambda x: x[1], reverse=True)[:top_k]
-            rerank_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
-            
-            # Convert final results to SearchTraceHit for rerank step
-            rerank_hits = []
-            for rank, (doc_id, score) in enumerate(items, 1):
-                # Get the best hit from all_hits for this doc_id
-                best_hit = next((h for h in all_hits if h.doc_id == doc_id), None)
-                signals = best_hit.signals if best_hit else {}
-                
-                hit = SearchTraceHit(
-                    doc_id=doc_id,
-                    score=score,
-                    rank=rank,
-                    source="RERANK",
-                    signals=signals
-                )
-                rerank_hits.append(hit)
-            
-            # Add rerank step to trace
-            trace.add_step(SearchTraceStep(
-                stage="RERANK",
-                query=query,
-                topk=top_k,
-                took_ms=rerank_time,
-                hits=rerank_hits,
-                meta={
-                    "total_candidates": len(results),
-                    "final_results": len(items),
-                    "merge_strategy": "max_score",
-                    "overlay_hits": len(overlay_hits) if self._overlay else 0,
-                    "active_hits": len(active_hits)
-                }
-            ))
-            
-            # Limit payload size to prevent excessive memory usage
-            trace.limit_payload_size(max_size_kb=200)
-            
-            trace.note(f"Watchlist search completed: {len(items)} results from {len(results)} candidates")
-            return items
-            
-        except Exception as e:
-            trace.note(f"Watchlist search failed: {str(e)}")
-            self.logger.error(f"Watchlist search failed for query '{query}': {e}")
-            return []
+    @property
+    def cfg(self):
+        return self._cfg
 
-    def _extract_signals(self, doc_id: str, doc_metadata: WatchlistDoc, query: str) -> Dict[str, Any]:
-        """Extract signals from document metadata for search trace."""
-        signals = {}
-        
-        # Extract DoB match signal
-        if hasattr(doc_metadata, 'metadata') and doc_metadata.metadata:
-            dob = doc_metadata.metadata.get('dob')
-            if dob:
-                signals['dob_match'] = self._check_dob_match(dob, query)
-        
-        # Extract doc_id match signal
-        signals['doc_id_match'] = self._check_doc_id_match(doc_id, query)
-        
-        # Extract entity type signal
-        if hasattr(doc_metadata, 'entity_type'):
-            signals['entity_type'] = doc_metadata.entity_type
-        
-        # Extract text match signal
-        if hasattr(doc_metadata, 'text'):
-            signals['text_match'] = self._check_text_match(doc_metadata.text, query)
-        
-        return signals
-    
-    def _check_dob_match(self, dob: str, query: str) -> bool:
-        """Check if date of birth matches query."""
-        if not dob or not query:
-            return False
-        
-        # Simple string matching for DOB
-        query_lower = query.lower()
-        dob_lower = dob.lower()
-        
-        # Check for year match
-        if len(dob) >= 4 and len(query) >= 4:
-            dob_year = dob[-4:] if dob[-4:].isdigit() else ""
-            query_year = "".join([c for c in query if c.isdigit()])
-            if dob_year and query_year and dob_year in query_year:
-                return True
-        
-        return dob_lower in query_lower or query_lower in dob_lower
-    
-    def _check_doc_id_match(self, doc_id: str, query: str) -> bool:
-        """Check if document ID matches query."""
-        if not doc_id or not query:
-            return False
-        
-        query_lower = query.lower()
-        doc_id_lower = doc_id.lower()
-        
-        return doc_id_lower in query_lower or query_lower in doc_id_lower
-    
-    def _check_text_match(self, text: str, query: str) -> bool:
-        """Check if document text matches query."""
-        if not text or not query:
-            return False
-        
-        query_lower = query.lower()
-        text_lower = text.lower()
-        
-        return query_lower in text_lower or text_lower in query_lower
+    def _new_index(self):
+        return EnhancedVectorIndex(self.cfg, embedding_service=self._embedding_service)
 
-    def get_doc(self, doc_id: str, trace: Optional[SearchTrace] = None) -> Optional[WatchlistDoc]:
-        """Get document by ID from overlay or active index."""
-        # Create dummy trace if none provided
-        if trace is None:
-            trace = SearchTrace(enabled=False)
-        
-        try:
-            # Check overlay first
-            doc = self._overlay_docs.get(doc_id)
-            if doc is not None:
-                trace.note(f"Document {doc_id} found in overlay index")
-                return doc
-            
-            # Check active index
-            doc = self._docs.get(doc_id)
-            if doc is not None:
-                trace.note(f"Document {doc_id} found in active index")
-                return doc
-            
-            trace.note(f"Document {doc_id} not found in any index")
-            return None
-            
-        except Exception as e:
-            trace.note(f"Failed to get document {doc_id}: {str(e)}")
-            self.logger.error(f"Failed to get document {doc_id}: {e}")
-            return None
+    def ready(self):
+        with self._lock:
+            return (
+                not self._closed
+                and bool(self._docs)
+                and self._active.ready()
+                and (self._overlay is None or self._overlay.ready())
+                and self._operations.health_check()["status"] == "healthy"
+            )
 
-    # ---- Snapshot I/O ---------------------------------------------------
-
-    def save_snapshot(self, snapshot_dir: str, as_overlay: bool = False) -> Dict:
-        os.makedirs(snapshot_dir, exist_ok=True)
-        idx = self._overlay if as_overlay else self._active
-        if idx is None:
-            raise RuntimeError("No index to save")
-        # Persist vectorizer + svd + doc ids/texts + dense vectors
-        with open(os.path.join(snapshot_dir, "vectorizer.pkl"), "wb") as f:
-            pickle.dump(idx.vectorizer, f)
-        with open(os.path.join(snapshot_dir, "svd.pkl"), "wb") as f:
-            pickle.dump(idx.svd, f)
-        data = {
-            "doc_ids": idx.doc_ids,
-            "doc_texts": idx.doc_texts,
-            "index_config": self.cfg.__dict__,
-        }
-        with open(os.path.join(snapshot_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        if idx.X_vec is not None:
-            np.save(os.path.join(snapshot_dir, "X_vec.npy"), idx.X_vec)
-        # Save FAISS if present
-        try:
-            import faiss  # type: ignore
-
-            if idx.faiss_index is not None:
-                faiss.write_index(
-                    idx.faiss_index, os.path.join(snapshot_dir, "faiss.index")
-                )
-        except Exception:
-            pass
-        # Save doc metadata
-        dmap = self._overlay_docs if as_overlay else self._docs
-        md = {
-            k: {"text": v.text, "entity_type": v.entity_type, "metadata": v.metadata}
-            for k, v in dmap.items()
-        }
-        with open(os.path.join(snapshot_dir, "docs.json"), "w", encoding="utf-8") as f:
-            json.dump(md, f, ensure_ascii=False)
-        return {"saved": True, "path": snapshot_dir}
-
-    def _load_char_index(self, snapshot_dir: str) -> CharTfidfVectorIndex:
-        # Load vectorizer + svd + docs + vectors + faiss (if available)
-        with open(os.path.join(snapshot_dir, "meta.json"), "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        cfg = VectorIndexConfig(**meta.get("index_config", {}))
-        idx = CharTfidfVectorIndex(cfg)
-        with open(os.path.join(snapshot_dir, "vectorizer.pkl"), "rb") as f:
-            idx.vectorizer = pickle.load(f)
-        with open(os.path.join(snapshot_dir, "svd.pkl"), "rb") as f:
-            idx.svd = pickle.load(f)
-        idx.doc_ids = meta.get("doc_ids", [])
-        idx.doc_texts = meta.get("doc_texts", [])
-        xvec_path = os.path.join(snapshot_dir, "X_vec.npy")
-        if os.path.exists(xvec_path):
+    def _snapshot_corpus(self, corpus):
+        if (
+            not isinstance(corpus, (list, tuple))
+            or len(corpus) > self.cfg.max_documents
+        ):
+            raise ValueError("Invalid watchlist corpus size")
+        prepared = []
+        size = 0
+        for row in corpus:
+            if not isinstance(row, (list, tuple)) or len(row) != 4:
+                raise ValueError("Expected document ID, text, entity type and metadata")
+            identity, text, entity_type, metadata = row
+            if (
+                not isinstance(entity_type, str)
+                or not entity_type.strip()
+                or len(entity_type) > self.cfg.max_text_length
+                or type(metadata) is not dict
+            ):
+                raise ValueError("Invalid watchlist document metadata")
             try:
-                idx.X_vec = np.load(xvec_path).astype("float32")
-            except Exception:
-                idx.X_vec = None
-        # Load faiss index if present
-        try:
-            import faiss  # type: ignore
+                data = canonical_bytes(metadata)
+                owned = json.loads(data)
+                size += len(canonical_bytes([identity, text, entity_type, owned]))
+            except (TypeError, ValueError, RecursionError):
+                raise ValueError(
+                    "Watchlist metadata must be finite JSON data"
+                ) from None
+            if size > self.cfg.max_corpus_bytes:
+                raise ValueError("Watchlist corpus exceeds configured byte limit")
+            prepared.append((identity, text, entity_type, owned))
+        self._active._snapshot_docs(
+            [(identity, text) for identity, text, _, _ in prepared]
+        )
+        return tuple(prepared)
 
-            fpath = os.path.join(snapshot_dir, "faiss.index")
-            if os.path.exists(fpath):
-                idx.faiss_index = faiss.read_index(fpath)
+    @staticmethod
+    def _index_id(value):
+        if value is None:
+            return str(uuid.uuid4())
+        if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+            raise ValueError("Invalid watchlist generation identifier")
+        return value
+
+    def build_from_corpus(self, corpus, index_id=None):
+        rows = self._snapshot_corpus(corpus)
+        return self._operations.run(
+            self._replace,
+            rows,
+            self._index_id(index_id),
+            False,
+            time.monotonic() + self.cfg.operation_timeout,
+        )
+
+    def set_overlay_from_corpus(self, corpus, overlay_id=None):
+        rows = self._snapshot_corpus(corpus)
+        return self._operations.run(
+            self._replace,
+            rows,
+            self._index_id(overlay_id),
+            True,
+            time.monotonic() + self.cfg.operation_timeout,
+        )
+
+    def _replace(self, rows, index_id, overlay, deadline):
+        candidate = self._new_index()
+        published = False
+        try:
+            candidate.rebuild([(identity, text) for identity, text, _, _ in rows])
+            documents = {
+                identity: WatchlistDoc(identity, text, entity_type, metadata)
+                for identity, text, entity_type, metadata in rows
+            }
+            with self._lock:
+                if self._closed or time.monotonic() >= deadline:
+                    raise InferenceUnavailableError(
+                        "Watchlist update is no longer available"
+                    )
+                if overlay:
+                    previous = self._overlay
+                    self._overlay = candidate if rows else None
+                    self._overlay_docs = documents
+                    self._overlay_id = index_id if rows else None
+                else:
+                    previous = self._active
+                    self._active, self._docs, self._active_id = (
+                        candidate,
+                        documents,
+                        index_id,
+                    )
+                published = bool(rows) or not overlay
+            if previous is not None:
+                previous.close()
+        finally:
+            if not published:
+                candidate.close()
+
+    def clear_overlay(self):
+        return self.set_overlay_from_corpus([])
+
+    def search(self, query, top_k=50, trace=None):
+        self._active._validate_query(query, top_k)
+        if len(query) > self.cfg.max_text_length:
+            raise ValueError("Watchlist query exceeds configured length")
+        if trace is not None and not isinstance(trace, SearchTrace):
+            raise TypeError("Expected SearchTrace")
+        try:
+            result, local_trace = self._operations.run(
+                self._search, query, top_k, bool(trace and trace.enabled)
+            )
         except Exception:
-            idx.faiss_index = None
-        return idx
+            if trace is not None:
+                trace.note("Watchlist search unavailable")
+            raise InferenceUnavailableError("Watchlist search unavailable") from None
+        if trace is not None and trace.enabled:
+            trace.steps.extend(local_trace.steps)
+            trace.notes.extend(local_trace.notes)
+        return result
 
-    def reload_snapshot(self, snapshot_dir: str, as_overlay: bool = False, trace: Optional[SearchTrace] = None) -> Dict:
-        """Reload snapshot from directory."""
-        # Create dummy trace if none provided
-        if trace is None:
-            trace = SearchTrace(enabled=False)
-        
-        try:
-            # Check if snapshot directory exists
-            if not os.path.exists(snapshot_dir):
-                trace.note(f"Snapshot directory not found: {snapshot_dir}")
-                return {"error": f"Snapshot directory not found: {snapshot_dir}"}
-            
-            start_time = time.perf_counter()
-            
-            # Load index
-            idx = self._load_char_index(snapshot_dir)
-            trace.note(f"Index loaded from {snapshot_dir}")
-            
-            # Load docs metadata
-            docs_path = os.path.join(snapshot_dir, "docs.json")
-            if not os.path.exists(docs_path):
-                trace.note(f"Docs metadata file not found: {docs_path}")
-                return {"error": f"Docs metadata file not found: {docs_path}"}
-            
-            with open(docs_path, "r", encoding="utf-8") as f:
-                md = json.load(f)
-            
-            load_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
-            
-            if as_overlay:
-                self._overlay = idx
-                self._overlay_docs = {
-                    k: WatchlistDoc(
-                        k, v["text"], v.get("entity_type", ""), v.get("metadata", {})
+    def _search(self, query, top_k, trace_enabled):
+        if not self.ready():
+            raise InferenceUnavailableError("Watchlist is not ready")
+        trace = SearchTrace(enabled=trace_enabled)
+        stage = (
+            ("HYBRID" if self.cfg.enable_hybrid_search else "SEMANTIC")
+            if self.cfg.use_semantic_embeddings
+            else "LEXICAL"
+        )
+        candidates, signals_by_id = {}, {}
+        overlay_hits = 0
+        for label, index, documents, index_id in (
+            ("overlay", self._overlay, self._overlay_docs, self._overlay_id),
+            ("active", self._active, self._docs, self._active_id),
+        ):
+            if index is None:
+                trace.note("No overlay index available")
+                continue
+            started = time.monotonic()
+            # An overlay replaces every old row with that ID, even when its new
+            # name does not match. Retrieve enough base candidates to fill top_k.
+            requested = min(
+                len(documents),
+                top_k + (len(self._overlay_docs) if label == "active" else 0),
+            )
+            results = index.search(query, max(1, requested))
+            hits = []
+            for identity, score in results:
+                if (
+                    identity not in documents
+                    or not isinstance(score, (int, float))
+                    or not math.isfinite(score)
+                    or not -1 <= score <= 1
+                ):
+                    raise InferenceUnavailableError(
+                        "Watchlist index and metadata disagree"
                     )
-                    for k, v in md.items()
-                }
-                self._overlay_id = snapshot_dir
-                info = {
-                    "overlay_loaded": True,
-                    "overlay_count": len(self._overlay_docs),
-                    "path": snapshot_dir,
-                    "load_time_ms": load_time,
-                }
-                trace.note(f"Overlay snapshot loaded: {len(self._overlay_docs)} documents")
-            else:
-                self._active = idx
-                self._docs = {
-                    k: WatchlistDoc(
-                        k, v["text"], v.get("entity_type", ""), v.get("metadata", {})
+                if score <= 0 or (label == "active" and identity in self._overlay_docs):
+                    continue
+                candidates[identity] = float(score)
+                signals = self._extract_signals(identity, documents[identity], query)
+                signals_by_id[identity] = signals
+                hits.append(
+                    SearchTraceHit(
+                        identity, float(score), len(hits) + 1, stage, signals
                     )
-                    for k, v in md.items()
-                }
-                self._active_id = snapshot_dir
-                info = {
-                    "active_loaded": True,
-                    "active_count": len(self._docs),
-                    "path": snapshot_dir,
-                    "load_time_ms": load_time,
-                }
-                trace.note(f"Active snapshot loaded: {len(self._docs)} documents")
-            
-            self.logger.info(f"Watchlist snapshot loaded: {info}")
-            return info
-            
-        except Exception as e:
-            error_msg = f"Failed to reload snapshot from {snapshot_dir}: {str(e)}"
-            trace.note(error_msg)
-            self.logger.error(error_msg)
-            return {"error": error_msg}
+                )
+            if label == "overlay":
+                overlay_hits = len(hits)
+            trace.add_step(
+                SearchTraceStep(
+                    stage=stage,
+                    query=query,
+                    topk=top_k,
+                    took_ms=(time.monotonic() - started) * 1000,
+                    hits=hits,
+                    meta={
+                        "overlay_id": index_id if label == "overlay" else None,
+                        "active_id": index_id if label == "active" else None,
+                        "search_type": label,
+                        "index_type": "hybrid" if stage == "HYBRID" else stage.lower(),
+                    },
+                )
+            )
+        items = sorted(candidates.items(), key=lambda row: (-row[1], row[0]))[:top_k]
+        trace.add_step(
+            SearchTraceStep(
+                "RERANK",
+                query,
+                top_k,
+                0.0,
+                [
+                    SearchTraceHit(
+                        identity, score, rank, "RERANK", signals_by_id[identity]
+                    )
+                    for rank, (identity, score) in enumerate(items, 1)
+                ],
+                {
+                    "total_candidates": len(candidates),
+                    "final_results": len(items),
+                    "merge_strategy": "overlay_replaces_base",
+                    "overlay_hits": overlay_hits,
+                },
+            )
+        )
+        trace.limit_payload_size(max_size_kb=200)
+        trace.note(
+            f"Watchlist search completed: {len(items)} results from {len(candidates)} candidates"
+        )
+        return items, trace
 
-    def status(self) -> Dict:
+    @staticmethod
+    def _literal_present(value, query):
+        if not isinstance(value, str) or not value.strip():
+            return False
+        value, query = (
+            without_format_controls(value).casefold(),
+            without_format_controls(query).casefold(),
+        )
+        return re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", query) is not None
+
+    @staticmethod
+    def _full_date(value):
+        if not isinstance(value, str):
+            return None
+        for date_format in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(value, date_format).date()
+            except ValueError:
+                pass
+        return None
+
+    def _extract_signals(self, identity, document, query):
+        # These are literal source-field occurrences, not same-person evidence.
+        dob = self._full_date(document.metadata.get("dob"))
+        dates = re.findall(
+            r"(?<!\d)(?:\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}|\d{2}/\d{2}/\d{4})(?!\d)",
+            without_format_controls(query),
+        )
         return {
-            "active": {"id": self._active_id, "count": len(self._docs)},
-            "overlay": {"id": self._overlay_id, "count": len(self._overlay_docs)},
+            "source_dob_present_in_query": dob is not None
+            and any(self._full_date(value) == dob for value in dates),
+            "document_id_present_in_query": self._literal_present(identity, query),
+            "source_text_present_in_query": self._literal_present(document.text, query),
+            "entity_type": document.entity_type,
         }
+
+    def get_doc(self, doc_id, trace=None):
+        try:
+            with self._lock:
+                if self._closed:
+                    raise InferenceUnavailableError("Watchlist is closed")
+                document = self._overlay_docs.get(doc_id) or self._docs.get(doc_id)
+                if document is None:
+                    if trace is not None:
+                        trace.note(f"Document {doc_id} not found in any index")
+                    return None
+                if trace is not None:
+                    trace.note(
+                        f'Document {doc_id} found in {"overlay" if doc_id in self._overlay_docs else "active"} index'
+                    )
+                return WatchlistDoc(
+                    document.doc_id,
+                    document.text,
+                    document.entity_type,
+                    json.loads(canonical_bytes(document.metadata)),
+                )
+        except Exception:
+            if trace is not None:
+                trace.note("Watchlist metadata unavailable")
+            raise InferenceUnavailableError("Watchlist metadata unavailable") from None
+
+    @contextmanager
+    def _commit_guard(self, deadline):
+        with self._lock:
+            if self._closed or time.monotonic() >= deadline:
+                raise InferenceUnavailableError(
+                    "Snapshot publication is no longer available"
+                )
+            yield
+
+    def _payload(self, rows, index_id):
+        return {
+            "format": FORMAT,
+            "version": VERSION,
+            "config": asdict(self.cfg),
+            "embedding_contract": self._active.embedding_contract,
+            "index_id": index_id,
+            "documents": [
+                {
+                    "doc_id": identity,
+                    "text": text,
+                    "entity_type": entity_type,
+                    "metadata": metadata,
+                }
+                for identity, text, entity_type, metadata in rows
+            ],
+        }
+
+    def save_snapshot(self, snapshot_dir, as_overlay=False):
+        if type(as_overlay) is not bool:
+            raise ValueError("as_overlay must be boolean")
+        try:
+            return self._operations.run(
+                self._save,
+                str(snapshot_dir),
+                as_overlay,
+                time.monotonic() + self.cfg.operation_timeout,
+            )
+        except InferenceUnavailableError:
+            raise
+        except Exception:
+            raise RuntimeError("Watchlist snapshot save failed") from None
+
+    def _save(self, snapshot_dir, overlay, deadline):
+        index, documents, index_id = (
+            (self._overlay, self._overlay_docs, self._overlay_id)
+            if overlay
+            else (self._active, self._docs, self._active_id)
+        )
+        if index is None or not index.ready():
+            raise InferenceUnavailableError("No ready watchlist index to save")
+        rows = [
+            (doc.doc_id, doc.text, doc.entity_type, doc.metadata)
+            for doc in documents.values()
+        ]
+        digest = write_snapshot(
+            snapshot_dir,
+            self._payload(rows, index_id),
+            self.cfg.max_corpus_bytes,
+            commit_guard=self._commit_guard(deadline),
+        )
+        return {
+            "saved": True,
+            "path": snapshot_dir,
+            "sha256": digest,
+            "format_version": VERSION,
+        }
+
+    def _read_payload(self, snapshot_dir, expected_sha256):
+        directory = Path(snapshot_dir)
+        if not (directory / FILENAME).exists() and (
+            (directory / "meta.json").exists() or (directory / "docs.json").exists()
+        ):
+            raise _LegacySnapshot(
+                "Legacy snapshot requires explicit data-only migration"
+            )
+        payload, digest = read_snapshot(
+            directory, self.cfg.max_corpus_bytes, expected_sha256
+        )
+        if (
+            type(payload["config"]) is not dict
+            or set(payload["config"]) != set(asdict(self.cfg))
+            or EnhancedVectorIndexConfig(**payload["config"]) != self.cfg
+        ):
+            raise ValueError("Snapshot and configured retrieval policies disagree")
+        if payload["embedding_contract"] != self._active.embedding_contract:
+            raise ValueError("Snapshot model contract differs from configured provider")
+        if not isinstance(payload["index_id"], str):
+            raise ValueError("Snapshot generation identifier is required")
+        self._index_id(payload["index_id"])
+        if not isinstance(payload["documents"], list):
+            raise ValueError("Snapshot documents must be a list")
+        rows = []
+        for doc in payload["documents"]:
+            if type(doc) is not dict or set(doc) != {
+                "doc_id",
+                "text",
+                "entity_type",
+                "metadata",
+            }:
+                raise ValueError("Unsupported snapshot document")
+            rows.append(
+                (doc["doc_id"], doc["text"], doc["entity_type"], doc["metadata"])
+            )
+        return self._snapshot_corpus(rows), payload["index_id"], digest
+
+    def reload_snapshot(
+        self, snapshot_dir, as_overlay=False, trace=None, *, expected_sha256=None
+    ):
+        if type(as_overlay) is not bool:
+            raise ValueError("as_overlay must be boolean")
+        try:
+            result = self._operations.run(
+                self._reload,
+                str(snapshot_dir),
+                as_overlay,
+                expected_sha256,
+                time.monotonic() + self.cfg.operation_timeout,
+            )
+        except _LegacySnapshot:
+            result = {
+                "error": "Legacy snapshots require migration from JSON source records"
+            }
+        except FileNotFoundError:
+            result = {"error": "Snapshot file not found"}
+        except Exception:
+            self.logger.error("Watchlist snapshot reload failed")
+            result = {"error": "Watchlist snapshot reload failed"}
+        if trace is not None:
+            trace.note(
+                "Watchlist snapshot reload failed"
+                if "error" in result
+                else "Watchlist snapshot loaded"
+            )
+        return result
+
+    def _reload(self, directory, overlay, expected_sha256, deadline):
+        started = time.monotonic()
+        rows, index_id, digest = self._read_payload(directory, expected_sha256)
+        if not rows:
+            raise ValueError("Cannot activate an empty snapshot")
+        self._replace(rows, index_id, overlay, deadline)
+        label = "overlay" if overlay else "active"
+        return {
+            label + "_loaded": True,
+            label + "_count": len(rows),
+            "index_id": index_id,
+            "path": directory,
+            "sha256": digest,
+            "load_time_ms": (time.monotonic() - started) * 1000,
+        }
+
+    def migrate_legacy_snapshot(self, source_dir, destination_dir):
+        """Rebuild from old JSON source rows only; never inspect pickle/NumPy/FAISS files."""
+        return self._operations.run(
+            self._migrate,
+            str(source_dir),
+            str(destination_dir),
+            time.monotonic() + self.cfg.operation_timeout,
+        )
+
+    def _migrate(self, source_dir, destination_dir, deadline):
+        source, destination = Path(source_dir), Path(destination_dir)
+        if (
+            source.resolve() == destination.resolve()
+            or (destination / FILENAME).exists()
+        ):
+            raise ValueError(
+                "Migration requires a separate unused snapshot destination"
+            )
+        meta, _ = read_json(source / "meta.json", self.cfg.max_corpus_bytes)
+        documents, _ = read_json(source / "docs.json", self.cfg.max_corpus_bytes)
+        if (
+            type(meta) is not dict
+            or type(documents) is not dict
+            or type(meta.get("index_config")) is not dict
+        ):
+            raise ValueError("Invalid legacy JSON source")
+        configured = asdict(self.cfg)
+        configured.update(meta["index_config"])
+        if EnhancedVectorIndexConfig(**configured) != self.cfg:
+            raise ValueError(
+                "Legacy index configuration differs from the selected policy"
+            )
+        identities, texts = meta.get("doc_ids"), meta.get("doc_texts")
+        if (
+            not isinstance(identities, list)
+            or not isinstance(texts, list)
+            or len(identities) != len(texts)
+            or set(identities) != set(documents)
+        ):
+            raise ValueError("Legacy index and metadata document sets disagree")
+        rows = []
+        for identity, text in zip(identities, texts):
+            document = documents[identity]
+            if type(document) is not dict or document.get("text") != text:
+                raise ValueError("Legacy source text differs between files")
+            rows.append(
+                (
+                    identity,
+                    text,
+                    document.get("entity_type"),
+                    document.get("metadata", {}),
+                )
+            )
+        rows = self._snapshot_corpus(rows)
+        if not rows:
+            raise ValueError("Cannot migrate an empty snapshot")
+        candidate = self._new_index()
+        try:
+            candidate.rebuild([(identity, text) for identity, text, _, _ in rows])
+            if self._closed or time.monotonic() >= deadline:
+                raise InferenceUnavailableError("Snapshot migration expired")
+            digest = write_snapshot(
+                destination,
+                self._payload(rows, str(uuid.uuid4())),
+                self.cfg.max_corpus_bytes,
+                commit_guard=self._commit_guard(deadline),
+            )
+        finally:
+            candidate.close()
+        return {
+            "migrated": True,
+            "documents": len(rows),
+            "path": destination_dir,
+            "sha256": digest,
+            "model_objects_deserialized": False,
+        }
+
+    def status(self):
+        with self._lock:
+            return {
+                "active": {"id": self._active_id, "count": len(self._docs)},
+                "overlay": {"id": self._overlay_id, "count": len(self._overlay_docs)},
+                "ready": self.ready(),
+                "operations": self._operations.snapshot(),
+            }
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._operations.close()
+            self._active.close()
+            if self._overlay is not None:
+                self._overlay.close()
+            if self._embedding_service is not None:
+                self._embedding_service.close()

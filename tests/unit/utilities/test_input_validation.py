@@ -6,8 +6,8 @@ Testing input sanitization and validation for sanctions screening
 import pytest
 from unittest.mock import patch
 
-from src.ai_service.utils.input_validation import InputValidator, ValidationResult
-from src.ai_service.exceptions import ValidationError
+from ai_service.utils.input_validation import InputValidator, ValidationResult
+from ai_service.exceptions import ValidationError
 
 
 class TestInputValidator:
@@ -266,7 +266,7 @@ class TestInputValidator:
     def test_input_validator_global_instance(self):
         """Test that global input_validator instance works"""
         # Arrange
-        from src.ai_service.utils.input_validation import input_validator
+        from ai_service.utils.input_validation import input_validator
 
         # Act
         result = input_validator.validate_and_sanitize("Test text")

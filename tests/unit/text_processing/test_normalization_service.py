@@ -23,8 +23,7 @@ class TestNormalizationService:
     @pytest.fixture
     def service(self):
         """Create a clean NormalizationService instance for testing"""
-        with patch('ai_service.layers.normalization.normalization_service.LanguageDetectionService') as mock_lang_service, \
-             patch('ai_service.layers.normalization.normalization_service.UnicodeService') as mock_unicode_service:
+        with patch('ai_service.layers.normalization.normalization_service.LanguageDetectionService') as mock_lang_service:
             
             # Mock the services with proper return values
             mock_lang_instance = Mock()
@@ -34,19 +33,15 @@ class TestNormalizationService:
             mock_lang_instance.detect_language_config_driven.return_value = mock_lang_result
             mock_lang_service.return_value = mock_lang_instance
             
-            mock_unicode_instance = Mock()
-            mock_unicode_instance.normalize_unicode.return_value = "test"
-            mock_unicode_service.return_value = mock_unicode_instance
             
             return NormalizationService()
 
     def test_initialization(self, service):
         """Test NormalizationService initialization"""
         assert service.language_service is not None
-        assert service.unicode_service is not None
-        assert hasattr(service, 'morph_analyzers')
-        assert hasattr(service, 'name_dictionaries')
-        assert hasattr(service, 'diminutive_maps')
+        assert service.morphology_adapter is not None
+        assert service.normalization_factory is not None
+        assert service.normalization_factory.role_classifier is not None
 
     def test_normalize_english_text(self, service):
         """Test normalization of English text"""
@@ -244,8 +239,7 @@ class TestNormalizationServiceConfiguration:
     @pytest.fixture
     def service(self):
         """Create a clean NormalizationService instance for testing"""
-        with patch('ai_service.layers.normalization.normalization_service.LanguageDetectionService') as mock_lang_service, \
-             patch('ai_service.layers.normalization.normalization_service.UnicodeService') as mock_unicode_service:
+        with patch('ai_service.layers.normalization.normalization_service.LanguageDetectionService') as mock_lang_service:
             
             # Mock the services with proper return values
             mock_lang_instance = Mock()
@@ -255,25 +249,28 @@ class TestNormalizationServiceConfiguration:
             mock_lang_instance.detect_language_config_driven.return_value = mock_lang_result
             mock_lang_service.return_value = mock_lang_instance
             
-            mock_unicode_instance = Mock()
-            mock_unicode_instance.normalize_unicode.return_value = "test"
-            mock_unicode_service.return_value = mock_unicode_instance
             
             return NormalizationService()
 
     def test_service_has_required_attributes(self, service):
         """Test that service has all required attributes"""
         required_attrs = [
+            'feature_flags',
             'language_service',
-            'unicode_service', 
-            'morph_analyzers',
-            'name_dictionaries',
-            'diminutive_maps',
-            'dim2full_maps'
+            'morphology_adapter',
+            'homoglyph_detector',
+            'normalization_factory',
         ]
         
         for attr in required_attrs:
             assert hasattr(service, attr), f"Service missing attribute: {attr}"
+
+    def test_canonical_factory_dependencies_initialization(self, service):
+        factory = service.normalization_factory
+        assert factory.tokenizer_service is not None
+        assert factory.morphology_adapter is not None
+        assert factory.role_classifier is not None
+        assert factory.ner_gateway is not None
 
     def test_service_has_required_methods(self, service):
         """Test that service has all required methods"""
@@ -289,26 +286,8 @@ class TestNormalizationServiceConfiguration:
             assert hasattr(service, method), f"Service missing method: {method}"
             assert callable(getattr(service, method)), f"Service method not callable: {method}"
 
-    def test_morph_analyzers_initialization(self, service):
-        """Test that morphological analyzers are properly initialized"""
-        assert isinstance(service.morph_analyzers, dict)
-        # Should have analyzers for supported languages
-        assert 'uk' in service.morph_analyzers or 'ru' in service.morph_analyzers
 
-    def test_name_dictionaries_initialization(self, service):
-        """Test that name dictionaries are properly initialized"""
-        assert isinstance(service.name_dictionaries, dict)
-        # Should have dictionaries for supported languages
-        assert 'en' in service.name_dictionaries
-        assert 'ru' in service.name_dictionaries
-        assert 'uk' in service.name_dictionaries
 
-    def test_diminutive_maps_initialization(self, service):
-        """Test that diminutive maps are properly initialized"""
-        assert isinstance(service.diminutive_maps, dict)
-        # Should have maps for supported languages
-        assert 'ru' in service.diminutive_maps
-        assert 'uk' in service.diminutive_maps
 
 
 class TestNormalizationResult:

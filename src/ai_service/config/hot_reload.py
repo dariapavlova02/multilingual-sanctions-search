@@ -170,15 +170,12 @@ class HotReloadableConfig:
         logger.info(f"Stopped hot-reload for configuration: {self.__class__.__name__}")
     
     def _on_config_changed(self) -> None:
-        """Called when configuration changes are detected."""
+        """Only successful reloads publish new state and advance the statistics."""
+        self._reload_configuration()
         self._last_reload = datetime.now()
         self._reload_count += 1
-        
-        logger.info(f"Configuration reloaded: {self.__class__.__name__} (count: {self._reload_count})")
-        
-        # Override this method in subclasses to handle specific reload logic
-        self._reload_configuration()
-    
+        logger.info("Configuration reloaded: %s (count: %s)", self.__class__.__name__, self._reload_count)
+
     def _reload_configuration(self) -> None:
         """
         Reload configuration from source.

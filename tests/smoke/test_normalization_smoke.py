@@ -11,10 +11,10 @@ import time
 from typing import Dict, Any, List
 from unittest.mock import patch
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationConfig
-from src.ai_service.utils.feature_flags import FeatureFlags
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.processors.normalization_factory import NormalizationConfig
+from ai_service.utils.feature_flags import FeatureFlags
+from ai_service.contracts.base_contracts import NormalizationResult
 
 
 class TestNormalizationSmoke:
@@ -29,7 +29,6 @@ class TestNormalizationSmoke:
     def base_flags(self):
         """Base feature flags for testing."""
         return FeatureFlags(
-            use_factory_normalizer=True,
             fix_initials_double_dot=False,
             preserve_hyphenated_case=False,
             strict_stopwords=False,
@@ -384,7 +383,7 @@ class TestNormalizationSmoke:
             assert result.normalized == expected, f"Expected '{expected}', got '{result.normalized}' for input '{input_text}'"
             
         # Verify trace contains titlecase information
-        # Note: titlecase is applied in _enforce_nominative_and_gender, not in factory
+        # Surname formatting is applied by the canonical normalization factory.
         # So we just verify the result is properly titlecased
         pass
 

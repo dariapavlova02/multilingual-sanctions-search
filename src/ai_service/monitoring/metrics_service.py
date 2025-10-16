@@ -178,6 +178,9 @@ class MetricsService:
         """Set a gauge metric value"""
         self._record_metric_value(name, value, labels or {})
 
+    record_counter = increment_counter
+    record_gauge = set_gauge
+
     def record_histogram(self, name: str, value: Union[int, float], labels: Optional[Dict[str, str]] = None):
         """Record a histogram metric value"""
         self._record_metric_value(name, value, labels or {})

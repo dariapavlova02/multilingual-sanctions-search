@@ -8,15 +8,15 @@ with risk fields and raw evidence.
 import pytest
 from unittest.mock import MagicMock
 
-from src.ai_service.contracts.base_contracts import (
+from ai_service.contracts.base_contracts import (
     UnifiedProcessingResult,
     SignalsPerson,
     SignalsOrganization,
     SignalsResult,
     TokenTrace,
 )
-from src.ai_service.contracts.decision_contracts import DecisionOutput, RiskLevel
-from src.ai_service.utils.response_formatter import (
+from ai_service.contracts.decision_contracts import DecisionOutput, RiskLevel
+from ai_service.utils.response_formatter import (
     format_processing_result,
     format_error_response,
     _extract_token_variants,

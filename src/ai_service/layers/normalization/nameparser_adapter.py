@@ -1,3 +1,4 @@
+from ai_service.data.resources import PACKAGE_DATA_DIR
 """
 Nameparser adapter for English name normalization.
 
@@ -36,8 +37,8 @@ class ParsedName:
     suffix: str
     nickname: str
     particles: List[str]
-    title: str
-    full_name: str
+    title: str = ""
+    full_name: str = ""
     confidence: float = 0.0
 
 
@@ -53,7 +54,7 @@ class NameparserAdapter:
         Args:
             lexicons_path: Path to lexicons directory
         """
-        self.lexicons_path = lexicons_path or Path(__file__).parent.parent.parent.parent.parent / "data" / "lexicons"
+        self.lexicons_path = lexicons_path or PACKAGE_DATA_DIR / "lexicons"
         self.nicknames: Dict[str, str] = {}
         self.surname_particles: Set[str] = set()
         self._load_lexicons()
@@ -64,8 +65,8 @@ class NameparserAdapter:
             # Load nicknames
             nicknames_path = self.lexicons_path / "en_nicknames.json"
             if nicknames_path.exists():
-                with open(nicknames_path, "r", encoding="utf-8") as f:
-                    self.nicknames = json.load(f)
+                from ...data.dicts.english_nicknames import load_english_nicknames
+                self.nicknames = load_english_nicknames(nicknames_path)
                 logger.info(f"Loaded {len(self.nicknames)} English nicknames")
             else:
                 logger.warning(f"Nicknames file not found: {nicknames_path}")

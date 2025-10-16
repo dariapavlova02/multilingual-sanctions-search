@@ -5,7 +5,7 @@ Unit tests for UnicodeService
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.unicode.unicode_service import UnicodeService
+from ai_service.layers.unicode.unicode_service import UnicodeService
 
 
 class TestUnicodeService:
@@ -224,7 +224,7 @@ class TestUnicodeService:
         # Check that service continues working even with ASCII folding error
         assert 'normalized' in result
     
-    @patch('src.ai_service.layers.unicode.unicode_service.unicodedata.normalize')
+    @patch('ai_service.layers.unicode.unicode_service.unicodedata.normalize')
     def test_unicode_normalization_failure_handling(self, mock_normalize, unicode_service):
         """Test Unicode normalization error handling"""
         # Arrange

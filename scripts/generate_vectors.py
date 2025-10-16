@@ -13,64 +13,46 @@ import sys
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    print("[WARN] sentence-transformers not available, using dummy vectors")
+from ai_service.config import EmbeddingConfig
+from ai_service.layers.embeddings.embedding_service import EmbeddingService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class VectorGenerator:
-    """Generate vectors from text patterns."""
+    """Generate vectors with the same pinned contract as runtime queries."""
 
-    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"):
-        self.model_name = model_name
-        self.model = None
-
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"Loading model: {model_name}")
-                self.model = SentenceTransformer(model_name)
-                logger.info("[OK] Model loaded successfully")
-            except Exception as e:
-                logger.warning(f"Failed to load model: {e}")
-                self.model = None
-        else:
-            logger.warning("sentence-transformers not available")
+    def __init__(self, model_name: str = None):
+        self.config = EmbeddingConfig()
+        if model_name is not None and model_name != self.config.model_name:
+            raise ValueError("Configure EMBEDDING_MODEL and its revision before selecting another model")
+        self.model_name = self.config.model_name
+        self.service = EmbeddingService(self.config)
 
     def generate_vector(self, text: str) -> List[float]:
-        """Generate vector for a single text."""
-        if self.model:
-            try:
-                embedding = self.model.encode([text])
-                return embedding[0].tolist()
-            except Exception as e:
-                logger.error(f"Failed to generate vector for '{text}': {e}")
-                return [0.0] * 384  # Fallback dummy vector
+        vector = self.service.encode_one(text)
+        self._validate(vector)
+        return vector
 
-        # Dummy vector for testing
-        return [0.1] * 384
+    def _validate(self, vector):
+        import math
+        if len(vector) != self.config.dimension or not all(math.isfinite(v) for v in vector) or not any(vector):
+            raise ValueError("Invalid vector generated; refusing to write an incompatible index")
 
     def generate_vectors_batch(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
-        """Generate vectors for multiple texts in batches (faster)."""
-        if not self.model:
-            return [[0.1] * 384 for _ in texts]
-
-        try:
-            embeddings = self.model.encode(texts, batch_size=batch_size, show_progress_bar=True)
-            return [emb.tolist() for emb in embeddings]
-        except Exception as e:
-            logger.error(f"Failed to generate batch vectors: {e}")
-            return [[0.0] * 384 for _ in texts]
+        vectors = self.service.encode_batch(texts, batch_size=batch_size)
+        if len(vectors) != len(texts):
+            raise ValueError("Embedding generation did not preserve the input rows")
+        for vector in vectors:
+            self._validate(vector)
+        return vectors
 
     def generate_vectors_from_patterns(self, patterns_file: Path, output_file: Path,
-                                     max_patterns: int = 10000, sample_tiers: List[int] = None) -> int:
+                                     max_patterns: int = None, sample_tiers: List[int] = None) -> int:
         """Generate vectors from AC patterns file (new format with metadata)."""
         if sample_tiers is None:
-            sample_tiers = [0, 1, 2]  # Tier 0, 1, 2 only (skip tier 3 for vectors)
+            sample_tiers = [0, 1, 2, 3, 4]
 
         logger.info(f"Generating vectors from {patterns_file}")
 
@@ -87,7 +69,7 @@ class VectorGenerator:
         tier_counts = {tier: 0 for tier in sample_tiers}
 
         for pattern_data in patterns_list:
-            if len(patterns_to_process) >= max_patterns:
+            if max_patterns is not None and len(patterns_to_process) >= max_patterns:
                 break
 
             tier = pattern_data.get('tier')
@@ -95,12 +77,14 @@ class VectorGenerator:
                 continue
 
             pattern = pattern_data.get('pattern', '')
-            if not pattern or len(pattern) < 2:
-                continue
+            if not pattern:
+                raise ValueError("Pattern export contains an empty name")
 
             patterns_to_process.append({
                 'text': pattern,
                 'metadata': {
+                    **(pattern_data.get('metadata') or {}),
+                    "source": pattern_data.get("source_list") or (pattern_data.get("metadata") or {}).get("source", "api_upload"),
                     "tier": tier,
                     "pattern_type": pattern_data.get('type', 'unknown'),
                     "entity_id": pattern_data.get('entity_id', ''),
@@ -126,7 +110,8 @@ class VectorGenerator:
             vector_entry = {
                 "name": pattern_info['text'],
                 "vector": embedding,
-                "metadata": pattern_info['metadata']
+                "metadata": pattern_info['metadata'],
+                "embedding_contract": self.service.embedding_contract,
             }
             vectors.append(vector_entry)
 
@@ -210,9 +195,9 @@ async def main():
     parser = argparse.ArgumentParser(description="Generate vectors from AC patterns")
     parser.add_argument("--input", type=Path, help="Input AC patterns file")
     parser.add_argument("--output", type=Path, help="Output vectors file")
-    parser.add_argument("--max-patterns", type=int, default=10000, help="Maximum patterns to process")
+    parser.add_argument("--max-patterns", type=int, default=None, help="Explicitly limit rows (default: complete export)")
     parser.add_argument("--sample", action="store_true", help="Generate sample vectors instead")
-    parser.add_argument("--model", default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    parser.add_argument("--model", default=None,
                        help="Model name for embeddings")
 
     args = parser.parse_args()
@@ -223,7 +208,7 @@ async def main():
         # Generate sample vectors
         output_file = args.output or Path("data/templates/sample_vectors.json")
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        count = generator.generate_sample_vectors(output_file, args.max_patterns)
+        count = generator.generate_sample_vectors(output_file, args.max_patterns or 1000)
         print(f"[OK] Generated {count} sample vectors in {output_file}")
 
     elif args.input and args.output:
@@ -233,29 +218,8 @@ async def main():
         print(f"[OK] Generated {count} vectors from {args.input} → {args.output}")
 
     else:
-        # Generate vectors for all available pattern files
-        data_dir = Path("data/templates")
+        parser.error("Supply both --input and --output, or explicitly select --sample")
 
-        pattern_files = [
-            ("person_ac_export.json", "person_vectors.json"),
-            ("company_ac_export.json", "company_vectors.json"),
-            ("terrorism_ac_export.json", "terrorism_vectors.json")
-        ]
-
-        for input_filename, output_filename in pattern_files:
-            input_file = data_dir / input_filename
-            output_file = data_dir / output_filename
-
-            if input_file.exists():
-                count = generator.generate_vectors_from_patterns(input_file, output_file, args.max_patterns)
-                print(f"[OK] Generated {count} vectors: {input_filename} → {output_filename}")
-            else:
-                print(f"[WARN] Input file not found: {input_file}")
-
-        # Also generate sample vectors
-        sample_output = data_dir / "sample_vectors.json"
-        count = generator.generate_sample_vectors(sample_output, 1000)
-        print(f"[OK] Generated {count} sample vectors in {sample_output}")
 
 if __name__ == "__main__":
     asyncio.run(main())

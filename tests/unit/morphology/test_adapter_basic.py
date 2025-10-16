@@ -9,7 +9,7 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 from typing import List, Tuple
 
-from src.ai_service.layers.normalization.morphology_adapter import (
+from ai_service.layers.normalization.morphology_adapter import (
     MorphologyAdapter,
     MorphParse,
     get_global_adapter,

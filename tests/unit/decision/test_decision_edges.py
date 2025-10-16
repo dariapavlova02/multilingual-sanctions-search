@@ -8,8 +8,8 @@ to ensure the decision engine works reliably even with incomplete data.
 import pytest
 from unittest.mock import Mock
 
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.decision_contracts import (
     DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo, RiskLevel
 )
 

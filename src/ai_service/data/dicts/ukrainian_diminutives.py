@@ -1,3 +1,4 @@
+from ai_service.data.resources import PACKAGE_DATA_DIR
 """
 Ukrainian diminutives dictionary
 Loads data from JSON file to maintain compatibility
@@ -7,7 +8,7 @@ import json
 from pathlib import Path
 
 # Load Ukrainian diminutives from JSON file
-_data_dir = Path(__file__).parent.parent.parent.parent.parent / "data"
+_data_dir = PACKAGE_DATA_DIR
 _diminutives_file = _data_dir / "diminutives_uk.json"
 
 try:

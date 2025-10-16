@@ -10,10 +10,10 @@ import pytest
 import time
 from unittest.mock import Mock, patch
 
-from src.ai_service.utils.lru_cache_ttl import LruTtlCache, CacheManager, create_cache_key, create_flags_hash
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService
-from src.ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
-from src.ai_service.monitoring.cache_metrics import CacheMetrics, MetricsCollector
+from ai_service.utils.lru_cache_ttl import LruTtlCache, CacheManager, create_cache_key, create_flags_hash
+from ai_service.layers.normalization.tokenizer_service import TokenizerService
+from ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
+from ai_service.monitoring.cache_metrics import CacheMetrics, MetricsCollector
 
 
 class TestLruTtlCache:

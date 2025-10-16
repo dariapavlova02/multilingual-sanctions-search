@@ -1,635 +1,261 @@
-"""
-Optimized Embedding Service with performance enhancements
-"""
-
-import asyncio
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor
+"""Cached legacy API over the canonical embedding loader and bounded worker."""
+from collections import OrderedDict
 from datetime import datetime
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Union, Tuple
 import threading
-from collections import deque
+import time
+from typing import Optional
 
 import numpy as np
-
 try:
     import faiss
 except ImportError:
     faiss = None
 
-from ...utils.logging_config import get_logger
+from ...config import EmbeddingConfig
 from .embedding_service import EmbeddingService
-from .models.embedding_model_manager import EmbeddingModelManager
-from .models.model_config import ModelConfig, get_model_config
 
 
 class OptimizedEmbeddingService(EmbeddingService):
-    """Optimized embedding service with performance enhancements"""
-
-    def __init__(
-        self,
-        default_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        max_cache_size: int = 1000,
-        enable_batch_optimization: bool = True,
-        enable_gpu: bool = True,
-        thread_pool_size: int = 4,
-        precompute_common_patterns: bool = True,
-    ):
-        """
-        Initialize optimized embedding service
-
-        Args:
-            default_model: Default model
-            max_cache_size: Maximum cache size for embeddings
-            enable_batch_optimization: Enable automatic batch optimization
-            enable_gpu: Enable GPU acceleration if available
-            thread_pool_size: Size of thread pool for parallel processing
-            precompute_common_patterns: Precompute embeddings for common patterns
-        """
-        # Create a mock config object for the parent class
-        from types import SimpleNamespace
-        config = SimpleNamespace(model_name=default_model)
+    def __init__(self, default_model=None, max_cache_size=1000,
+                 enable_batch_optimization=True, enable_gpu=True, thread_pool_size=None,
+                 precompute_common_patterns=True, *, config: Optional[EmbeddingConfig] = None):
+        if type(max_cache_size) is not int or max_cache_size < 0:
+            raise ValueError("Cache capacity must be a nonnegative integer")
+        if thread_pool_size is not None:
+            raise ValueError("thread_pool_size is no longer supported; configure max_pending_calls on EmbeddingConfig")
+        self.enable_gpu = enable_gpu
+        auto_gpu = self._check_gpu_availability()
+        if config is None:
+            values = {"device": "cuda" if auto_gpu else "cpu"}
+            if default_model is not None:
+                values["model_name"] = default_model
+            config = EmbeddingConfig(**values)
+        elif default_model is not None and default_model != config.model_name:
+            raise ValueError("default_model and explicit model contract disagree")
         super().__init__(config)
-        
-        # Store the default model name
-        self.default_model = default_model
-        
-        # Initialize model manager
-        self.model_manager = EmbeddingModelManager(
-            max_models=3,
-            enable_gpu=enable_gpu,
-            thread_pool_size=thread_pool_size
-        )
-
-        # Initialize model cache
-        self.model_cache = {}
-
         self.max_cache_size = max_cache_size
         self.enable_batch_optimization = enable_batch_optimization
-        self.enable_gpu = enable_gpu
-        self.thread_pool_size = thread_pool_size
         self.precompute_common_patterns = precompute_common_patterns
-
-        # Performance optimization features
-        self.embedding_cache: Dict[str, Tuple[List[float], float]] = {}  # text -> (embedding, timestamp)
+        self.gpu_available = self.config.device != "cpu"
+        self.embedding_cache = OrderedDict()
         self.cache_lock = threading.RLock()
-
-        # Batch processing queue
-        self.batch_queue = deque()
-        self.batch_lock = threading.Lock()
-
-        # Thread pool for parallel processing
-        self.thread_pool = ThreadPoolExecutor(max_workers=thread_pool_size)
-
-        # Performance metrics
-        self.performance_metrics = {
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "batch_optimizations": 0,
-            "total_embeddings_generated": 0,
-            "total_processing_time": 0.0,
-            "gpu_accelerated": 0,
-        }
-
-        # GPU acceleration setup
-        self.gpu_available = self._check_gpu_availability()
-
-        # Precompute common patterns
+        self.performance_metrics = {"cache_hits": 0, "cache_misses": 0,
+            "batch_optimizations": 0, "total_embeddings_generated": 0,
+            "total_processing_time": 0.0, "gpu_accelerated": 0}
         if precompute_common_patterns:
             self._precompute_common_patterns()
 
-        self.logger.info(
-            f"OptimizedEmbeddingService initialized (GPU: {self.gpu_available}, "
-            f"Cache: {max_cache_size}, Threads: {thread_pool_size})"
-        )
-
-    def _check_gpu_availability(self) -> bool:
-        """Check if GPU acceleration is available"""
-        try:
-            if not self.enable_gpu:
-                return False
-
-            # Lazy import of torch for GPU checking
-            import torch
-            return torch.cuda.is_available()
-        except ImportError:
+    def _check_gpu_availability(self):
+        if not self.enable_gpu:
             return False
+        import torch
+        return torch.cuda.is_available()
 
     def _precompute_common_patterns(self):
-        """Precompute embeddings for common patterns"""
-        common_patterns = [
-            "payment", "платіж", "платеж",
-            "company", "компанія", "компания",
-            "person", "персона", "особа",
-            "contract", "договір", "договор",
-            "invoice", "рахунок", "счет",
-            "transfer", "переказ", "перевод",
-        ]
+        # Retain the existing optional warmup vocabulary; use the same preprocessor
+        # as real input and exclude terms that have no embeddable content.
+        patterns = ["payment", "платіж", "платеж", "company", "компанія", "компания",
+                    "person", "персона", "особа", "contract", "договір", "договор",
+                    "invoice", "рахунок", "счет", "transfer", "переказ", "перевод"]
+        patterns = [text for text in patterns if self.preprocessor.normalize_for_embedding(text)]
+        self.warm_up_cache(patterns)
 
-        try:
-            self.logger.info("Precomputing embeddings for common patterns...")
-            start_time = time.time()
+    def _get_cache_key(self, text, model_name, normalize=True):
+        config = self._selected_model_config(model_name)
+        return (config.model_name, config.revision, config.dimension,
+                config.preprocessing_version, normalize, text)
 
-            # Generate embeddings for common patterns
-            result = self.get_embeddings(common_patterns)
-            if result["success"]:
-                # Cache the embeddings
-                embeddings = result["embeddings"]
-                timestamp = time.time()
-
-                with self.cache_lock:
-                    for i, pattern in enumerate(common_patterns):
-                        cache_key = self._get_cache_key(pattern, self.default_model)
-                        self.embedding_cache[cache_key] = (embeddings[i], timestamp)
-
-                precompute_time = time.time() - start_time
-                self.logger.info(f"Precomputed {len(common_patterns)} patterns in {precompute_time:.3f}s")
-
-        except Exception as e:
-            self.logger.warning(f"Failed to precompute common patterns: {e}")
-
-    def _get_cache_key(self, text: str, model_name: str) -> str:
-        """Generate cache key for text and model"""
-        return f"{model_name}:{hash(text)}"
-
-    def _get_cached_embedding(self, text: str, model_name: str) -> Optional[List[float]]:
-        """Get cached embedding if available and not expired"""
-        cache_key = self._get_cache_key(text, model_name)
-
+    def _get_cached_embedding(self, text, model_name, normalize=True):
+        key = self._get_cache_key(text, model_name, normalize)
         with self.cache_lock:
-            if cache_key in self.embedding_cache:
-                embedding, timestamp = self.embedding_cache[cache_key]
-
-                # Check if cache entry is not too old (1 hour expiry)
-                if time.time() - timestamp < 3600:
-                    self.performance_metrics["cache_hits"] += 1
-                    return embedding
-                else:
-                    # Remove expired entry
-                    del self.embedding_cache[cache_key]
-
-        self.performance_metrics["cache_misses"] += 1
+            saved = self.embedding_cache.pop(key, None)
+            if saved is not None and time.monotonic() - saved[1] < 3600:
+                self.embedding_cache[key] = saved
+                self.performance_metrics["cache_hits"] += 1
+                return list(saved[0])
+            self.performance_metrics["cache_misses"] += 1
         return None
 
-    def _cache_embedding(self, text: str, model_name: str, embedding: List[float]):
-        """Cache embedding with LRU eviction"""
-        cache_key = self._get_cache_key(text, model_name)
-        timestamp = time.time()
-
+    def _cache_embedding(self, text, model_name, embedding, normalize=True):
+        key = self._get_cache_key(text, model_name, normalize)
         with self.cache_lock:
-            # LRU eviction if cache is full
-            if len(self.embedding_cache) >= self.max_cache_size:
-                # Remove oldest entry
-                oldest_key = min(
-                    self.embedding_cache.keys(),
-                    key=lambda k: self.embedding_cache[k][1]
-                )
-                del self.embedding_cache[oldest_key]
+            if not self.max_cache_size or self._inference.snapshot()["closed"]:
+                return
+            self.embedding_cache.pop(key, None)
+            self.embedding_cache[key] = (tuple(embedding), time.monotonic())
+            while len(self.embedding_cache) > self.max_cache_size:
+                self.embedding_cache.popitem(last=False)
 
-            self.embedding_cache[cache_key] = (embedding, timestamp)
+    def _load_model_optimized(self, model_name=None):
+        return super()._load_model(model_name)
 
-    def _load_model_optimized(self, model_name: str):
-        """Load model with GPU acceleration if available"""
-        try:
-            # Use model manager for optimized loading
-            model_config = get_model_config(model_name)
-            model_config.enable_gpu = self.enable_gpu
-            model_config.use_fp16 = self.enable_gpu
-            
-            model = self.model_manager.get_model(model_name, model_config)
-            
-            # Cache in local cache for backward compatibility
-            self.model_cache[model_name] = model
-            
-            return model
-
-        except Exception as e:
-            self.logger.error(f"Failed to load optimized model {model_name}: {e}")
-            # Fallback to parent implementation
-            return super()._load_model(model_name)
-
-    def get_embeddings_optimized(
-        self,
-        texts: Union[str, List[str]],
-        model_name: Optional[str] = None,
-        normalize: bool = True,
-        batch_size: int = 32,
-        use_cache: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Optimized embedding generation with caching and performance enhancements
-
-        Args:
-            texts: Text or list of texts
-            model_name: Model name
-            normalize: Normalize embeddings (L2)
-            batch_size: Batch size
-            use_cache: Use embedding cache
-
-        Returns:
-            Dict with embeddings and metadata
-        """
-        start_time = time.time()
-
-        # Normalize input
-        if isinstance(texts, str):
-            texts = [texts]
-
-        if not texts:
-            return self._create_empty_result()
-
-        if model_name is None:
-            model_name = self.default_model
-
-        try:
-            cached_embeddings = []
-            texts_to_compute = []
-            cache_indices = []
-
-            # Check cache if enabled
-            if use_cache:
-                for i, text in enumerate(texts):
-                    cached = self._get_cached_embedding(text, model_name)
-                    if cached is not None:
-                        cached_embeddings.append((i, cached))
-                    else:
-                        texts_to_compute.append(text)
-                        cache_indices.append(i)
-            else:
-                texts_to_compute = texts
-                cache_indices = list(range(len(texts)))
-
-            # Generate embeddings for uncached texts
-            new_embeddings = []
-            if texts_to_compute:
-                # Use optimized model loading
-                model = self._load_model_optimized(model_name)
-
-                # Optimize batch size based on GPU memory
-                if self.gpu_available and len(texts_to_compute) > batch_size * 2:
-                    optimized_batch_size = min(batch_size * 2, 64)
-                    self.performance_metrics["batch_optimizations"] += 1
-                else:
-                    optimized_batch_size = batch_size
-
-                # Generate embeddings
-                embeddings = model.encode(
-                    texts_to_compute,
-                    batch_size=optimized_batch_size,
-                    show_progress_bar=False,
-                    normalize_embeddings=normalize,
-                    convert_to_numpy=True,
-                )
-
-                # Convert to list and cache
-                if isinstance(embeddings, np.ndarray):
-                    new_embeddings = embeddings.tolist()
-                else:
-                    new_embeddings = embeddings
-
-                # Cache new embeddings
-                if use_cache:
-                    for text, embedding in zip(texts_to_compute, new_embeddings):
-                        self._cache_embedding(text, model_name, embedding)
-
-                # Track GPU usage
-                if self.gpu_available:
-                    self.performance_metrics["gpu_accelerated"] += len(texts_to_compute)
-
-            # Combine cached and new embeddings
-            final_embeddings = [None] * len(texts)
-
-            # Insert cached embeddings
-            for i, embedding in cached_embeddings:
-                final_embeddings[i] = embedding
-
-            # Insert new embeddings
-            for i, embedding in zip(cache_indices, new_embeddings):
-                final_embeddings[i] = embedding
-
-            # Update metrics
-            processing_time = time.time() - start_time
-            self.performance_metrics["total_embeddings_generated"] += len(texts)
-            self.performance_metrics["total_processing_time"] += processing_time
-
-            result = {
-                "success": True,
-                "embeddings": final_embeddings,
-                "model_name": model_name,
-                "text_count": len(texts),
-                "embedding_dimension": len(final_embeddings[0]) if final_embeddings else 0,
-                "processing_time": processing_time,
-                "normalized": normalize,
-                "batch_size": optimized_batch_size if texts_to_compute else batch_size,
-                "timestamp": datetime.now().isoformat(),
-                "cache_hits": len(cached_embeddings),
-                "cache_misses": len(texts_to_compute),
-                "gpu_accelerated": self.gpu_available and bool(texts_to_compute),
-            }
-
-            self.logger.info(
-                f"Generated embeddings for {len(texts)} texts "
-                f"(cached: {len(cached_embeddings)}, computed: {len(texts_to_compute)}) "
-                f"in {processing_time:.3f}s"
-            )
-
-            return result
-
-        except Exception as e:
-            self.logger.error(f"Failed to generate optimized embeddings: {e}")
-            return self._create_error_result(str(e))
-
-    def find_similar_texts_optimized(
-        self,
-        query: str,
-        candidates: List[str],
-        model_name: Optional[str] = None,
-        threshold: float = 0.7,
-        top_k: int = 10,
-        metric: str = "cosine",
-        use_faiss: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Optimized similarity search with FAISS acceleration if available
-
-        Args:
-            query: Search query
-            candidates: List of candidates
-            model_name: Model name
-            threshold: Similarity threshold
-            top_k: Number of best results
-            metric: Similarity metric
-            use_faiss: Use FAISS for acceleration
-
-        Returns:
-            Dict with search results
-        """
-        try:
-            start_time = time.time()
-
-            # Get embeddings for all texts using optimized method
-            all_texts = [query] + candidates
-            embeddings_result = self.get_embeddings_optimized(all_texts, model_name)
-
-            if not embeddings_result["success"]:
-                return self._create_error_result("Failed to generate embeddings")
-
-            embeddings = embeddings_result["embeddings"]
-            query_embedding = embeddings[0]
-            candidate_embeddings = embeddings[1:]
-
-            # Use FAISS for large candidate sets if available
-            if use_faiss and len(candidates) > 100:
-                try:
-                    similarities = self._faiss_similarity_search(
-                        query_embedding, candidate_embeddings, candidates, top_k, threshold
-                    )
-                except Exception as e:
-                    self.logger.warning(f"FAISS search failed, falling back to numpy: {e}")
-                    similarities = self._numpy_similarity_search(
-                        query_embedding, candidate_embeddings, candidates, top_k, threshold, metric
-                    )
-            else:
-                similarities = self._numpy_similarity_search(
-                    query_embedding, candidate_embeddings, candidates, top_k, threshold, metric
-                )
-
-            processing_time = time.time() - start_time
-
-            result = {
-                "success": True,
-                "query": query,
-                "total_candidates": len(candidates),
-                "threshold": threshold,
-                "top_k": top_k,
-                "metric": metric,
-                "results": similarities,
-                "model_name": embeddings_result["model_name"],
-                "processing_time": processing_time,
-                "optimized": True,
-                "faiss_accelerated": use_faiss and len(candidates) > 100,
-                "timestamp": datetime.now().isoformat(),
-            }
-
-            self.logger.info(
-                f"Found {len(similarities)} similar texts for query "
-                f"from {len(candidates)} candidates in {processing_time:.3f}s"
-            )
-
-            return result
-
-        except Exception as e:
-            self.logger.error(f"Failed optimized similarity search: {e}")
-            return self._create_error_result(str(e))
-
-    def _faiss_similarity_search(
-        self,
-        query_embedding: List[float],
-        candidate_embeddings: List[List[float]],
-        candidates: List[str],
-        top_k: int,
-        threshold: float,
-    ) -> List[Dict[str, Any]]:
-        """Use FAISS for accelerated similarity search"""
-        try:
-            import faiss
-
-            # Convert to numpy arrays
-            query_vec = np.array([query_embedding], dtype=np.float32)
-            candidate_matrix = np.array(candidate_embeddings, dtype=np.float32)
-
-            # Normalize vectors for cosine similarity
-            faiss.normalize_L2(query_vec)
-            faiss.normalize_L2(candidate_matrix)
-
-            # Build FAISS index
-            dimension = candidate_matrix.shape[1]
-            index = faiss.IndexFlatIP(dimension)  # Inner product for normalized vectors
-            index.add(candidate_matrix)
-
-            # Search
-            scores, indices = index.search(query_vec, min(top_k * 2, len(candidates)))
-
-            # Filter by threshold and format results
-            results = []
-            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-                if score >= threshold and idx >= 0:
-                    results.append({
-                        "text": candidates[idx],
-                        "similarity_score": float(score),
-                        "rank": len(results) + 1,
-                    })
-
-                    if len(results) >= top_k:
-                        break
-
-            return results
-
-        except ImportError:
-            raise Exception("FAISS not available")
-
-    def _numpy_similarity_search(
-        self,
-        query_embedding: List[float],
-        candidate_embeddings: List[List[float]],
-        candidates: List[str],
-        top_k: int,
-        threshold: float,
-        metric: str,
-    ) -> List[Dict[str, Any]]:
-        """Use numpy for similarity search"""
-        query_vec = np.array(query_embedding)
-        candidate_matrix = np.array(candidate_embeddings)
-
-        if metric == "cosine":
-            # Normalize for cosine similarity
-            query_norm = query_vec / np.linalg.norm(query_vec)
-            candidate_norms = candidate_matrix / np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
-
-            # Calculate similarities
-            similarities = np.dot(candidate_norms, query_norm)
-        else:
-            # Use original method for other metrics
-            similarities = []
-            for candidate_emb in candidate_embeddings:
-                sim = self._calculate_embedding_similarity(query_embedding, candidate_emb, metric)
-                similarities.append(sim)
-            similarities = np.array(similarities)
-
-        # Filter and sort
-        valid_indices = np.where(similarities >= threshold)[0]
-        valid_similarities = similarities[valid_indices]
-
-        # Sort by similarity (descending)
-        sorted_indices = np.argsort(-valid_similarities)[:top_k]
-
-        results = []
-        for i, sort_idx in enumerate(sorted_indices):
-            orig_idx = valid_indices[sort_idx]
-            results.append({
-                "text": candidates[orig_idx],
-                "similarity_score": float(valid_similarities[sort_idx]),
-                "rank": i + 1,
-            })
-
-        return results
-
-    def get_performance_metrics(self) -> Dict[str, Any]:
-        """Get performance metrics"""
-        with self.cache_lock:
-            cache_hit_rate = (
-                self.performance_metrics["cache_hits"] /
-                (self.performance_metrics["cache_hits"] + self.performance_metrics["cache_misses"])
-                if (self.performance_metrics["cache_hits"] + self.performance_metrics["cache_misses"]) > 0
-                else 0.0
-            )
-
-            avg_processing_time = (
-                self.performance_metrics["total_processing_time"] /
-                self.performance_metrics["total_embeddings_generated"]
-                if self.performance_metrics["total_embeddings_generated"] > 0
-                else 0.0
-            )
-
-            return {
-                "cache_hit_rate": cache_hit_rate,
-                "cache_size": len(self.embedding_cache),
-                "max_cache_size": self.max_cache_size,
-                "gpu_available": self.gpu_available,
-                "gpu_accelerated_embeddings": self.performance_metrics["gpu_accelerated"],
-                "batch_optimizations": self.performance_metrics["batch_optimizations"],
-                "total_embeddings_generated": self.performance_metrics["total_embeddings_generated"],
-                "average_processing_time": avg_processing_time,
-                "total_processing_time": self.performance_metrics["total_processing_time"],
-            }
-
-    def clear_cache(self):
-        """Clear embedding cache"""
-        with self.cache_lock:
-            self.embedding_cache.clear()
-            self.logger.info("Embedding cache cleared")
-
-    def warm_up_cache(self, texts: List[str], model_name: Optional[str] = None):
-        """Warm up cache with common texts"""
-        self.logger.info(f"Warming up cache with {len(texts)} texts")
-        self.get_embeddings_optimized(texts, model_name, use_cache=True)
-
-    # Override parent methods to use optimized versions
-    def get_embeddings(
-        self,
-        texts: Union[str, List[str]],
-        model_name: Optional[str] = None,
-        normalize: bool = True,
-        batch_size: int = 32,
-    ) -> Dict[str, Any]:
-        """Override to use optimized version"""
-        return self.get_embeddings_optimized(texts, model_name, normalize, batch_size)
-
-    def find_similar_texts(
-        self,
-        query: str,
-        candidates: List[str],
-        model_name: Optional[str] = None,
-        threshold: float = 0.7,
-        top_k: int = 10,
-        metric: str = "cosine",
-    ) -> Dict[str, Any]:
-        """Override to use optimized version"""
-        return self.find_similar_texts_optimized(
-            query, candidates, model_name, threshold, top_k, metric
-        )
-
-    def _load_model(self, model_name: str):
-        """Override to use optimized loading"""
+    def _load_model(self, model_name=None):
         return self._load_model_optimized(model_name)
 
-    # Enhanced async methods
-    async def get_embeddings_async_optimized(
-        self,
-        texts: Union[str, List[str]],
-        model_name: Optional[str] = None,
-        normalize: bool = True,
-        batch_size: int = 32,
-    ) -> Dict[str, Any]:
-        """Optimized async embedding generation"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self.get_embeddings_optimized,
-            texts, model_name, normalize, batch_size
-        )
+    @staticmethod
+    def _snapshot_texts(texts):
+        return list(texts) if isinstance(texts, (list, tuple)) else texts
 
-    async def find_similar_texts_async_optimized(
-        self,
-        query: str,
-        candidates: List[str],
-        model_name: Optional[str] = None,
-        threshold: float = 0.7,
-        top_k: int = 10,
-        metric: str = "cosine",
-    ) -> Dict[str, Any]:
-        """Optimized async similarity search"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self.find_similar_texts_optimized,
-            query, candidates, model_name, threshold, top_k, metric
-        )
+    def get_embeddings_optimized(self, texts, model_name=None, normalize=True,
+                                 batch_size=32, use_cache=True):
+        return self._inference.run(self._get_embeddings, self._snapshot_texts(texts),
+                                   model_name, normalize, batch_size, use_cache)
 
-    def _create_error_result(self, error_message: str) -> dict:
-        """Create error result dictionary"""
-        return {
-            "embeddings": [],
-            "error": error_message,
-            "success": False
-        }
-
-    def __del__(self):
-        """Cleanup resources"""
+    def _get_embeddings(self, texts, model_name=None, normalize=True, batch_size=32, use_cache=True):
+        started = time.monotonic()
         try:
-            if hasattr(self, 'thread_pool'):
-                self.thread_pool.shutdown(wait=False)
+            config = self._selected_model_config(model_name)
+            if type(normalize) is not bool or type(batch_size) is not int or batch_size < 1:
+                raise ValueError("Invalid encoding options")
+            if isinstance(texts, str):
+                texts = [texts]
+            if not isinstance(texts, list) or any(not isinstance(text, str) for text in texts):
+                raise ValueError("Expected a string or list of strings")
+            if any(not self._get_cached_preprocessing(text) for text in texts):
+                raise ValueError("Every requested row must have embeddable text")
+            vectors = [None] * len(texts)
+            missing = []
+            for index, text in enumerate(texts):
+                cached = self._get_cached_embedding(text, config.model_name, normalize) if use_cache else None
+                if cached is None:
+                    missing.append(index)
+                else:
+                    vectors[index] = cached
+            effective_batch_size = batch_size
+            if missing:
+                if self.enable_batch_optimization and self.gpu_available and len(missing) > batch_size * 2:
+                    effective_batch_size = min(batch_size * 2, 64)
+                    with self.cache_lock:
+                        self.performance_metrics["batch_optimizations"] += 1
+                # _encode is the common synchronous worker implementation. Calling
+                # it directly here avoids nesting a second queue behind this job.
+                computed = self._encode([texts[i] for i in missing], batch_size=effective_batch_size,
+                    model_name=config.model_name, normalize_embeddings=normalize)
+                array = np.asarray(computed, dtype=np.float32)
+                if (array.shape != (len(missing), config.dimension) or not np.isfinite(array).all()
+                        or not np.any(array != 0, axis=1).all()):
+                    raise ValueError("Model output does not preserve the row/vector contract")
+                computed = array.tolist()
+                for index, vector in zip(missing, computed):
+                    vectors[index] = vector
+                    if use_cache:
+                        self._cache_embedding(texts[index], config.model_name, vector, normalize)
+            elapsed = time.monotonic() - started
+            with self.cache_lock:
+                self.performance_metrics["total_embeddings_generated"] += len(missing)
+                self.performance_metrics["total_processing_time"] += elapsed
+                if self.gpu_available:
+                    self.performance_metrics["gpu_accelerated"] += len(missing)
+            return {"success": True, "embeddings": vectors, "model_name": config.model_name,
+                "embedding_contract": config.embedding_contract(), "text_count": len(texts),
+                "embedding_dimension": config.dimension, "processing_time": elapsed,
+                "normalized": normalize, "batch_size": effective_batch_size,
+                "timestamp": datetime.now().isoformat(), "cache_hits": len(texts)-len(missing),
+                "cache_misses": len(missing), "gpu_accelerated": self.gpu_available and bool(missing)}
         except Exception:
-            pass
+            self.logger.error("Legacy embedding generation failed")
+            return self._create_error_result("Embedding generation is unavailable")
+
+    async def get_embeddings_async_optimized(self, texts, model_name=None, normalize=True, batch_size=32):
+        return await self._inference.run_async(self._get_embeddings, self._snapshot_texts(texts),
+                                             model_name, normalize, batch_size, True)
+
+    def get_embeddings(self, texts, model_name=None, normalize=True, batch_size=32):
+        return self.get_embeddings_optimized(texts, model_name, normalize, batch_size)
+
+    def find_similar_texts_optimized(self, query, candidates, model_name=None,
+                                    threshold=0.7, top_k=10, metric="cosine", use_faiss=True):
+        return self._inference.run(self._find_similar, query, self._snapshot_texts(candidates),
+                                   model_name, threshold, top_k, metric, use_faiss)
+
+    def _find_similar(self, query, candidates, model_name, threshold, top_k, metric, use_faiss):
+        started = time.monotonic()
+        try:
+            if (not isinstance(candidates, list) or type(top_k) is not int or top_k < 1
+                    or metric not in {"cosine", "dot", "euclidean"} or not np.isfinite(threshold)):
+                raise ValueError("Invalid similarity options")
+            encoded = self._get_embeddings([query] + candidates, model_name)
+            if not encoded["success"]:
+                return self._create_error_result("Embedding generation is unavailable")
+            query_vector, candidate_vectors = encoded["embeddings"][0], encoded["embeddings"][1:]
+            accelerated = False
+            if use_faiss and faiss is not None and metric == "cosine" and len(candidates) > 100:
+                try:
+                    results = self._faiss_similarity_search(query_vector, candidate_vectors, candidates, top_k, threshold)
+                    accelerated = True
+                except Exception:
+                    results = self._numpy_similarity_search(query_vector, candidate_vectors, candidates, top_k, threshold, metric)
+            else:
+                results = self._numpy_similarity_search(query_vector, candidate_vectors, candidates, top_k, threshold, metric)
+            return {"success": True, "query": query, "total_candidates": len(candidates),
+                "threshold": threshold, "top_k": top_k, "metric": metric, "results": results,
+                "model_name": encoded["model_name"], "embedding_contract": encoded["embedding_contract"],
+                "processing_time": time.monotonic()-started, "optimized": True,
+                "faiss_accelerated": accelerated, "timestamp": datetime.now().isoformat()}
+        except Exception:
+            self.logger.error("Legacy similarity calculation failed")
+            return self._create_error_result("Similarity calculation is unavailable")
+
+    def _faiss_similarity_search(self, query_embedding, candidate_embeddings, candidates, top_k, threshold):
+        query = np.array([query_embedding], dtype=np.float32)
+        matrix = np.array(candidate_embeddings, dtype=np.float32)
+        faiss.normalize_L2(query)
+        faiss.normalize_L2(matrix)
+        index = faiss.IndexFlatIP(matrix.shape[1])
+        index.add(matrix)
+        scores, indices = index.search(query, min(top_k, len(candidates)))
+        results = []
+        for score, position in zip(scores[0], indices[0]):
+            if position >= 0 and score >= threshold:
+                results.append({"text": candidates[position], "similarity_score": float(score), "rank": len(results)+1})
+        return results
+
+    def _numpy_similarity_search(self, query_embedding, candidate_embeddings, candidates, top_k, threshold, metric):
+        if not candidates:
+            return []
+        query, matrix = np.asarray(query_embedding), np.asarray(candidate_embeddings)
+        if metric == "cosine":
+            scores = (matrix @ query) / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(query))
+        elif metric == "dot":
+            scores = matrix @ query
+        elif metric == "euclidean":
+            scores = 1.0 / (1.0 + np.linalg.norm(matrix-query, axis=1))
+        else:
+            raise ValueError("Unsupported similarity metric")
+        positions = [i for i in np.argsort(-scores, kind="stable") if scores[i] >= threshold][:top_k]
+        return [{"text": candidates[i], "similarity_score": float(scores[i]), "rank": rank+1}
+                for rank, i in enumerate(positions)]
+
+    def find_similar_texts(self, query, candidates, model_name=None, threshold=0.7, top_k=10, metric="cosine"):
+        return self.find_similar_texts_optimized(query, candidates, model_name, threshold, top_k, metric)
+
+    async def find_similar_texts_async_optimized(self, query, candidates, model_name=None, threshold=0.7, top_k=10, metric="cosine"):
+        return await self._inference.run_async(self._find_similar, query, self._snapshot_texts(candidates),
+                                             model_name, threshold, top_k, metric, True)
+
+    def get_performance_metrics(self):
+        with self.cache_lock:
+            metrics = dict(self.performance_metrics)
+            total = metrics["cache_hits"] + metrics["cache_misses"]
+            generated = metrics["total_embeddings_generated"]
+            return {"cache_hit_rate": metrics["cache_hits"]/total if total else 0.0,
+                "cache_size": len(self.embedding_cache), "max_cache_size": self.max_cache_size,
+                "gpu_available": self.gpu_available, "gpu_accelerated_embeddings": metrics["gpu_accelerated"],
+                "batch_optimizations": metrics["batch_optimizations"], "total_embeddings_generated": generated,
+                "average_processing_time": metrics["total_processing_time"]/generated if generated else 0.0,
+                "total_processing_time": metrics["total_processing_time"]}
+
+    def clear_cache(self):
+        with self.cache_lock:
+            self.embedding_cache.clear()
+
+    def warm_up_cache(self, texts, model_name=None):
+        return self.get_embeddings_optimized(texts, model_name, use_cache=True)
+
+    @staticmethod
+    def _create_error_result(message):
+        return {"success": False, "embeddings": [], "error": message}
+
+    def close(self):
+        super().close()
+        self.clear_cache()

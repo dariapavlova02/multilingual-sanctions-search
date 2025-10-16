@@ -7,11 +7,11 @@ These tests focus on the core functionality without complex dependencies.
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.normalization.morphology_adapter import (
+from ai_service.layers.normalization.morphology_adapter import (
     MorphologyAdapter,
     MorphParse,
 )
-from src.ai_service.layers.normalization.morphology.gender_rules import (
+from ai_service.layers.normalization.morphology.gender_rules import (
     is_likely_feminine_surname,
     prefer_feminine_form,
 )
@@ -155,7 +155,7 @@ class TestNominativeGenderSimple:
 
     def test_exception_names_always_feminine(self):
         """Test that exception names are always considered feminine."""
-        from src.ai_service.layers.normalization.morphology.gender_rules import EXCEPTIONS_KEEP_FEM
+        from ai_service.layers.normalization.morphology.gender_rules import EXCEPTIONS_KEEP_FEM
         
         for name in EXCEPTIONS_KEEP_FEM:
             assert is_likely_feminine_surname(name, "ru") is True

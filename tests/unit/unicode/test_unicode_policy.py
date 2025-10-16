@@ -8,8 +8,8 @@ Tests homoglyph normalization and yo strategy handling based on golden test case
 import pytest
 from typing import Dict, Any
 
-from src.ai_service.layers.unicode.unicode_service import UnicodeService
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.unicode.unicode_service import UnicodeService
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, 
     NormalizationConfig
 )

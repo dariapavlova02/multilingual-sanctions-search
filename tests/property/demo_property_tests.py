@@ -13,7 +13,7 @@ from pathlib import Path
 # Add src to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 def demo_property_tests():

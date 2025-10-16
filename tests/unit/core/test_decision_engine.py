@@ -8,9 +8,9 @@ processing results from layers 1-8.
 import pytest
 from unittest.mock import Mock
 
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.base_contracts import SignalsResult, UnifiedProcessingResult
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.base_contracts import SignalsResult, UnifiedProcessingResult
+from ai_service.contracts.decision_contracts import (
     ConfidenceLevel,
     DecisionResult,
     MatchDecision,
@@ -194,120 +194,3 @@ class TestDecisionEngine:
         assert len(decisions) == 3
         # Ensure descending order of scores (higher confidence = higher score)
         assert decisions[0].score >= decisions[1].score >= decisions[2].score
-
-    def test_threshold_updates(self, decision_engine):
-        """Test threshold updating functionality"""
-        # Test threshold updates (if supported)
-        # Note: DecisionEngine uses config-based thresholds
-        pass
-
-    @pytest.mark.skip(reason="Feature not implemented")
-    def test_decision_statistics(self, decision_engine):
-        """Test decision statistics collection"""
-        # Simulate some decisions
-        decision_engine.metrics.total_decisions = 100
-        decision_engine.metrics.match_decisions = 60
-        decision_engine.metrics.no_match_decisions = 30
-        decision_engine.metrics.review_decisions = 10
-        decision_engine.metrics.avg_confidence = 0.75
-
-        stats = decision_engine.get_decision_statistics()
-
-        assert stats["total_decisions"] == 100
-        assert stats["decision_distribution"]["match"] == 0.6
-        assert stats["decision_distribution"]["no_match"] == 0.3
-        assert stats["decision_distribution"]["needs_review"] == 0.1
-        assert stats["confidence_metrics"]["average_confidence"] == 0.75
-
-    @pytest.mark.skip(reason="Feature not implemented")
-    @pytest.mark.asyncio
-    async def test_error_handling(self, decision_engine):
-        """Test error handling in decision making"""
-        # Create a malformed processing result that might cause errors
-        malformed_result = Mock()
-        malformed_result.original_text = "test"
-        malformed_result.success = None  # This might cause issues
-
-        decision = await decision_engine.decide(malformed_result)
-
-        # Should handle errors gracefully
-        assert decision.decision == MatchDecision.NEEDS_REVIEW
-        assert decision.fallback_used is True
-        assert "decision_engine_error" in decision.risk_factors
-
-    @pytest.mark.skip(reason="Feature not implemented")
-    @pytest.mark.asyncio
-    async def test_match_type_determination(self, decision_engine, basic_processing_result):
-        """Test match type determination (person vs organization)"""
-        # Test person match type
-        person_mock = Mock()
-        person_mock.core = "John Smith"
-        basic_processing_result.signals.persons = [person_mock]
-        basic_processing_result.signals.organizations = []
-
-        decision = await decision_engine.decide(basic_processing_result)
-        assert decision.match_type == "person"
-
-        # Test organization match type
-        org_mock = Mock()
-        org_mock.core = "Acme Corp"
-        basic_processing_result.signals.persons = []
-        basic_processing_result.signals.organizations = [org_mock]
-
-        decision = await decision_engine.decide(basic_processing_result)
-        assert decision.match_type == "organization"
-
-    @pytest.mark.skip(reason="Feature not implemented")
-    @pytest.mark.asyncio
-    async def test_processing_time_tracking(self, decision_engine, basic_processing_result):
-        """Test that processing time is tracked"""
-        decision = await decision_engine.decide(basic_processing_result)
-
-        assert decision.processing_time > 0.0
-        assert decision.processing_time < 1.0  # Should be fast for simple cases
-
-
-class TestDecisionEngineIntegration:
-    """Integration tests for DecisionEngine"""
-
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_real_processing_result_decision(self):
-        """Test with a more realistic processing result"""
-        # This would be filled in with actual integration testing
-        # using real service responses
-        pass
-
-    @pytest.mark.skip(reason="Feature not implemented")
-    @pytest.mark.performance
-    @pytest.mark.asyncio
-    async def test_decision_performance(self):
-        """Test decision engine performance"""
-        decision_engine = DecisionEngine()
-
-        # Create a simple processing result
-        result = UnifiedProcessingResult(
-            original_text="Test Name",
-            language="en",
-            language_confidence=0.8,
-            normalized_text="Test Name",
-            tokens=["Test", "Name"],
-            trace=[],
-            signals=SignalsResult(confidence=0.7),
-            processing_time=0.01,
-            success=True,
-            errors=[]
-        )
-
-        import time
-        start_time = time.time()
-
-        # Make multiple decisions
-        for _ in range(100):
-            await decision_engine.decide(result)
-
-        total_time = time.time() - start_time
-        avg_time = total_time / 100
-
-        # Should be very fast - under 10ms per decision
-        assert avg_time < 0.01

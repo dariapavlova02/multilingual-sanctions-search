@@ -2,18 +2,18 @@
 Golden tests for ASCII fastpath equivalence validation.
 
 These tests run both ASCII fastpath and full normalization pipeline
-in shadow mode to prove equivalence for ASCII names.
+side by side to prove equivalence for ASCII names.
 """
 
 import pytest
 import asyncio
 from typing import List, Tuple, Dict, Any
 
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, 
     NormalizationConfig
 )
-from src.ai_service.utils.ascii_utils import (
+from ai_service.utils.ascii_utils import (
     is_ascii_name, 
     ascii_fastpath_normalize,
     validate_ascii_fastpath_equivalence
@@ -91,12 +91,12 @@ class TestAsciiFastpathEquivalence:
         ]
     
     @pytest.mark.asyncio
-    async def test_ascii_fastpath_equivalence_shadow_mode(
+    async def test_ascii_fastpath_equivalence_side_by_side(
         self, 
         normalization_factory: NormalizationFactory,
         ascii_test_cases: List[Dict[str, Any]]
     ):
-        """Test ASCII fastpath equivalence in shadow mode."""
+        """Test ASCII fastpath equivalence side by side."""
         
         for test_case in ascii_test_cases:
             text = test_case["text"]

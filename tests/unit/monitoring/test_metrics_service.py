@@ -44,7 +44,7 @@ class TestMetricsService:
     def test_counter_metric(self, metrics_service):
         """Test counter metric operations"""
         # Register metric first
-        from src.ai_service.monitoring.metrics_service import MetricDefinition, MetricType
+        from ai_service.monitoring.metrics_service import MetricDefinition, MetricType
         metric_def = MetricDefinition("test.counter", MetricType.COUNTER, "Test counter metric")
         metrics_service.register_metric(metric_def)
         
@@ -61,7 +61,7 @@ class TestMetricsService:
     def test_set_gauge_metric(self, metrics_service):
         """Test set_gauge metric operations"""
         # Register metric first
-        from src.ai_service.monitoring.metrics_service import MetricDefinition, MetricType
+        from ai_service.monitoring.metrics_service import MetricDefinition, MetricType
         metric_def = MetricDefinition("test.set_gauge", MetricType.GAUGE, "Test gauge metric")
         metrics_service.register_metric(metric_def)
         
@@ -82,7 +82,7 @@ class TestMetricsService:
     def test_record_histogram_metric(self, metrics_service):
         """Test record_histogram metric operations"""
         # Register metric first
-        from src.ai_service.monitoring.metrics_service import MetricDefinition, MetricType
+        from ai_service.monitoring.metrics_service import MetricDefinition, MetricType
         metric_def = MetricDefinition("test.record_histogram", MetricType.HISTOGRAM, "Test histogram metric")
         metrics_service.register_metric(metric_def)
         
@@ -98,7 +98,7 @@ class TestMetricsService:
     def test_timer_metric(self, metrics_service):
         """Test timer metric operations"""
         # Register metric first
-        from src.ai_service.monitoring.metrics_service import MetricDefinition, MetricType
+        from ai_service.monitoring.metrics_service import MetricDefinition, MetricType
         metric_def = MetricDefinition("test.timer", MetricType.HISTOGRAM, "Test timer metric")
         metrics_service.register_metric(metric_def)
         
@@ -136,7 +136,7 @@ class TestMetricsService:
 
     def test_alert_system(self, metrics_service):
         """Test alert system functionality"""
-        from src.ai_service.monitoring.metrics_service import AlertSeverity
+        from ai_service.monitoring.metrics_service import AlertSeverity
         
         # Register metric with alert threshold
         definition = MetricDefinition(

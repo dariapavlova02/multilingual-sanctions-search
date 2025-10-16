@@ -1,0 +1,1 @@
+"""Russian-language test package."""

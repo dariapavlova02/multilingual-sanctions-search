@@ -52,6 +52,22 @@ class ProcessResponse(BaseModel):
     decision: Optional[Dict[str, Any]] = None
     search_results: Optional[Dict[str, Any]] = None
     embedding: Optional[List[float]] = None
+    variants: Optional[List[str]] = None
+
+
+class ProcessBatchItem(ProcessResponse):
+    """A complete processing result associated with one submitted text."""
+
+    original_text: str
+    language_confidence: float
+    variants_count: int = 0
+
+
+class ProcessBatchResponse(BaseModel):
+    results: List[ProcessBatchItem]
+    total_texts: int
+    successful: int
+    total_processing_time: float
 
 
 # ============================================================================
@@ -181,6 +197,7 @@ class SignalsExtras:
         default_factory=list
     )  # [{value, precision, context}]
     amounts: List[Dict[str, Any]] = field(default_factory=list)  # [{value, currency}]
+    unassigned_ids: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -411,8 +428,8 @@ class VariantsServiceInterface(ABC):
     """Variant generation service"""
 
     @abstractmethod
-    async def generate_variants(self, normalized_text: str, language: str) -> List[str]:
-        """Generate morphological and typographic variants"""
+    async def generate_variants(self, normalized_text: str, language: str) -> Union[List[str], Dict[str, Any]]:
+        """Generate a list or a payload with a variants list; the orchestrator validates it."""
         pass
 
 

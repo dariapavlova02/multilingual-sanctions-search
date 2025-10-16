@@ -1,113 +1,17 @@
-version: '3.8'
-
+# Local runs use the same authenticated stack and image as production.
 services:
-  ai-service:
-    build: .
-    container_name: ai-service
-    ports:
-      - "8002:8000"
-    environment:
-      - APP_ENV=production
-      - WORKERS=4
-      - DEBUG=false
-      # Project IP configuration
-      - PROJECT_IP=${PROJECT_IP:-0.0.0.0}
-      # Elasticsearch configuration
-      - ES_HOSTS=elasticsearch:9200
-      - ES_INDEX_PREFIX=sanctions
-      - ES_STARTUP_TIMEOUT=60
-      - SKIP_ES_INIT=false
-    env_file:
-      - env.production
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      - ./output:/app/output
-    restart: unless-stopped
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: '1.0'
-        reservations:
-          memory: 1G
-          cpus: '0.5'
-
-  ai-service-dev:
-    build: .
-    ports:
-      - "8001:8000"
-    environment:
-      - APP_ENV=development
-      - DEBUG=true
-      - NLTK_DATA=/app/nltk_data
-      - LOGGING_CONFIG=/app/src/ai_service/config/logging_dev.yml
-      # Project IP configuration
-      - PROJECT_IP=${PROJECT_IP:-0.0.0.0}
-    volumes:
-      - ./src/ai_service/main.py:/app/src/ai_service/main.py
-      - ./src/ai_service/services:/app/src/ai_service/services
-      - ./src/ai_service/utils:/app/src/ai_service/utils
-      - ./config.py:/app/config.py
-      - ./logs:/app/logs
-    command: ["sh", "-c", "mkdir -p /app/logs && poetry run uvicorn src.ai_service.main:app --host ${PROJECT_IP:-0.0.0.0} --port 8000 --reload"]
-    profiles:
-      - dev
-    depends_on:
-      - elasticsearch
-
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.enrollment.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-      - http.max_content_length=200mb
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-          cpus: '0.5'
-        reservations:
-          memory: 512M
-          cpus: '0.25'
+    extends: {file: docker-compose.prod.yml, service: elasticsearch}
+  provision:
+    extends: {file: docker-compose.prod.yml, service: provision}
+  ai-service:
+    extends: {file: docker-compose.prod.yml, service: ai-service}
 
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
-    container_name: kibana
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    ports:
-      - "5601:5601"
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-    profiles:
-      - dev
-      - monitoring
-
+networks:
+  backend: {internal: true}
+  frontend: {}
 volumes:
-  elasticsearch_data:
-    driver: local
+  elasticsearch_data: {}
+  ingestion_state: {}
+  application_cache: {}
+  application_logs: {}

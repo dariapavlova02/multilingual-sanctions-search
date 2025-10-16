@@ -2,6 +2,10 @@
 Performance timing utilities
 """
 
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
 import time
 from contextlib import contextmanager
 from typing import Generator
@@ -55,7 +59,7 @@ def perf_timer(operation_name: str = "operation") -> Generator[None, None, None]
     finally:
         end_time = time.perf_counter()
         duration_ms = (end_time - start_time) * 1000
-        print(f"⏱️  {operation_name}: {duration_ms:.2f}ms")
+        logger.debug(f"⏱️  {operation_name}: {duration_ms:.2f}ms")
 
 
 def time_function(func):
@@ -73,7 +77,7 @@ def time_function(func):
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
         duration_ms = (end_time - start_time) * 1000
-        print(f"⏱️  {func.__name__}: {duration_ms:.2f}ms")
+        logger.debug(f"⏱️  {func.__name__}: {duration_ms:.2f}ms")
         return result
     return wrapper
 

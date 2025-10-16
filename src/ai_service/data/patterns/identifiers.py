@@ -378,18 +378,16 @@ def _validate_russian_inn(value: str) -> bool:
 
 
 def _validate_ukrainian_inn(value: str) -> bool:
-    """Validate Ukrainian INN checksum (for individuals)"""
-    if len(value) == 10:
-        # Ukrainian 10-digit INN for individuals
-        # Uses simple modulus algorithm: sum of first 9 digits % 10 = 10th digit
-        first_nine_sum = sum(int(value[i]) for i in range(9))
-        expected_check_digit = first_nine_sum % 10
-        return int(value[9]) == expected_check_digit
-    
-    # Ukrainian INNs can also be 12 digits for legal entities
-    # but the algorithm is more complex and less standardized
-    # For now, we focus on the 10-digit case which covers our sanctioned INNs
-    return False
+    """Check the ten-digit Ukrainian individual tax number, not registration."""
+    if not isinstance(value, str) or len(value) != 10 or not value.isascii() or not value.isdigit():
+        return False
+
+    # Weighted RNTRC checksum; the final reduction is modulo 11, then modulo 10.
+    # Reference: python-stdnum/stdnum/ua/rntrc.py (also linked in validation docs).
+    weighted_sum = sum(int(value[index]) * weight for index, weight in enumerate(
+        (-1, 5, 7, 9, 4, 6, 10, 5, 7)
+    ))
+    return int(value[-1]) == weighted_sum % 11 % 10
 
 
 def validate_edrpou(value: str) -> bool:

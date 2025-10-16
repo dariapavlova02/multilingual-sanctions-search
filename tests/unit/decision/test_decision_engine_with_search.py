@@ -3,12 +3,12 @@ Unit tests for DecisionEngine with search integration.
 """
 
 import pytest
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.contracts.decision_contracts import (
     DecisionInput, DecisionOutput, RiskLevel, SmartFilterInfo, SignalsInfo, 
     SimilarityInfo, SearchInfo
 )
-from src.ai_service.config.settings import DecisionConfig
+from ai_service.config.settings import DecisionConfig
 
 
 class TestDecisionEngineWithSearch:
@@ -350,8 +350,9 @@ class TestDecisionEngineWithSearch:
         
         score = engine._calculate_weighted_score(decision_input)
         
-        # Should calculate the total score (uncapped)
-        assert score == 2.0
+        # The internal calculation remains uncapped; decide() normalizes its
+        # public score to the documented 0..1 range.
+        assert score == pytest.approx(2.2)
     
     def test_determine_risk_level_with_search(self):
         """Test risk level determination with search results."""

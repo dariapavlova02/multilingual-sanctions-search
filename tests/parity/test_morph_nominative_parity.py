@@ -6,8 +6,8 @@ golden parity without regressions on existing test cases.
 """
 
 import pytest
-from src.ai_service.layers.normalization.morphology_adapter import MorphologyAdapter, get_global_adapter
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.layers.normalization.morphology_adapter import MorphologyAdapter, get_global_adapter
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestMorphNominativeParity:

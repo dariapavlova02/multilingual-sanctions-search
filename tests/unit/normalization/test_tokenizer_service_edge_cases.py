@@ -7,7 +7,7 @@ to ensure robust tokenization behavior.
 """
 
 import pytest
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
+from ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
 
 
 class TestTokenizerServiceEdgeCases:
@@ -420,7 +420,7 @@ class TestTokenizerServiceEdgeCases:
         ]
         
         for tokens in edge_cases:
-            processed_tokens, traces = service._apply_post_processing_rules(tokens)
+            processed_tokens, traces, _token_traces = service._apply_post_processing_rules(tokens)
             assert isinstance(processed_tokens, list)
             assert isinstance(traces, list)
             assert len(processed_tokens) == len(tokens)

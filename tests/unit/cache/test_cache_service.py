@@ -7,7 +7,7 @@ import asyncio
 import time
 from unittest.mock import Mock, patch
 
-from src.ai_service.core.cache_service import CacheService
+from ai_service.core.cache_service import CacheService
 
 
 class TestCacheService:

@@ -12,35 +12,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from functools import wraps
 
-# Fix httpx version compatibility issue with elasticsearch
-try:
-    import httpx
-    if not hasattr(httpx, '__version__'):
-        httpx.__version__ = "0.13.3"  # Patch missing __version__ attribute
-except ImportError:
-    pass
+from elasticsearch import (
+    AsyncElasticsearch, ApiError as ElasticsearchException,
+    ConnectionError, ConnectionTimeout as TimeoutError,
+)
 
-try:
-    from elasticsearch import AsyncElasticsearch
-    try:
-        from elasticsearch.exceptions import ElasticsearchException, ConnectionError
-        try:
-            from elasticsearch.exceptions import TimeoutError
-        except ImportError:
-            # TimeoutError may not exist in some versions
-            TimeoutError = Exception
-    except ImportError:
-        # Fallback for newer elasticsearch versions
-        from elasticsearch.exceptions import ConnectionError, RequestError as ElasticsearchException
-        TimeoutError = Exception
-    ELASTICSEARCH_AVAILABLE = True
-except ImportError as e:
-    # Elasticsearch not available - create dummy classes
-    AsyncElasticsearch = None
-    ElasticsearchException = Exception
-    ConnectionError = Exception
-    TimeoutError = Exception
-    ELASTICSEARCH_AVAILABLE = False
+ELASTICSEARCH_AVAILABLE = True
 
 from ...utils.logging_config import get_logger
 
@@ -48,6 +25,7 @@ from .contracts import Candidate, SearchOpts, ElasticsearchAdapter, SearchMode
 from .config import HybridSearchConfig
 from .elasticsearch_client import ElasticsearchClientFactory
 from .elasticsearch_index_manager import ElasticsearchIndexManager
+from .search_integrity import require_complete_response, source_metadata
 
 
 def retry_elasticsearch(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
@@ -81,7 +59,7 @@ def retry_elasticsearch(max_retries: int = 3, delay: float = 1.0, backoff: float
 class ElasticsearchACAdapter(ElasticsearchAdapter):
     """Elasticsearch adapter for AC (exact/almost-exact) search."""
 
-    AC_PATTERN_FIELD = "ac_patterns.keyword"
+    AC_PATTERN_FIELD = "pattern.keyword"
     AC_PATTERNS_INDEX = "ac_patterns"
 
     def __init__(
@@ -89,9 +67,11 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
         config: HybridSearchConfig,
         client_factory: Optional[ElasticsearchClientFactory] = None,
     ) -> None:
-        self.config = config
+        self.config = HybridSearchConfig.validated_copy(config)
         self.logger = get_logger(__name__)
-        self._client_factory = client_factory or ElasticsearchClientFactory(config)
+        self._client_factory = client_factory or ElasticsearchClientFactory(self.config)
+        if isinstance(self._client_factory, ElasticsearchClientFactory):
+            self._client_factory.validate_connection_configuration(self.config)
         self._client: Optional[AsyncElasticsearch] = None
         self._index_manager: Optional[ElasticsearchIndexManager] = None
         self._latency_stats = {
@@ -236,7 +216,7 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
         # Exact pattern match (T0/T1) - highest priority
         ac_queries.append({
             "term": {
-                "pattern": {
+                "pattern.keyword": {
                     "value": query,
                     "boost": opts.ac_boost * 10.0 * self.config.ac_query_boost_factor,
                 }
@@ -246,7 +226,7 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
         # Optimized edge ngram match with better scoring
         ac_queries.append({
             "match": {
-                "pattern.edge_ngram": {
+                "pattern": {
                     "query": query,
                     "boost": opts.ac_boost * 3.0 * self.config.ac_query_boost_factor,
                     "fuzziness": "0",  # Disable fuzziness for better performance
@@ -278,13 +258,15 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
             if value is None:
                 continue
 
-            if key in {"id", "doc_id", "entity_id"}:
+            if key in {"id", "doc_id"}:
                 values = value if isinstance(value, list) else [value]
                 filters.append({"ids": {"values": values}})
                 continue
 
             field_name = key
-            if key in {"country", "country_code"}:
+            if key == "entity_id":
+                field_name = "entity_id"
+            elif key in {"country", "country_code"}:
                 field_name = "country.keyword"
             elif key in {"dob", "date_of_birth"}:
                 field_name = "dob"
@@ -303,9 +285,7 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
 
         # Защита от пустых should запросов
         if not should_queries:
-            should_queries = [{
-                "match_all": {}  # Fallback запрос
-            }]
+            should_queries = [{"match_none": {}}]
 
         bool_query: Dict[str, Any] = {
             "should": should_queries,
@@ -330,7 +310,8 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
 
         return search_body
 
-    def _parse_candidates(self, response: Dict[str, Any]) -> List[Candidate]:
+    def _parse_candidates(self, response: Dict[str, Any], query: Optional[str] = None) -> List[Candidate]:
+        require_complete_response(response)
         hits_section = response.get("hits", {})
         hits = hits_section.get("hits", [])
         max_score = hits_section.get("max_score") or 0.0
@@ -338,11 +319,17 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
 
         for hit in hits:
             source = hit.get("_source", {})
-            metadata = source.get("metadata") or {}
+            metadata = source_metadata(source)
             score = float(hit.get("_score") or 0.0)
             confidence = 0.0
-            if max_score:
+            if query is not None:
+                from rapidfuzz.fuzz import ratio
+                name = source.get("normalized_text") or source.get("name") or ""
+                confidence = ratio(query.casefold(), name.casefold()) / 100.0
+            elif max_score:
                 confidence = min(1.0, score / max_score)
+            metadata = dict(metadata)
+            metadata["raw_es_score"] = score
 
             match_fields: List[str] = []
             if "matched_queries" in hit and isinstance(hit["matched_queries"], list):
@@ -353,7 +340,7 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
             candidates.append(
                 Candidate(
                     doc_id=hit.get("_id", ""),
-                    score=score,
+                    score=confidence if query is not None else score,
                     text=source.get("normalized_text")
                     or source.get("legal_names")
                     or source.get("name")
@@ -386,9 +373,7 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
 
             # Защита от пустых should запросов
             if not ac_pattern_queries:
-                ac_pattern_queries = [{
-                    "match_all": {}  # Fallback запрос
-                }]
+                return []
 
             pattern_query = {
                 "query": {
@@ -397,14 +382,15 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
                         "minimum_should_match": 1
                     }
                 },
-                "size": 10,  # Limit AC pattern results
+                "size": opts.top_k,
                 "sort": [
                     {"tier": {"order": "asc"}},  # T0 before T1
                     {"_score": {"order": "desc"}}
                 ]
             }
             
-            response = await client.search(index=self.AC_PATTERNS_INDEX, body=pattern_query)
+            response = await client.search(index=self.config.elasticsearch.ac_index, body=pattern_query)
+            require_complete_response(response)
             payload = response
             
             hits = payload.get("hits", {}).get("hits", [])
@@ -422,15 +408,63 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
             return ac_patterns
             
         except Exception as exc:
-            self.logger.error(f"AC patterns search failed: {exc}")
-            return []
+            self.logger.error("AC pattern retrieval failed")
+            raise
+
+    async def iter_documents(self, opts: SearchOpts, *, batch_size: int = 1000):
+        """Read the configured active index without a result-window coverage limit.
+
+        A PIT and _shard_doc/search_after keep pages consistent during refreshes.
+        The caller checks the ingestion generation again before publishing results.
+        """
+        if not 1 <= batch_size <= 5000:
+            raise ValueError("Invalid fuzzy scan batch size")
+        client = await self._ensure_connection()
+        keep_alive = f"{opts.timeout_ms + 5000}ms"
+        opened = await client.open_point_in_time(
+            index=self.config.elasticsearch.ac_index,
+            keep_alive=keep_alive,
+            allow_partial_search_results=False,
+        )
+        pit_id = opened["id"]
+        try:
+            if opened.get("_shards", {}).get("failed", 0):
+                raise RuntimeError("Cannot open a complete sanctions snapshot")
+            search_after = None
+            while True:
+                body = {
+                    "pit": {"id": pit_id, "keep_alive": keep_alive},
+                    "query": {"bool": {"filter": self._build_filters(opts)}},
+                    "size": batch_size,
+                    "sort": ["_shard_doc"],
+                    "track_total_hits": False,
+                    "timeout": f"{opts.timeout_ms}ms",
+                    "_source": ["pattern", "normalized_text", "name", "aliases",
+                                "entity_id", "entity_type", "source_list", "category",
+                                "country", "dob", "metadata"],
+                }
+                if search_after is not None:
+                    body["search_after"] = search_after
+                response = await client.search(body=body, allow_partial_search_results=False)
+                pit_id = response.get("pit_id", pit_id)
+                require_complete_response(response)
+                hits = response["hits"]["hits"]
+                if not hits:
+                    break
+                next_page = hits[-1].get("sort")
+                if not next_page or next_page == search_after:
+                    raise RuntimeError("Invalid sanctions snapshot pagination")
+                search_after = next_page
+                yield hits
+        finally:
+            await client.options(request_timeout=2, max_retries=0).close_point_in_time(id=pit_id)
 
     @retry_elasticsearch(max_retries=3, delay=0.5, backoff=2.0)
     async def search(
         self,
         query: Any,
         opts: SearchOpts,
-        index_name: str = "watchlist_ac",
+        index_name: Optional[str] = None,
     ) -> List[Candidate]:
         if not isinstance(query, str):
             raise TypeError("AC adapter expects query as string")
@@ -440,43 +474,21 @@ class ElasticsearchACAdapter(ElasticsearchAdapter):
 
         try:
             search_body = self._build_ac_query(query, opts)
-            response = await client.search(index=index_name, body=search_body)
-            candidates = self._parse_candidates(response)
+            response = await client.search(index=index_name or self.config.elasticsearch.ac_index, body=search_body)
+            candidates = self._parse_candidates(response, query=query)
             
-            # Add AC pattern hits if enabled
-            if getattr(self.config, 'enable_ac_es', False):
-                ac_patterns = await self.search_ac_patterns(query, opts)
-                if ac_patterns:
-                    # Mark candidates as should_process=True and boost their scores
-                    for candidate in candidates:
-                        candidate.should_process = True
-                        # Apply boost based on AC pattern tier
-                        for pattern in ac_patterns:
-                            if pattern["tier"] == 0:
-                                candidate.score *= 2.0  # T0 boost
-                            elif pattern["tier"] == 1:
-                                candidate.score *= 1.5  # T1 boost
-                            
-                            # Add trace information
-                            if not hasattr(candidate, 'trace'):
-                                candidate.trace = {}
-                            candidate.trace.update({
-                                "tier": pattern["tier"],
-                                "reason": pattern["meta"].get("reason", "ac_pattern_match")
-                            })
-                            
         except ElasticsearchException as exc:
             self.logger.error(f"Elasticsearch error during AC search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         except (ConnectionError, TimeoutError) as exc:
             self.logger.error(f"Connection error during AC search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         except Exception as exc:
             self.logger.error(f"Unexpected error during AC search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         finally:
             latency_ms = (time.time() - start_time) * 1000
             self._update_latency_stats(latency_ms)
@@ -544,9 +556,11 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
         config: HybridSearchConfig,
         client_factory: Optional[ElasticsearchClientFactory] = None,
     ) -> None:
-        self.config = config
+        self.config = HybridSearchConfig.validated_copy(config)
         self.logger = get_logger(__name__)
-        self._client_factory = client_factory or ElasticsearchClientFactory(config)
+        self._client_factory = client_factory or ElasticsearchClientFactory(self.config)
+        if isinstance(self._client_factory, ElasticsearchClientFactory):
+            self._client_factory.validate_connection_configuration(self.config)
         self._client: Optional[AsyncElasticsearch] = None
         self._index_manager: Optional[ElasticsearchIndexManager] = None
         self._latency_stats = {
@@ -628,162 +642,11 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
             )
         return vector
 
-    @retry_elasticsearch(max_retries=3, delay=0.5, backoff=2.0)
-    async def search_vector_fallback(
-        self,
-        query_vector: List[float],
-        query_text: str,
-        opts: SearchOpts,
-    ) -> List[Candidate]:
-        """Search using vector fallback with kNN + BM25 combination."""
-        if not getattr(self.config, 'enable_vector_fallback', True):
+    async def search_vector_fallback(self, query_vector, query_text, opts):
+        """Compatibility entry point using the same validated cosine search contract."""
+        if not self.config.enable_vector_fallback:
             return []
-            
-        client = await self._ensure_connection()
-        start_time = time.time()
-        
-        try:
-            # Build hybrid query combining kNN and BM25
-            search_body = self._build_vector_fallback_query(query_vector, query_text, opts)
-            
-            response = await client.search(index=self.config.elasticsearch.vector_index, body=search_body)
-            candidates = self._parse_vector_fallback_candidates(response, query_text)
-            
-        except ElasticsearchException as exc:
-            self.logger.error(f"Elasticsearch error during vector fallback search: {exc}")
-            candidates = []
-        except (ConnectionError, TimeoutError) as exc:
-            self.logger.error(f"Connection error during vector fallback search: {exc}")
-            candidates = []
-        except Exception as exc:
-            self.logger.error(f"Unexpected error during vector fallback search: {exc}")
-            candidates = []
-        finally:
-            latency_ms = (time.time() - start_time) * 1000
-            self._update_latency_stats(latency_ms)
-
-        return candidates
-
-    def _build_vector_fallback_query(
-        self, 
-        query_vector: List[float], 
-        query_text: str, 
-        opts: SearchOpts
-    ) -> Dict[str, Any]:
-        """Build hybrid query combining kNN and BM25 for vector fallback."""
-        vector_dim = self.config.vector_search.vector_dimension
-        cos_threshold = getattr(self.config, 'vector_cos_threshold', 0.45)
-        max_results = getattr(self.config, 'vector_fallback_max_results', 50)
-        
-        # Optimized kNN query for vector similarity
-        knn_query = {
-            "field": self.config.vector_search.vector_field,
-            "query_vector": query_vector,
-            "k": max_results,
-            "num_candidates": max_results * 3,  # Increased candidates for better recall
-            "similarity": cos_threshold,
-            "boost": 2.0 * self.config.vector_query_boost_factor  # Boost vector similarity scores
-        }
-        
-        # Optimized BM25 query for text matching
-        bm25_query = {
-            "multi_match": {
-                "query": query_text,
-                "fields": ["text^3", "normalized_text^2", "aliases^1.5"],  # Better field weights
-                "type": "best_fields",
-                "fuzziness": "1",  # Reduced fuzziness for better performance
-                "minimum_should_match": "75%",  # Require most terms to match
-                "boost": 1.5 * self.config.bm25_query_boost_factor  # Boost BM25 scores
-            }
-        }
-        
-        # В Elasticsearch 8+ kNN должен быть на верхнем уровне, не в bool/should
-        # Используем только kNN запрос для vector fallback
-        search_body = {
-            "knn": knn_query,
-            "query": {
-                "bool": {
-                    "should": [bm25_query],
-                    "minimum_should_match": 1
-                }
-            },
-            "size": max_results,
-            "min_score": cos_threshold,
-            "timeout": f"{opts.timeout_ms}ms",
-            "_source": ["text", "normalized_text", "entity_type", "metadata", "dob_anchor", "id_anchor"]
-        }
-
-        # Добавляем фильтры
-        filters = self._build_filters(opts)
-        if filters:
-            search_body["query"]["bool"]["filter"] = filters
-        
-        return search_body
-
-    def _parse_vector_fallback_candidates(
-        self, 
-        response: Dict[str, Any], 
-        query_text: str
-    ) -> List[Candidate]:
-        """Parse vector fallback search results with trace information."""
-        hits_section = response.get("hits", {})
-        hits = hits_section.get("hits", [])
-        max_score = hits_section.get("max_score") or 0.0
-        candidates: List[Candidate] = []
-
-        for hit in hits:
-            source = hit.get("_source", {})
-            metadata = source.get("metadata") or {}
-            score = float(hit.get("_score") or 0.0)
-            confidence = 0.0
-            if max_score:
-                confidence = min(1.0, score / max_score)
-
-            # Calculate cosine similarity (approximate from score)
-            cosine_sim = min(1.0, max(0.0, score / 2.0))  # Rough approximation
-            
-            # Calculate string similarity using RapidFuzz if enabled
-            fuzz_score = 0
-            if getattr(self.config, 'enable_rapidfuzz_rerank', True):
-                try:
-                    from rapidfuzz import fuzz
-                    text = source.get("normalized_text") or source.get("text") or ""
-                    fuzz_score = fuzz.ratio(query_text.lower(), text.lower())
-                except ImportError:
-                    self.logger.warning("RapidFuzz not available, skipping string similarity")
-                    fuzz_score = 0
-
-            # Check DoB/ID anchors if enabled
-            anchor_matches = []
-            if getattr(self.config, 'enable_dob_id_anchors', True):
-                if source.get("dob_anchor"):
-                    anchor_matches.append("dob_anchor")
-                if source.get("id_anchor"):
-                    anchor_matches.append("id_anchor")
-
-            # Create trace information
-            trace = {
-                "reason": "vector_fallback",
-                "cosine": round(cosine_sim, 3),
-                "fuzz": fuzz_score,
-                "anchors": anchor_matches
-            }
-
-            candidates.append(
-                Candidate(
-                    doc_id=hit.get("_id", ""),
-                    score=score,
-                    text=source.get("normalized_text") or source.get("text") or "",
-                    entity_type=source.get("entity_type", metadata.get("entity_type", "unknown")),
-                    metadata=metadata,
-                    search_mode=SearchMode.VECTOR,
-                    match_fields=["vector", "text"],
-                    confidence=confidence,
-                    trace=trace
-                )
-            )
-
-        return candidates
+        return await self.search(query_vector, opts)
 
     def _build_filters(self, opts: SearchOpts) -> List[Dict[str, Any]]:
         filters: List[Dict[str, Any]] = []
@@ -796,13 +659,15 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
             if value is None:
                 continue
 
-            if key in {"id", "doc_id", "entity_id"}:
+            if key in {"id", "doc_id"}:
                 values = value if isinstance(value, list) else [value]
                 filters.append({"ids": {"values": values}})
                 continue
 
             field_name = key
-            if key in {"country", "country_code"}:
+            if key == "entity_id":
+                field_name = "entity_id"
+            elif key in {"country", "country_code"}:
                 field_name = "country.keyword"
             elif key in {"dob", "date_of_birth"}:
                 field_name = "dob"
@@ -838,11 +703,12 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
 
         filters = self._build_filters(opts)
         if filters:
-            request["filter"] = filters
+            request["knn"]["filter"] = filters
 
         return request
 
     def _parse_candidates(self, response: Dict[str, Any]) -> List[Candidate]:
+        require_complete_response(response)
         hits_section = response.get("hits", {})
         hits = hits_section.get("hits", [])
         max_score = hits_section.get("max_score") or 0.0
@@ -850,16 +716,17 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
 
         for hit in hits:
             source = hit.get("_source", {})
-            metadata = source.get("metadata") or {}
+            metadata = source_metadata(source)
             score = float(hit.get("_score") or 0.0)
             confidence = 0.0
-            if max_score:
-                confidence = min(1.0, score / max_score)
+            confidence = min(1.0, max(0.0, 2.0 * score - 1.0))
+            metadata = dict(metadata)
+            metadata["raw_es_score"] = score
 
             candidates.append(
                 Candidate(
                     doc_id=hit.get("_id", ""),
-                    score=score * self.config.vector_search.boost,
+                    score=confidence,
                     text=source.get("normalized_text")
                     or source.get("legal_names")
                     or source.get("name")
@@ -879,7 +746,7 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
         self,
         query: Any,
         opts: SearchOpts,
-        index_name: str = "watchlist_vector",
+        index_name: Optional[str] = None,
     ) -> List[Candidate]:
         query_vector = self._validate_query_vector(query)
         client = await self._ensure_connection()
@@ -887,20 +754,20 @@ class ElasticsearchVectorAdapter(ElasticsearchAdapter):
 
         try:
             body = self._build_vector_query(query_vector, opts)
-            response = await client.search(index=index_name, body=body)
+            response = await client.search(index=index_name or self.config.elasticsearch.vector_index, body=body)
             candidates = self._parse_candidates(response)
         except ElasticsearchException as exc:
             self.logger.error(f"Elasticsearch error during vector search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         except (ConnectionError, TimeoutError) as exc:
             self.logger.error(f"Connection error during vector search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         except Exception as exc:
             self.logger.error(f"Unexpected error during vector search: {exc}")
             self._connected = False
-            candidates = []
+            raise
         finally:
             latency_ms = (time.time() - start_time) * 1000
             self._update_latency_stats(latency_ms)

@@ -9,8 +9,8 @@ functionality.
 import pytest
 from unittest.mock import patch, Mock
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.contracts.base_contracts import NormalizationResult
 
 
 class TestCaseGenderRegression:
@@ -20,10 +20,6 @@ class TestCaseGenderRegression:
         """Set up test fixtures."""
         self.service = NormalizationService()
         
-        # Mock feature flags to enable nominative enforcement
-        with patch.object(self.service.feature_flags, 'enforce_nominative', return_value=True):
-            with patch.object(self.service.feature_flags, 'preserve_feminine_surnames', return_value=True):
-                self.service = NormalizationService()
 
     def test_russian_feminine_surname_preservation(self):
         """Test that Russian feminine surnames ending in -ова/-ева/-іна are preserved."""
@@ -271,7 +267,7 @@ class TestCaseGenderRegression:
     def test_feature_flags_disable_functionality(self):
         """Test that feature flags can disable nominative enforcement and gender preservation."""
         # Test with enforce_nominative disabled
-        with patch.object(self.service.feature_flags, 'enforce_nominative', return_value=False):
+        with patch.object(self.service.feature_flags._flags, 'enforce_nominative', False):
             with patch.object(self.service.normalization_factory, 'normalize_text') as mock_factory:
                 mock_factory.return_value = NormalizationResult(
                     normalized="Анна Ивановой",
@@ -302,8 +298,8 @@ class TestCaseGenderRegression:
                 assert result.normalized == "Анна Ивановой"
 
         # Test with preserve_feminine_surnames disabled
-        with patch.object(self.service.feature_flags, 'enforce_nominative', return_value=True):
-            with patch.object(self.service.feature_flags, 'preserve_feminine_surnames', return_value=False):
+        with patch.object(self.service.feature_flags._flags, 'enforce_nominative', True):
+            with patch.object(self.service.feature_flags._flags, 'preserve_feminine_surnames', False):
                 with patch.object(self.service.morphology_adapter, 'to_nominative') as mock_nominative:
                     with patch.object(self.service.morphology_adapter, 'detect_gender') as mock_gender:
                         mock_nominative.side_effect = lambda token, lang: {

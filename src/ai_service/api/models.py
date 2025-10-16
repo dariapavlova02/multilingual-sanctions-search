@@ -3,10 +3,10 @@ API Models and Request/Response schemas.
 """
 
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from enum import Enum
 
-from ..utils.feature_flags import FeatureFlags, NormalizationImplementation
+from ..utils.feature_flags import FeatureFlags, merge_feature_flags
 
 
 class ProcessingMode(str, Enum):
@@ -36,23 +36,12 @@ class SearchMode(str, Enum):
 class FlagOverrides(BaseModel):
     """Feature flag overrides for request."""
 
-    # Core implementation
-    normalization_implementation: Optional[NormalizationImplementation] = None
-    factory_rollout_percentage: Optional[int] = Field(None, ge=0, le=100)
-
-    # Performance flags
-    enable_performance_fallback: Optional[bool] = None
-    max_latency_threshold_ms: Optional[float] = Field(None, gt=0, le=10000)
-    enable_accuracy_monitoring: Optional[bool] = None
-    min_confidence_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     # Debug flags
-    enable_dual_processing: Optional[bool] = None
-    log_implementation_choice: Optional[bool] = None
     debug_tracing: Optional[bool] = None
 
     # Normalization behavior
-    use_factory_normalizer: Optional[bool] = None
     fix_initials_double_dot: Optional[bool] = None
     preserve_hyphenated_case: Optional[bool] = None
     strict_stopwords: Optional[bool] = None
@@ -94,9 +83,6 @@ class FlagOverrides(BaseModel):
     use_diminutives_dictionary_only: Optional[bool] = None
     diminutives_allow_cross_lang: Optional[bool] = None
 
-    # Language overrides
-    language_overrides: Optional[Dict[str, NormalizationImplementation]] = None
-
 
 class ProcessingOptions(BaseModel):
     """Processing options for requests."""
@@ -129,18 +115,8 @@ class ProcessingOptions(BaseModel):
 
     def get_effective_flags(self, base_flags: FeatureFlags) -> FeatureFlags:
         """Get effective flags by applying overrides to base flags."""
-        if not self.flags:
-            return base_flags
-
-        # Create a copy of base flags
-        effective = FeatureFlags(**base_flags.__dict__)
-
-        # Apply overrides
-        for field_name, value in self.flags.__dict__.items():
-            if value is not None and hasattr(effective, field_name):
-                setattr(effective, field_name, value)
-
-        return effective
+        overrides = self.flags.model_dump(exclude_none=True) if self.flags else None
+        return merge_feature_flags(base_flags, overrides)
 
 
 class ProcessRequest(BaseModel):

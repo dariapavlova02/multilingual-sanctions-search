@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.smart_filter.smart_filter_service import SmartFilterService, FilterResult
+from ai_service.layers.smart_filter.smart_filter_service import SmartFilterService, FilterResult
 
 
 class TestSmartFilterServiceAsync:

@@ -4,8 +4,8 @@ Integration tests for Elasticsearch search functionality.
 
 import pytest
 import httpx
-from src.ai_service.contracts.search_contracts import SearchOpts, SearchMode
-from src.ai_service.layers.search.elasticsearch_adapters import (
+from ai_service.contracts.search_contracts import SearchOpts, SearchMode
+from ai_service.layers.search.elasticsearch_adapters import (
     ElasticsearchACAdapter, ElasticsearchVectorAdapter
 )
 
@@ -346,8 +346,8 @@ class TestElasticsearchHybridSearch:
     @pytest.mark.asyncio
     async def test_hybrid_search_combines_ac_and_vector(self, elasticsearch_client, test_indices, sample_query_vector):
         """Test that hybrid search combines AC and Vector results."""
-        from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-        from src.ai_service.contracts.search_contracts import HybridSearchConfig
+        from ai_service.layers.search.hybrid_search_service import HybridSearchService
+        from ai_service.contracts.search_contracts import HybridSearchConfig
         
         # Create hybrid search service
         config = HybridSearchConfig()
@@ -361,7 +361,7 @@ class TestElasticsearchHybridSearch:
         service._vector_adapter = vector_adapter
         
         # Create mock normalization result
-        from src.ai_service.contracts.base_contracts import NormalizationResult
+        from ai_service.contracts.base_contracts import NormalizationResult
         normalization_result = NormalizationResult(
             normalized="иван петров",
             tokens=["иван", "петров"],
@@ -404,8 +404,8 @@ class TestElasticsearchHybridSearch:
     @pytest.mark.asyncio
     async def test_hybrid_search_escalation(self, elasticsearch_client, test_indices, sample_query_vector):
         """Test that hybrid search escalates from AC to Vector when AC results are weak."""
-        from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-        from src.ai_service.contracts.search_contracts import HybridSearchConfig
+        from ai_service.layers.search.hybrid_search_service import HybridSearchService
+        from ai_service.contracts.search_contracts import HybridSearchConfig
         
         # Create hybrid search service with low AC threshold
         config = HybridSearchConfig(
@@ -422,7 +422,7 @@ class TestElasticsearchHybridSearch:
         service._vector_adapter = vector_adapter
         
         # Create mock normalization result
-        from src.ai_service.contracts.base_contracts import NormalizationResult
+        from ai_service.contracts.base_contracts import NormalizationResult
         normalization_result = NormalizationResult(
             normalized="иван петров",
             tokens=["иван", "петров"],
@@ -459,8 +459,8 @@ class TestElasticsearchHybridSearch:
     @pytest.mark.asyncio
     async def test_hybrid_search_fusion_scoring(self, elasticsearch_client, test_indices, sample_query_vector):
         """Test that hybrid search properly fuses AC and Vector scores."""
-        from src.ai_service.layers.search.hybrid_search_service import HybridSearchService
-        from src.ai_service.contracts.search_contracts import HybridSearchConfig
+        from ai_service.layers.search.hybrid_search_service import HybridSearchService
+        from ai_service.contracts.search_contracts import HybridSearchConfig
         
         # Create hybrid search service
         config = HybridSearchConfig()
@@ -474,7 +474,7 @@ class TestElasticsearchHybridSearch:
         service._vector_adapter = vector_adapter
         
         # Create mock normalization result
-        from src.ai_service.contracts.base_contracts import NormalizationResult
+        from ai_service.contracts.base_contracts import NormalizationResult
         normalization_result = NormalizationResult(
             normalized="иван петров",
             tokens=["иван", "петров"],

@@ -1,44 +1,27 @@
-"""Smoke test ensuring factory stays close to legacy on golden set."""
-
-from __future__ import annotations
+"""Synchronous and asynchronous entry points preserve the same name evidence."""
 
 import json
 from pathlib import Path
+from statistics import quantiles
+from time import perf_counter
 
-from tests.parity.parity_runner import (
-    NormalizationFlags,
-    compare_results,
-    measure_latency,
-    run_factory,
-    run_legacy,
-)
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "parity_golden.jsonl"
 
 
-def _load_cases() -> list[dict[str, str]]:
-    with FIXTURE_PATH.open("r", encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
-
-
-def test_factory_parity_smoke() -> None:
-    cases = _load_cases()
+async def test_sync_async_parity_smoke():
+    cases = [json.loads(line) for line in FIXTURE_PATH.read_text().splitlines() if line.strip()]
     assert len(cases) == 10, "Fixture should contain 10 parity cases"
-
-    flags = NormalizationFlags()
-    equal_text_hits = 0
-    factory_times: list[float] = []
-
+    service = NormalizationService()
+    timings = []
     for case in cases:
-        legacy_result, _ = run_legacy(case["text"], flags)
-        factory_result, factory_timing = run_factory(case["text"], flags)
-        comparison = compare_results(legacy_result, factory_result)
-        if comparison["equal_text"]:
-            equal_text_hits += 1
-        factory_times.append(factory_timing["elapsed_ms"])
-
-    parity_ratio = equal_text_hits / len(cases)
-    factory_latency = measure_latency(lambda: factory_times)
-
-    assert parity_ratio >= 0.7, "Factory parity should stay above 70% on smoke set"
-    assert factory_latency["p95_ms"] <= 20.0, "Factory p95 must remain within 20ms"
+        sync = service.normalize_sync(case["text"], language="auto")
+        start = perf_counter()
+        asynchronous = await service.normalize_async(case["text"], language="auto")
+        timings.append((perf_counter() - start) * 1000)
+        assert sync.success and asynchronous.success
+        assert sync.normalized == asynchronous.normalized
+        assert sync.tokens == asynchronous.tokens
+        assert sync.persons_core == asynchronous.persons_core
+    assert quantiles(timings, n=100, method="inclusive")[94] <= 20.0, "Normalization p95 must remain within 20ms"

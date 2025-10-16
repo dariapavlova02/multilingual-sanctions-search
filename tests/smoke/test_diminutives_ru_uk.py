@@ -7,8 +7,8 @@ with cases from golden test suite.
 
 import os
 import pytest
-from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestDiminutivesRuUk:
@@ -17,7 +17,7 @@ class TestDiminutivesRuUk:
     def setup_method(self):
         """Set up test environment."""
         # Clear any existing feature flag manager
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
         
         # Create factory instance
@@ -25,7 +25,7 @@ class TestDiminutivesRuUk:
 
     def teardown_method(self):
         """Clean up test environment."""
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
     @pytest.mark.asyncio

@@ -5,8 +5,8 @@ Unit tests for RussianMorphologyAnalyzer using pytest fixtures
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 
-from src.ai_service.layers.normalization.morphology.russian_morphology import RussianMorphologyAnalyzer
-from src.ai_service.layers.normalization.morphology.base_morphology import MorphologicalAnalysis
+from ai_service.layers.normalization.morphology.russian_morphology import RussianMorphologyAnalyzer
+from ai_service.layers.normalization.morphology.base_morphology import MorphologicalAnalysis
 
 
 class TestRussianMorphologyAnalyzer:
@@ -16,7 +16,7 @@ class TestRussianMorphologyAnalyzer:
     def setup_analyzer(self):
         """Create analyzer instance for tests"""
         # Mock the dependencies
-        with patch('src.ai_service.layers.normalization.morphology.russian_morphology.get_logger'):
+        with patch('ai_service.layers.normalization.morphology.russian_morphology.get_logger'):
             self.analyzer = RussianMorphologyAnalyzer()
         
         # Mock special names

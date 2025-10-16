@@ -1,0 +1,3 @@
+[installer]
+# Honor the lockfile's platform markers (macOS PyTorch / Linux CPU PyTorch).
+re-resolve = false

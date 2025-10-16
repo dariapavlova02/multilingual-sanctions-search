@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 import pytest
 
-from src.ai_service.config.hot_reload import ConfigurationWatcher, HotReloadableConfig
-from src.ai_service.config.settings import SearchConfig
+from ai_service.config.hot_reload import ConfigurationWatcher, HotReloadableConfig
+from ai_service.config.settings import SearchConfig
 
 
 class TestConfigurationWatcher:

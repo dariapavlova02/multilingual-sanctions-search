@@ -6,14 +6,15 @@ nicknames to their full forms (e.g., Bill -> William).
 """
 
 import pytest
-from src.ai_service.layers.normalization.nameparser_adapter import NameparserAdapter
+from ai_service.layers.normalization.nameparser_adapter import NameparserAdapter
 from pathlib import Path
+from ai_service.data.resources import LEXICONS_DIR
 
 
 @pytest.fixture
 def nameparser_adapter():
     """Create a nameparser adapter for testing."""
-    lexicons_path = Path(__file__).resolve().parents[3] / "data" / "lexicons"
+    lexicons_path = LEXICONS_DIR
     return NameparserAdapter(lexicons_path)
 
 

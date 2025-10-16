@@ -1,0 +1,14 @@
+{
+  "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": {
+    "revision": "4328cf26390c98c5e3c738b4460a05b95f4911f5",
+    "dimension": 768
+  },
+  "sentence-transformers/all-MiniLM-L6-v2": {
+    "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "dimension": 384
+  },
+  "sentence-transformers/paraphrase-MiniLM-L6-v2": {
+    "revision": "c9a2bfebc254878aee8c3aca9e6844d5bbb102d1",
+    "dimension": 384
+  }
+}

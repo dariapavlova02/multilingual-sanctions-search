@@ -11,7 +11,7 @@ from hypothesis import given, strategies as st, assume, settings, HealthCheck
 import string
 import unicodedata
 
-from src.ai_service.layers.unicode.unicode_service import UnicodeService
+from ai_service.layers.unicode.unicode_service import UnicodeService
 
 # Configure Hypothesis settings for CI
 settings.register_profile("ci", suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=200)

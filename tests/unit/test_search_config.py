@@ -9,8 +9,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from typing import List, Dict, Any
 
-from src.ai_service.config.settings import SearchConfig
-from src.ai_service.layers.search.config import HybridSearchConfig
+from ai_service.config.settings import SearchConfig
+from ai_service.layers.search.config import HybridSearchConfig
 from pydantic import ValidationError
 
 
@@ -250,23 +250,26 @@ class TestSearchConfig:
             SearchConfig()
         
         # Invalid fallback threshold (too low)
+        os.environ["ESCALATION_THRESHOLD"] = "0.9"
         os.environ["FALLBACK_THRESHOLD"] = "0.05"
         with pytest.raises(ValidationError, match="Fallback threshold should be greater than 0.1"):
             SearchConfig()
         
         # Invalid vector similarity threshold (too low)
+        os.environ["FALLBACK_THRESHOLD"] = "0.4"
         os.environ["VECTOR_SIMILARITY_THRESHOLD"] = "0.2"
         with pytest.raises(ValidationError, match="Vector similarity threshold should be greater than 0.3"):
             SearchConfig()
         
         # Invalid cache size (too small)
+        os.environ["VECTOR_SIMILARITY_THRESHOLD"] = "0.8"
         os.environ["EMBEDDING_CACHE_SIZE"] = "50"
         with pytest.raises(ValidationError, match="Embedding cache size should be at least 100"):
             SearchConfig()
 
     def test_model_dump(self):
         """Test model serialization"""
-        config = SearchConfig()
+        config = SearchConfig(es_password="fixture-password", es_api_key="fixture-api-key")
         data = config.model_dump()
         
         assert "es_hosts" in data
@@ -297,27 +300,27 @@ class TestSearchConfig:
         config = SearchConfig()
         stats = config.get_reload_stats()
         
-        assert "last_reloaded" in stats
+        assert "last_reload" in stats
         assert "reload_count" in stats
-        assert "monitoring_active" in stats
-        assert "watched_paths" in stats
+        assert "watcher_running" in stats
         
         assert stats["reload_count"] == 0
-        assert stats["monitoring_active"] is False
+        assert stats["watcher_running"] is False
 
     @pytest.mark.asyncio
-    async def test_hot_reload_functionality(self):
+    async def test_hot_reload_functionality(self, tmp_path):
         """Test hot reload functionality"""
         config = SearchConfig()
         
         # Test starting hot reload
-        await config.start_hot_reload()
-        assert config._reload_task is not None
-        assert not config._reload_task.done()
+        path = tmp_path / "configuration.json"
+        path.write_text("{}")
+        await config.start_hot_reload([path])
+        assert config.get_reload_stats()["watcher_running"]
         
         # Test stopping hot reload
-        config.stop_hot_reload()
-        assert config._reload_task is None
+        await config.stop_hot_reload()
+        assert not config.get_reload_stats()["watcher_running"]
 
     def test_reload_configuration(self):
         """Test configuration reload"""

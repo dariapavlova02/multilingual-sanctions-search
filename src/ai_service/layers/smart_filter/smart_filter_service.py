@@ -338,169 +338,55 @@ class SmartFilterService:
             self.logger.error(f"Error in analyze_payment_description: {e}")
             raise SmartFilterError(f"Payment description analysis failed: {str(e)}")
 
-    def search_aho_corasick(
-        self, text: str, max_matches: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Perform real AC pattern matching using Elasticsearch AC patterns
-
-        Args:
-            text: Text to search in
-            max_matches: Maximum number of matches to return
-
-        Returns:
-            Real AC pattern search results
-
-        Raises:
-            SmartFilterError: If search fails
-        """
-        if not self.aho_corasick_enabled:
-            return {
-                "matches": [],
-                "total_matches": 0,
-                "processing_time_ms": 0.0,
-                "patterns_loaded": 0,
-                "text_length": len(text),
-                "enabled": False,
-                "message": "AC integration disabled",
-            }
-
+    async def _search_ac_candidates(self, text, max_matches):
+        from ...contracts.base_contracts import NormalizationResult
+        from ..search.config import HybridSearchConfig
+        from ..search.contracts import SearchMode, SearchOpts
+        from ..search.hybrid_search_service import HybridSearchService
+        service = HybridSearchService(HybridSearchConfig.from_env())
         try:
-            import time
-            import requests
-            from requests.auth import HTTPBasicAuth
-            start_time = time.time()
+            normalization = NormalizationResult(normalized=text, tokens=text.split(), trace=[])
+            return await service.find_candidates(normalization, text, SearchOpts(
+                search_mode=SearchMode.AC, top_k=max_matches,
+                threshold=service.config.ac_search.min_score,
+            ))
+        finally:
+            await service.close()
 
-            # ES connection details - using environment variables for security
-            ES_HOST = os.getenv("ES_HOST", "localhost")
-            ES_PORT = int(os.getenv("ES_PORT", "9200"))
-            ES_USER = os.getenv("ES_USERNAME", os.getenv("ES_USER"))
-            ES_PASSWORD = os.getenv("ES_PASSWORD")
-            ES_INDEX = os.getenv("ES_AC_PATTERNS_INDEX", "ai_service_ac_patterns")
-
-            # Check if credentials are available, skip ES lookup if not
-            if not ES_PASSWORD or not ES_USER:
-                # Fallback to basic detection without ES lookup
-                return {
-                    "should_use_ac": False,
-                    "confidence": 0.5,
-                    "reason": "ES credentials not configured",
-                    "processing_time": time.time() - start_time
-                }
-
-            # Normalize text for search (same as AC patterns)
-            from ..unicode.unicode_service import UnicodeService
-            unicode_service = UnicodeService()
-            normalized_result = unicode_service.normalize_text(text, normalize_homoglyphs=True)
-            normalized_text = normalized_result["normalized"]
-
-            # Search for AC patterns that match this text
-            search_url = f"http://{ES_HOST}:{ES_PORT}/{ES_INDEX}/_search"
-            auth = HTTPBasicAuth(ES_USER, ES_PASSWORD)
-
-            # Create search query to find patterns that match our text
-            search_query = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "wildcard": {
-                                    "pattern": {
-                                        "value": f"*{normalized_text.lower()}*",
-                                        "case_insensitive": True
-                                    }
-                                }
-                            },
-                            {
-                                "match": {
-                                    "pattern": {
-                                        "query": normalized_text,
-                                        "fuzziness": "AUTO"
-                                    }
-                                }
-                            }
-                        ],
-                        "minimum_should_match": 1
-                    }
-                },
-                "size": max_matches or 50,
-                "sort": [
-                    {"tier": {"order": "asc"}},  # Lower tier = higher priority
-                    {"confidence": {"order": "desc"}},
-                    {"_score": {"order": "desc"}}
-                ]
-            }
-
-            # Use configurable timeout instead of hardcoded 5 seconds
-            # Import SearchConfig to get proper ES timeout
-            from ...config.settings import SearchConfig
-            search_config = SearchConfig()
-            timeout = search_config.es_timeout
-            response = requests.post(search_url, json=search_query, auth=auth, timeout=timeout)
-
-            matches = []
-            patterns_loaded = 0
-
-            if response.status_code == 200:
-                result = response.json()
-                hits = result.get("hits", {}).get("hits", [])
-                patterns_loaded = result.get("hits", {}).get("total", {}).get("value", 0)
-
-                for hit in hits:
-                    source = hit["_source"]
-                    pattern = source.get("pattern", "")
-
-                    # Check if this pattern actually matches our normalized text
-                    if pattern.lower() in normalized_text.lower() or normalized_text.lower() in pattern.lower():
-                        matches.append({
-                            "pattern": pattern,
-                            "tier": f"tier_{source.get('tier', 3)}",
-                            "start": normalized_text.lower().find(pattern.lower()),
-                            "end": normalized_text.lower().find(pattern.lower()) + len(pattern),
-                            "matched_text": pattern,
-                            "confidence": source.get("confidence", 0.5),
-                            "pattern_type": source.get("type", "unknown"),
-                            "entity_type": source.get("entity_type", "unknown"),
-                            "entity_id": source.get("entity_id", ""),
-                            "es_score": hit.get("_score", 0)
-                        })
-
-            processing_time_ms = (time.time() - start_time) * 1000
-
-            return {
-                "matches": matches,
-                "total_matches": len(matches),
-                "processing_time_ms": processing_time_ms,
-                "patterns_loaded": patterns_loaded,
-                "text_length": len(text),
-                "enabled": True,
-                "normalized_text": normalized_text,
-                "message": f"Real AC search completed with {len(matches)} matches from {patterns_loaded} total patterns",
-            }
-
-        except Exception as e:
-            import requests
-            is_timeout = isinstance(e, (requests.Timeout, requests.ConnectTimeout, requests.ReadTimeout))
-            error_type = "timeout" if is_timeout else "error"
-
-            if is_timeout:
-                self.logger.warning(f"AC search timeout after {timeout}s: {e}")
-            else:
-                self.logger.error(f"Error in real AC search: {e}")
-
-            # Fallback to empty result instead of failing
-            return {
-                "matches": [],
-                "total_matches": 0,
-                "processing_time_ms": 0.0,
-                "patterns_loaded": 0,
-                "text_length": len(text),
-                "enabled": True,
-                "error": str(e),
-                "error_type": error_type,
-                "timeout_used": timeout,
-                "message": f"AC search {error_type}: {str(e)}",
-            }
+    def search_aho_corasick(self, text: str, max_matches: Optional[int] = None) -> Dict[str, Any]:
+        """Use the canonical configured search layer for optional AC evidence."""
+        import time
+        from ...utils.async_bridge import run_sync
+        started = time.monotonic()
+        if max_matches is not None and not 1 <= max_matches <= 100:
+            raise ValueError("max_matches must be between 1 and 100")
+        result = {
+            "matches": [], "total_matches": 0, "processing_time_ms": 0.0,
+            "text_length": len(text), "enabled": self.aho_corasick_enabled,
+            "language": self._detect_language(text), "tier_distribution": {},
+        }
+        if not self.aho_corasick_enabled:
+            return {**result, "message": "AC integration disabled"}
+        try:
+            candidates = run_sync(self._search_ac_candidates(text, max_matches or 50))
+            for candidate in candidates:
+                start = text.casefold().find(candidate.text.casefold())
+                tier = candidate.metadata.get("tier")
+                result["matches"].append({
+                    "pattern": candidate.text, "matched_text": candidate.text,
+                    "start": start if start >= 0 else None,
+                    "end": start + len(candidate.text) if start >= 0 else None,
+                    "confidence": candidate.confidence, "tier": tier,
+                    "pattern_type": "sanctions_candidate", "entity_type": candidate.entity_type,
+                    "entity_id": candidate.metadata.get("entity_id"),
+                })
+                if tier is not None:
+                    result["tier_distribution"][str(tier)] = result["tier_distribution"].get(str(tier), 0) + 1
+            result["total_matches"] = len(result["matches"])
+            result["processing_time_ms"] = (time.monotonic() - started) * 1000
+            return result
+        except Exception as exc:
+            raise SmartFilterError("Optional AC evidence could not be retrieved") from exc
 
     def _analyze_payment_context(self, text: str) -> Dict[str, Any]:
         """

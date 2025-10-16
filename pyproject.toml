@@ -3,28 +3,51 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [project]
-name = "ai-normalization-service"
-version = "0.0.1"
-description = "Name normalization service"
+name = "hybrid-sanctions-search-engine"
+version = "0.1.0"
+description = "Multilingual sanctions screening with normalization, exact matching, and vector search"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dynamic = ["version", "readme"]
+dynamic = ["dependencies"]
+authors = [{name = "Daria Pavlova"}]
+license = "MIT"
+keywords = ["sanctions", "screening", "search", "nlp", "compliance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/dariapavlova02/multilingual-sanctions-search"
+Repository = "https://github.com/dariapavlova02/multilingual-sanctions-search"
+Issues = "https://github.com/dariapavlova02/multilingual-sanctions-search/issues"
 
 [tool.poetry]
-name = "ai-normalization-service"
-version = "0.0.1"
-description = "Name normalization service"
-readme = "README.md"
 packages = [{include = "ai_service", from = "src"}]
+include = [
+    {path = "src/ai_service/data/*.json", format = ["sdist", "wheel"]},
+    {path = "src/ai_service/data/lexicons/*", format = ["sdist", "wheel"]},
+    {path = "src/ai_service/data/config/*.json", format = ["sdist", "wheel"]},
+]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-fastapi = ">=0.116.1"
+fastapi = ">=0.141.1,<0.142.0"
+starlette = ">=1.3.1,<2.0.0"
 uvicorn = {extras = ["standard"], version = ">=0.35.0"}
 pydantic = ">=2.11.7"
 pydantic-settings = ">=2.10.1"
 pyahocorasick = ">=2.2.0"
-sentence-transformers = ">=5.1.0"
+sentence-transformers = ">=5.7.0,<6.0.0"
+transformers = ">=5.16.1,<6.0.0"
+torch = [
+    {version = "2.14.0+cpu", source = "pytorch-cpu", markers = "sys_platform == 'linux'"},
+    {version = "2.14.0", markers = "sys_platform != 'linux'"},
+]
 scipy = ">=1.14.0"
 numpy = ">=1.24.0,<3.0.0"
 pymorphy3 = ">=2.0.4"
@@ -33,29 +56,34 @@ pymorphy3-dicts-ru = ">=2.4.417150.4580142"
 pyyaml = ">=6.0.2"
 httpx = ">=0.27.0,<0.29.0"
 nameparser = ">=1.1.0"
-elasticsearch = "8.11.0"
-elastic-transport = "8.10.0"
+elasticsearch = {extras = ["async"], version = ">=8.19.3,<9.0.0"}
+elastic-transport = ">=8.19.0,<9.0.0"
+aiohttp = ">=3.14.3,<4.0.0"
+urllib3 = ">=2.7.0,<3.0.0"
 prometheus-client = ">=0.19.0"
 rapidfuzz = ">=3.5.0"
-spacy = ">=3.7.0"
+spacy = ">=3.8.16,<3.9.0"
 transliterate = ">=1.10.2"
-
-# Optional spaCy models (add as extras if needed)
-[tool.poetry.extras]
-spacy-models = []
+python-multipart = ">=0.0.32,<0.1.0"
 
 [tool.poetry.group.dev.dependencies]
+pip = ">=26.2,<27.0.0"
 pytest-asyncio = ">=1.1.0"
 pytest-cov = ">=6.0.0"
 httpx = ">=0.27.0"
 pytest-timeout = ">=2.4.0"
 isort = ">=6.0.1,<7.0.0"
-black = ">=25.1.0,<26.0.0"
+black = ">=26.3.1,<27.0.0"
 pre-commit = ">=4.3.0"
 hypothesis = ">=6.112.0"
 
-[tool.poetry.scripts]
-post-install = "scripts.post_install:main"
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[project.scripts]
+post-install = "ai_service.scripts.post_install:main"
 
 
 [tool.isort]

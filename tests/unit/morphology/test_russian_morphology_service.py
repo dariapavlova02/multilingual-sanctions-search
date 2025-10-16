@@ -5,7 +5,7 @@ This addresses the critical coverage gap (37.1% -> 75%)
 
 import pytest
 from unittest.mock import Mock, patch, MagicMock
-from src.ai_service.layers.normalization.morphology.russian_morphology import RussianMorphologyAnalyzer
+from ai_service.layers.normalization.morphology.russian_morphology import RussianMorphologyAnalyzer
 
 
 class TestRussianMorphology:

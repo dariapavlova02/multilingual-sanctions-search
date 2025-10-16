@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ...utils.logging_config import get_logger
+from .entity_association import evidence_owner
+from ...utils.source_text_view import SourceTextView, without_format_controls
 from .extractors import (
     BirthdateExtractor,
     IdentifierExtractor,
@@ -68,6 +70,8 @@ class PersonSignal:
     ids: List[Dict[str, Any]] = field(default_factory=list)
     confidence: float = 0.0
     evidence: List[str] = field(default_factory=list)
+    source_names: List[str] = field(default_factory=list, repr=False)
+    dob_position: Optional[tuple[int, int]] = None
 
 
 @dataclass
@@ -110,8 +114,6 @@ class SignalsService:
         self.identifier_extractor = IdentifierExtractor()
         self.birthdate_extractor = BirthdateExtractor()
 
-        # Text storage for proximity matching
-        self._current_text = ""
 
         self.logger.info("SignalsService initialized with extractors")
 
@@ -161,33 +163,22 @@ class SignalsService:
                 self.logger.warning(f"Cannot convert normalization_result to dict: {type(normalization_result)}")
                 normalization_result = None
 
-        # Логируем что в итоге передано в _get_entity_cores
-        if normalization_result:
-            self.logger.info(f"[CHECK] SIGNALS DEBUG: normalization_result keys: {list(normalization_result.keys())}")
-            self.logger.info(f"[CHECK] SIGNALS DEBUG: persons_core present: {'persons_core' in normalization_result}")
-            print(f"[CHECK] SIGNALS DEBUG: normalization_result keys: {list(normalization_result.keys())}")
-            print(f"[CHECK] SIGNALS DEBUG: persons_core present: {'persons_core' in normalization_result}")
-        else:
-            self.logger.warning(f"[CHECK] SIGNALS DEBUG: normalization_result is None/empty!")
-            print(f"[CHECK] SIGNALS DEBUG: normalization_result is None/empty!")
-
-        # Сохраняем текст для proximity matching
-        self._current_text = text
-
         try:
             # 1. Извлекаем базовые токены сущностей
+            matching_text = without_format_controls(text)
             persons_core, organizations_core = self._get_entity_cores(
-                text, normalization_result, language
+                matching_text, normalization_result, language
             )
 
             # 2. Создаем персоны из токенов
             persons = self._create_person_signals(persons_core)
+            self._attach_source_names(persons, normalization_result)
 
             # 3. Создаем организации из токенов (используем persons_core, чтобы не захватывать ФИО)
-            organizations = self._create_organization_signals(text, organizations_core, persons_core)
+            organizations = self._create_organization_signals(matching_text, organizations_core, persons_core)
 
             # 4. Обогащаем сущности идентификаторами
-            self._enrich_with_identifiers(text, persons, organizations, normalization_result)
+            unassigned_ids = self._enrich_with_identifiers(text, persons, organizations, normalization_result)
 
             # 5. Обогащаем персоны датами рождения
             self._enrich_with_birthdates(text, persons)
@@ -197,6 +188,7 @@ class SignalsService:
 
             # 7. Формируем результат
             result = self._build_result(persons, organizations)
+            result["extras"]["unassigned_ids"] = unassigned_ids
 
             self.logger.debug(
                 f"Extracted {len(persons)} persons, {len(organizations)} organizations"
@@ -205,8 +197,8 @@ class SignalsService:
             return result
 
         except Exception as e:
-            self.logger.error(f"Error extracting signals: {e}")
-            return self._empty_result()
+            self.logger.exception("Signal extraction failed")
+            raise RuntimeError("Signal extraction failed") from e
 
     def _get_entity_cores(
         self,
@@ -219,7 +211,7 @@ class SignalsService:
         if normalization_result and "persons_core" in normalization_result:
             persons_core = normalization_result["persons_core"]
             self.logger.info(f"🟢 SIGNALS FIX: Using normalized persons_core: {persons_core}")
-            print(f"🟢 SIGNALS FIX: Using normalized persons_core: {persons_core}")
+            self.logger.debug(f"🟢 SIGNALS FIX: Using normalized persons_core: {persons_core}")
 
             # ДИАГНОСТИКА: проверим что в persons_core и отфильтруем неправильные токены
             filtered_persons_core = []
@@ -231,19 +223,19 @@ class SignalsService:
                         filtered_tokens.append(token)
                     else:
                         self.logger.warning(f"🔴 FILTERING OUT invalid person token: '{token}'")
-                        print(f"🔴 FILTERING OUT invalid person token: '{token}'")
+                        self.logger.debug(f"🔴 FILTERING OUT invalid person token: '{token}'")
 
                 if filtered_tokens:  # Добавляем только если остались валидные токены
                     filtered_persons_core.append(filtered_tokens)
 
             persons_core = filtered_persons_core
             self.logger.info(f"🟢 AFTER FILTERING: persons_core: {persons_core}")
-            print(f"🟢 AFTER FILTERING: persons_core: {persons_core}")
+            self.logger.debug(f"🟢 AFTER FILTERING: persons_core: {persons_core}")
 
             # FALLBACK: если после фильтрации ничего не осталось, попробуем PersonExtractor
             if not persons_core:
                 self.logger.warning(f"[WARN] EMPTY AFTER FILTERING: Trying PersonExtractor as fallback")
-                print(f"[WARN] EMPTY AFTER FILTERING: Trying PersonExtractor as fallback")
+                self.logger.debug(f"[WARN] EMPTY AFTER FILTERING: Trying PersonExtractor as fallback")
                 fallback_persons = self.person_extractor.extract(text, language)
 
                 # Применяем такую же фильтрацию к fallback результатам
@@ -256,11 +248,11 @@ class SignalsService:
                         persons_core.append(filtered_tokens)
 
                 self.logger.info(f"[WARN] FALLBACK RESULT: persons_core: {persons_core}")
-                print(f"[WARN] FALLBACK RESULT: persons_core: {persons_core}")
+                self.logger.debug(f"[WARN] FALLBACK RESULT: persons_core: {persons_core}")
         else:
             # FALLBACK: используем PersonExtractor только если нет нормализованных данных
             self.logger.warning(f"🔴 SIGNALS FALLBACK: No persons_core in normalization_result, falling back to PersonExtractor. normalization_result keys: {list(normalization_result.keys()) if normalization_result else 'None'}")
-            print(f"🔴 SIGNALS FALLBACK: No persons_core in normalization_result, falling back to PersonExtractor")
+            self.logger.debug(f"🔴 SIGNALS FALLBACK: No persons_core in normalization_result, falling back to PersonExtractor")
             persons_core = self.person_extractor.extract(text, language)
 
         # Ensure persons_core is not None
@@ -286,6 +278,11 @@ class SignalsService:
         """Проверяет является ли токен валидным для персоны (не stopword/payment context)."""
         if not token or len(token) < 2:
             return False
+
+        # Initials already retained by name normalization distinguish people with
+        # the same surname. Dropping them also loses their source-name association.
+        if len(token) == 2 and token[0].isalpha() and token[0].isupper() and token[1] == ".":
+            return True
 
         token_lower = token.lower()
 
@@ -313,8 +310,15 @@ class SignalsService:
         if self._looks_like_person_name(token, language):
             return True
 
-        # Если не определили как имя, проверяем базовые характеристики
-        return len(token) >= 3 and token[0].isupper() and token[1:].islower()
+        # A normalized compound can capitalize each hyphen/apostrophe segment.
+        # Requiring the entire tail to be lowercase discards names such as
+        # Smith-Jones and O'Connor after normalization has already accepted them.
+        parts = re.split(r"[-'’]", token)
+        return len(token) >= 3 and all(
+            part.isalpha() and part[0].isupper()
+            and (len(part) == 1 or part[1:].islower())
+            for part in parts
+        )
 
     def _looks_like_person_name(self, token: str, language: str) -> bool:
         """Проверяет похож ли токен на имя человека."""
@@ -363,6 +367,26 @@ class SignalsService:
             )
             persons.append(person)
         return persons
+
+    @staticmethod
+    def _attach_source_names(persons, normalization_result):
+        """Keep original name forms for evidence ownership after inflection."""
+        if not normalization_result:
+            return
+        source_names = {}
+        for person in normalization_result.get("persons", []) or []:
+            if not isinstance(person, dict):
+                continue
+            normalized = person.get("tokens", [])
+            original = person.get("original_tokens", [])
+            if (not isinstance(normalized, list) or not isinstance(original, list)
+                    or not normalized or not original
+                    or not all(isinstance(token, str) for token in [*normalized, *original])):
+                continue
+            key = tuple(token.casefold() for token in normalized)
+            source_names.setdefault(key, set()).add(" ".join(original))
+        for person in persons:
+            person.source_names = sorted(source_names.get(tuple(token.casefold() for token in person.core), set()))
 
     def _create_organization_signals(
         self, text: str, organizations_core: List[str], persons_core: List[List[str]]
@@ -483,19 +507,25 @@ class SignalsService:
         all_person_ids = trace_ids.get('person_ids', []) + person_ids
 
         # 4. Удаляем дубликаты по значению
-        unique_org_ids = self._deduplicate_ids(all_org_ids)
-        unique_person_ids = self._deduplicate_ids(all_person_ids)
+        unique_org_ids = self._deduplicate_ids(all_org_ids, text)
+        unique_person_ids = self._deduplicate_ids(all_person_ids, text)
 
         self.logger.debug(f"[CHECK] ID ENRICHMENT: Found {len(unique_person_ids)} person IDs, {len(unique_org_ids)} org IDs")
         if unique_person_ids:
             self.logger.debug(f"[CHECK] PERSON IDS: {[(p.get('type'), p.get('value'), p.get('source')) for p in unique_person_ids[:3]]}")
 
-        # 5. Обогащаем персон и организации ID
-        self._enrich_organizations_with_ids(organizations, unique_org_ids)
-        self._enrich_persons_with_ids(persons, unique_person_ids)
-
-        # 6. FAST PATH: Проверяем INN cache для быстрого обнаружения санкций (после обогащения ID)
-        self._check_sanctioned_inn_cache(unique_person_ids, unique_org_ids, persons, organizations)
+        unassigned = []
+        all_entities = [*persons, *organizations]
+        all_ids = self._deduplicate_ids(unique_person_ids + unique_org_ids, text)
+        for id_info in all_ids:
+            owner = evidence_owner(all_entities, id_info, text)
+            eligible = unique_person_ids if isinstance(owner, PersonSignal) else unique_org_ids
+            if owner is not None and id_info in eligible:
+                self._assign_id_to_person(owner, id_info)
+            else:
+                unassigned.append(id_info)
+        # Identifier lookup belongs to screening. Never attach a hit to the first entity.
+        return unassigned
 
     def _enrich_with_birthdates(self, text: str, persons: List[PersonSignal]):
         """Обогащает персоны найденными датами рождения."""
@@ -848,199 +878,26 @@ class SignalsService:
 
         return extract_birthdates_from_text(text)
 
-    def _enrich_organizations_with_ids(
-        self, organizations: List[OrganizationSignal], org_ids: List[Dict]
-    ):
-        """Обогащение организаций найденными ID"""
-        if not org_ids:
-            return
+    def _enrich_organizations_with_ids(self, organizations, org_ids, text=""):
+        for id_info in org_ids:
+            owner = evidence_owner(organizations, id_info, text)
+            if owner is not None:
+                self._assign_id_to_person(owner, id_info)
 
-        for org in organizations:
-            # Ищем релевантные ID для этой организации
-            for id_info in org_ids:
-                # Простая эвристика: добавляем все найденные организационные ID
-                # В будущем можно добавить более сложную логику связывания
-                org.ids.append(
-                    {
-                        "type": id_info["type"],
-                        "value": id_info["value"],
-                        "raw": id_info["raw"],
-                        "confidence": id_info["confidence"],
-                        "valid": id_info["valid"],
-                    }
-                )
+    def _enrich_persons_with_ids(self, persons, person_ids, text=""):
+        self._link_ids_to_persons_by_proximity(persons, person_ids, text)
 
-                # Добавляем evidence (скоринг будет в _score_entities)
-                if id_info["valid"]:
-                    org.evidence.append(f"valid_{id_info['type']}")
-                else:
-                    org.evidence.append(f"invalid_{id_info['type']}")
-
-    def _enrich_persons_with_ids(
-        self, persons: List[PersonSignal], person_ids: List[Dict]
-    ):
-        """Обогащение персон найденными ID с proximity matching"""
-        if not person_ids or not persons:
-            return
-
-        # Используем proximity matching аналогично логике для дат рождения
-        self._link_ids_to_persons_by_proximity(persons, person_ids, self._current_text)
-
-    def _link_ids_to_persons_by_proximity(
-        self, persons: List[PersonSignal], person_ids: List[Dict], text: str
-    ):
-        """Связывание ID с персонами на основе близости в тексте"""
-        if not person_ids or not persons or not text:
-            return
-
-        # Check if text is mixed language for more lenient proximity matching
-        is_mixed_language = self._is_mixed_language_text(text)
-
-        # Найдем позиции всех персон в тексте для proximity matching
-        person_positions = []
-        for person in persons:
-            # Составляем полное имя для поиска
-            full_name = " ".join(person.core)
-
-            # Ищем все вхождения имени в тексте
-            import re
-
-            name_pattern = re.escape(full_name)
-            matches = list(re.finditer(name_pattern, text, re.IGNORECASE))
-
-            if matches:
-                # Берем первое вхождение как основную позицию
-                start_pos = matches[0].start()
-                end_pos = matches[0].end()
-                person_positions.append(
-                    {
-                        "person": person,
-                        "start": start_pos,
-                        "end": end_pos,
-                        "center": (start_pos + end_pos) // 2,
-                    }
-                )
-
-        # Ассоциируем каждый ID с ближайшей персоной
-        used_ids = set()
-
+    def _link_ids_to_persons_by_proximity(self, persons, person_ids, text):
         for id_info in person_ids:
-            if "position" not in id_info:
-                # Если позиция ID не указана, добавляем ко всем персонам
-                # (fallback для совместимости)
-                self._assign_id_to_all_persons(persons, id_info)
-                continue
-
-            id_start = id_info["position"][0]
-            id_end = id_info["position"][1]
-            id_center = (id_start + id_end) // 2
-
-            # Находим ближайшую персону
-            closest_person = None
-            min_distance = float("inf")
-
-            for person_pos in person_positions:
-                # Проверяем, что ID не был использован
-                id_key = f"{id_info['type']}_{id_info['value']}"
-                if id_key in used_ids:
-                    continue
-
-                person_center = person_pos["center"]
-
-                # Вычисляем расстояние между центрами
-                distance = abs(id_center - person_center)
-
-                # Для смешанного языка увеличиваем максимальное расстояние
-                max_distance = 500 if is_mixed_language else 300
-                
-                # Ограичиваем максимальным расстоянием
-                # (больше для смешанного языка, т.к. ID могут быть в другой части текста)
-                if distance < max_distance and distance < min_distance:
-                    min_distance = distance
-                    closest_person = person_pos["person"]
-
-                    self.logger.debug(
-                        f"ID {id_info['type']}:{id_info['value']} distance {distance} to person "
-                        f"{''.join(person_pos['person'].core)} (new closest)"
-                    )
-
-            # Назначаем ID ближайшей персоне
-            if closest_person:
-                id_key = f"{id_info['type']}_{id_info['value']}"
-                if id_key not in used_ids:
-                    # Дополнительная проверка: если персона уже имеет ID того же типа,
-                    # это может быть признаком ошибки или наличия нескольких сущностей
-                    existing_id_types = {existing_id["type"] for existing_id in closest_person.ids}
-
-                    if id_info["type"] in existing_id_types:
-                        self.logger.debug(
-                            f"Person {''.join(closest_person.core)} already has ID of type "
-                            f"{id_info['type']}, possible multiple entities"
-                        )
-                        # Не назначаем дублирующий тип ID той же персоне
-                        # Это ID останется для fallback логики
-                    else:
-                        self._assign_id_to_person(closest_person, id_info)
-                        used_ids.add(id_key)
-
-                        self.logger.debug(
-                            f"Linked ID {id_info['type']}:{id_info['value']} to person "
-                            f"{''.join(closest_person.core)} (distance: {min_distance})"
-                        )
-
-        # Если остались персоны без ID, но есть неиспользованные ID,
-        # применяем fallback логику для оставшихся ID
-        remaining_ids = [
-            id_info for id_info in person_ids
-            if f"{id_info['type']}_{id_info['value']}" not in used_ids
-        ]
-
-        if remaining_ids:
-            self.logger.debug(f"Applying fallback logic for {len(remaining_ids)} unlinked IDs")
-
-            # Применяем консервативную fallback логику в ограниченных случаях:
-            # 1. Если персон без ID больше чем ID (более вероятно правильное распределение) И
-            #    количество ID не превышает количество персон
-            # 2. Или если у нас простая ситуация: 1 персона, 1 ID, и расстояние не экстремальное
-            persons_without_ids = [p for p in persons if not p.ids]
-
-            # Для случая 1 персона + 1 ID проверяем расстояние
-            can_apply_single_fallback = True
-            if len(persons_without_ids) == 1 and len(remaining_ids) == 1:
-                id_info = remaining_ids[0]
-                if "position" in id_info and person_positions:
-                    person_pos = person_positions[0]  # Единственная персона
-                    id_center = (id_info["position"][0] + id_info["position"][1]) // 2
-                    person_center = person_pos["center"]
-                    distance = abs(id_center - person_center)
-
-                    # Если расстояние экстремально большое (>500), не применяем fallback
-                    if distance > 500:
-                        can_apply_single_fallback = False
-                        self.logger.debug(
-                            f"Skipping single fallback: distance {distance} > 500 chars"
-                        )
-
-            # Условие 1: Персон строго больше чем ID (можно назначить все ID персонам)
-            # Условие 2: Простой случай 1:1 с подходящим расстоянием
-            if ((len(persons_without_ids) > len(remaining_ids) and len(remaining_ids) > 0) or
-                (len(persons_without_ids) == 1 and len(remaining_ids) == 1 and can_apply_single_fallback)):
-
-                # Добавляем оставшиеся ID к персонам без ID (по одному на персону)
-                for i, id_info in enumerate(remaining_ids):
-                    if i < len(persons_without_ids):
-                        self._assign_id_to_person(persons_without_ids[i], id_info)
-                        self.logger.debug(f"Fallback: assigned ID {id_info['type']}:{id_info['value']} to person")
-            else:
-                # Слишком рискованно назначать ID - возможно, они действительно не связаны
-                # Например: 1 персона и 2+ ID - неясно, какие ID принадлежат персоне
-                self.logger.debug(
-                    f"Skipping fallback assignment: {len(remaining_ids)} remaining IDs, "
-                    f"{len(persons_without_ids)} persons without IDs"
-                )
+            owner = evidence_owner(persons, id_info, text)
+            if owner is not None:
+                self._assign_id_to_person(owner, id_info)
 
     def _assign_id_to_person(self, person: PersonSignal, id_info: Dict):
         """Присваивает ID конкретной персоне"""
+        if any(existing["type"] == id_info["type"] and existing["value"] == id_info["value"]
+               for existing in person.ids):
+            return
         person.ids.append(
             {
                 "type": id_info["type"],
@@ -1048,6 +905,7 @@ class SignalsService:
                 "raw": id_info["raw"],
                 "confidence": id_info["confidence"],
                 "valid": id_info["valid"],
+                "position": id_info.get("position"),
             }
         )
 
@@ -1057,89 +915,22 @@ class SignalsService:
         else:
             person.evidence.append(f"invalid_{id_info['type']}")
 
-    def _assign_id_to_all_persons(self, persons: List[PersonSignal], id_info: Dict):
-        """Fallback: присваивает ID всем персонам (старая логика)"""
-        for person in persons:
-            self._assign_id_to_person(person, id_info)
-
-    def _enrich_persons_with_birthdates(
-        self, persons: List[PersonSignal], birthdates: List[Dict], text: str
-    ):
-        """Обогащение персон найденными датами рождения на основе близости в тексте"""
-        if not birthdates or not persons:
-            return
-
-        # Найдем позиции всех персон в тексте для proximity matching
-        person_positions = []
-        for person in persons:
-            # Составляем полное имя для поиска
-            full_name = " ".join(person.core)
-
-            # Ищем все вхождения имени в тексте
-            import re
-
-            name_pattern = re.escape(full_name)
-            matches = list(re.finditer(name_pattern, text, re.IGNORECASE))
-
-            if matches:
-                # Берем первое вхождение как основную позицию
-                start_pos = matches[0].start()
-                end_pos = matches[0].end()
-                person_positions.append(
-                    {
-                        "person": person,
-                        "start": start_pos,
-                        "end": end_pos,
-                        "center": (start_pos + end_pos) // 2,
-                    }
-                )
-
-        # Ассоциируем каждую дату рождения с ближайшей персоной
-        used_birthdates = set()
-
+    def _enrich_persons_with_birthdates(self, persons, birthdates, text):
+        assignments = {}
         for date_info in birthdates:
-            date_start = date_info["position"][0]
-            date_end = date_info["position"][1]
-            date_center = (date_start + date_end) // 2
-
-            # Находим ближайшую персону
-            closest_person = None
-            min_distance = float("inf")
-
-            for person_pos in person_positions:
-                # Проверяем, что дата не была использована
-                if date_info["raw"] in used_birthdates:
-                    continue
-
-                person_center = person_pos["center"]
-
-                # Вычисляем расстояние между центрами
-                distance = abs(date_center - person_center)
-
-                # Дополнительно учитываем, находится ли дата в "разумном" диапазоне от персоны
-                # Ограничиваем максимальным расстоянием в 200 символов
-                if distance < 200 and distance < min_distance:
-                    min_distance = distance
-                    closest_person = person_pos["person"]
-
-            # Назначаем дату ближайшей персоне
-            if closest_person and date_info["raw"] not in used_birthdates:
-                closest_person.dob = date_info["iso_format"]  # ISO формат YYYY-MM-DD
-                closest_person.dob_raw = date_info["raw"]  # Исходный текст
-                closest_person.evidence.append("birthdate_found")
-                used_birthdates.add(date_info["raw"])
-
-        # Если остались персоны без дат, но есть неиспользованные даты,
-        # назначаем их в порядке появления в тексте
-        remaining_dates = [d for d in birthdates if d["raw"] not in used_birthdates]
-        persons_without_dates = [p for p in persons if not p.dob]
-
-        for i, person in enumerate(persons_without_dates):
-            if i < len(remaining_dates):
-                date_info = remaining_dates[i]
-                person.dob = date_info["iso_format"]
-                person.dob_raw = date_info["raw"]
-                person.evidence.append("birthdate_found")
+            owner = evidence_owner(persons, date_info, text, max_distance=200)
+            if owner is not None:
+                assignments.setdefault(id(owner), (owner, []))[1].append(date_info)
+        for owner, values in assignments.values():
+            distinct = {value["iso_format"] for value in values}
+            if len(distinct) == 1:
+                owner.dob = values[0]["iso_format"]
+                owner.dob_raw = values[0]["raw"]
+                owner.dob_position = values[0].get("position")
+                owner.evidence.append("birthdate_found")
+            else:
+                owner.dob = owner.dob_raw = owner.dob_position = None
+                owner.evidence.append("conflicting_birthdates")
 
     def _score_entities(
         self, persons: List[PersonSignal], organizations: List[OrganizationSignal]
@@ -1234,6 +1025,7 @@ class SignalsService:
             "full_name": person.full_name,
             "dob": person.dob,
             "dob_raw": person.dob_raw,
+            "dob_position": person.dob_position,
             "ids": person.ids,
             "confidence": person.confidence,
             "evidence": person.evidence,
@@ -1367,6 +1159,8 @@ class SignalsService:
                 for org in self.organizations:
                     if hasattr(org, 'ids') and org.ids:
                         all_ids.extend(org.ids)
+
+                all_ids.extend(result_dict.get("extras", {}).get("unassigned_ids", []))
 
                 # Organize IDs by type
                 for id_item in all_ids:
@@ -1560,8 +1354,10 @@ class SignalsService:
                 if token_text and token_text.isdigit():
                     # Найдем позицию токена в исходном тексте
                     import re
-                    matches = list(re.finditer(re.escape(token_text), text))
-                    position = matches[0].span() if matches else (0, len(token_text))
+                    matches = list(re.finditer(r"(?<!\d)" + re.escape(token_text) + r"(?!\d)", text))
+                    if len(matches) != 1:
+                        continue  # Regex extraction retains real per-occurrence spans.
+                    position = matches[0].span()
 
                     # Определяем тип ID на основе длины и контекста
                     id_length = len(token_text)
@@ -1574,7 +1370,7 @@ class SignalsService:
                         "name": f"Numeric ID ({id_length} digits)",
                         "confidence": 0.95,  # Высокая уверенность - найдено нормализацией
                         "position": position,
-                        "valid": True,
+                        "valid": False,  # A numeric token has not passed identifier validation.
                         "source": "normalization_trace"  # Отметка что из trace
                     }
 
@@ -1599,8 +1395,8 @@ class SignalsService:
                     inn_found = False
                     for match in inn_matches:
                         inn_value = match.group(1)
-                        if inn_value == token_text or len(token_text) == 10:  # ИНН 2839403975 имеет 10 цифр
-                            position = match.span(1)  # Позиция только цифр
+                        if inn_value == token_text:
+                            position = match.span()  # Span and raw both include the marker.
 
                             # Создаем ID для ИНН с правильной валидацией
                             is_valid = validate_inn(inn_value)
@@ -1628,7 +1424,7 @@ class SignalsService:
         self.logger.debug(f"[CHECK] ID TRACE: Extracted {len(person_ids)} person IDs, {len(organization_ids)} org IDs from trace")
         return {'person_ids': person_ids, 'organization_ids': organization_ids}
 
-    def _deduplicate_ids(self, ids: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _deduplicate_ids(self, ids: List[Dict[str, Any]], text: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Удаляет дубликаты ID по значению, сохраняя приоритет trace > regex.
 
@@ -1644,7 +1440,18 @@ class SignalsService:
         # Группируем по значению
         id_groups = {}
         for id_info in ids:
-            value = id_info.get('value', '')
+            span = tuple(id_info.get('position') or ())
+            value_text = str(id_info.get('value', ''))
+            if text and value_text and len(span) == 2 and 0 <= span[0] < span[1] <= len(text):
+                # Regex evidence may include its label ("ИНН 123...") while
+                # normalization records only the digits. Both describe one
+                # source occurrence, not two independent identifiers.
+                view = SourceTextView.from_text(text[span[0]:span[1]])
+                matches = list(re.finditer(r"(?<!\w)" + re.escape(value_text) + r"(?!\w)", view.text))
+                if len(matches) == 1:
+                    local_start, local_end = view.original_span(*matches[0].span())
+                    span = (span[0] + local_start, span[0] + local_end)
+            value = (value_text, span)
             if value not in id_groups:
                 id_groups[value] = []
             id_groups[value].append(id_info)
@@ -1666,182 +1473,6 @@ class SignalsService:
             self.logger.debug(f"[CHECK] ID DEDUP: Selected {best_id.get('source', 'regex')} source for ID '{value}'")
 
         return unique_ids
-
-    def _check_sanctioned_inn_cache(
-        self,
-        person_ids: List[Dict[str, Any]],
-        org_ids: List[Dict[str, Any]],
-        persons: List[PersonSignal],
-        organizations: List[OrganizationSignal]
-    ):
-        """
-        FAST PATH: Проверяет ID в sanctioned INN cache и сразу помечает как matched.
-
-        Args:
-            person_ids: Список ID персон
-            org_ids: Список ID организаций
-            persons: Список персон для обогащения
-            organizations: Список организаций для обогащения
-        """
-        try:
-            from ...layers.search.sanctioned_inn_cache import get_inn_cache
-            inn_cache = get_inn_cache()
-
-            # Try to get metrics exporter, but don't fail if not available
-            metrics = None
-            try:
-                from ...monitoring.prometheus_exporter import get_exporter
-                metrics = get_exporter()
-            except Exception:
-                # Metrics not available, continue without them
-                pass
-
-            # Собираем все ID для проверки
-            all_ids_to_check = []
-
-            # Добавляем person IDs с правильной валидацией
-            self.logger.warning(f"[CHECK] FAST PATH INPUT: Processing {len(person_ids)} person IDs")
-            for idx, id_info in enumerate(person_ids):
-                id_value = id_info.get('value', '')
-                id_type = id_info.get('type', '')
-                is_valid = id_info.get('valid', None)
-                id_source = id_info.get('source', 'unknown')
-
-                self.logger.warning(
-                    f"[CHECK] FAST PATH [{idx+1}/{len(person_ids)}]: "
-                    f"value='{id_value}' type='{id_type}' valid={is_valid} source={id_source}"
-                )
-
-                if id_value and id_value.isdigit():
-                    # Для ИНН проверяем ВСЕ независимо от валидации
-                    # КРИТИЧНО: Даже невалидный ИНН может быть в санкционных списках!
-                    if id_type == 'inn' and len(id_value) in [10, 12]:
-                        # Добавляем в проверку ВСЕГДА, даже если формально невалидный
-                        all_ids_to_check.append((id_value, 'person', id_info))
-                        self.logger.warning(
-                            f"[OK] FAST PATH: Added INN for sanction check: {id_value} "
-                            f"(type: {id_type}, valid={is_valid}, will check anyway)"
-                        )
-                    # Для остальных типов ID проверяем по старой логике
-                    elif len(id_value) >= 10 and id_info.get('valid', True):
-                        all_ids_to_check.append((id_value, 'person', id_info))
-                        self.logger.debug(f"[INIT] FAST PATH: Added valid ID for sanction check: {id_value} (type: {id_type})")
-                    else:
-                        self.logger.warning(
-                            f"[WARN] FAST PATH SKIP: ID '{id_value}' not added "
-                            f"(type={id_type}, len={len(id_value)}, valid={is_valid})"
-                        )
-
-            # Добавляем org IDs
-            for id_info in org_ids:
-                id_value = id_info.get('value', '')
-                if id_value and id_value.isdigit() and len(id_value) >= 8:  # Минимальная длина для ЄДРПОУ
-                    all_ids_to_check.append((id_value, 'org', id_info))
-
-            if not all_ids_to_check:
-                return
-
-            self.logger.warning(f"[INIT] FAST PATH: Checking {len(all_ids_to_check)} IDs against sanctions cache")
-            if all_ids_to_check:
-                self.logger.warning(f"[INIT] FAST PATH: IDs to check: {[(id_value, entity_type, id_info.get('type', 'unknown')) for id_value, entity_type, id_info in all_ids_to_check[:5]]}")
-            else:
-                self.logger.warning("[INIT] FAST PATH: No IDs to check - this is the problem!")
-
-            # Проверяем каждый ID в cache
-            sanctioned_matches = 0
-            for id_value, entity_type, id_info in all_ids_to_check:
-                sanctioned_data = inn_cache.lookup(id_value)
-
-                # Record cache lookup metrics
-                cache_hit = sanctioned_data is not None
-                if metrics:
-                    metrics.record_fast_path_cache_lookup(cache_hit)
-
-                if sanctioned_data:
-                    sanctioned_matches += 1
-                    self.logger.warning(
-                        f"🚨 FAST PATH SANCTION HIT: {id_value} -> {sanctioned_data.get('name', 'Unknown')} "
-                        f"(type: {sanctioned_data.get('type', 'unknown')})"
-                    )
-
-                    # Обогащаем соответствующие сущности санкционной информацией
-                    if entity_type == 'person' and persons:
-                        self._enrich_person_with_sanctioned_data(persons[0], sanctioned_data, id_info)
-                    elif entity_type == 'org' and organizations:
-                        self._enrich_organization_with_sanctioned_data(organizations[0], sanctioned_data, id_info)
-
-            if sanctioned_matches > 0:
-                self.logger.warning(f"🚨 FAST PATH: Found {sanctioned_matches} sanctioned ID matches in cache")
-            else:
-                self.logger.debug("[OK] FAST PATH: No sanctions found in INN cache")
-
-        except ImportError:
-            self.logger.warning("INN cache not available - falling back to regular search")
-        except Exception as e:
-            self.logger.error(f"Error in sanctioned INN cache check: {e}")
-
-    def _enrich_person_with_sanctioned_data(
-        self, person: PersonSignal, sanctioned_data: Dict[str, Any], id_info: Dict[str, Any]
-    ):
-        """Обогащает персону санкционными данными из cache."""
-        id_value = id_info.get('value')
-
-        # Проверяем, есть ли уже такой ID у персоны
-        existing_id = None
-        for existing in person.ids:
-            if existing.get('value') == id_value:
-                existing_id = existing
-                break
-
-        if existing_id:
-            # Обновляем существующий ID санкционной информацией
-            existing_id['sanctioned'] = True
-            existing_id['sanctioned_name'] = sanctioned_data.get('name')
-            existing_id['sanctioned_source'] = sanctioned_data.get('source', 'sanctions_cache')
-            existing_id['confidence'] = 1.0  # Максимальная уверенность для точного совпадения
-            self.logger.warning(f"🚨 UPDATED existing ID {id_value} with sanctioned flag")
-        else:
-            # Добавляем новый ID к персоне с санкционной пометкой
-            sanctioned_id = {
-                **id_info,
-                'sanctioned': True,
-                'sanctioned_name': sanctioned_data.get('name'),
-                'sanctioned_source': sanctioned_data.get('source', 'sanctions_cache'),
-                'confidence': 1.0  # Максимальная уверенность для точного совпадения
-            }
-            person.ids.append(sanctioned_id)
-            self.logger.warning(f"🚨 ADDED new sanctioned ID {id_value}")
-
-        # Обогащаем evidence
-        person.evidence.append(f"sanctioned_inn_cache_hit_{id_value}")
-
-        # Повышаем confidence персоны
-        person.confidence = max(person.confidence, 0.95)
-
-        self.logger.warning(f"🚨 Enriched person '{person.full_name}' with sanctioned INN {id_value} -> {sanctioned_data.get('name')}")
-
-    def _enrich_organization_with_sanctioned_data(
-        self, org: OrganizationSignal, sanctioned_data: Dict[str, Any], id_info: Dict[str, Any]
-    ):
-        """Обогащает организацию санкционными данными из cache."""
-        # Добавляем ID к организации с санкционной пометкой
-        sanctioned_id = {
-            **id_info,
-            'sanctioned': True,
-            'sanctioned_name': sanctioned_data.get('name'),
-            'sanctioned_source': sanctioned_data.get('source', 'sanctions_cache'),
-            'confidence': 1.0  # Максимальная уверенность для точного совпадения
-        }
-
-        org.ids.append(sanctioned_id)
-
-        # Обогащаем evidence
-        org.evidence.append(f"sanctioned_inn_cache_hit_{id_info.get('value')}")
-
-        # Повышаем confidence организации
-        org.confidence = max(org.confidence, 0.95)
-
-        self.logger.debug(f"Enriched organization '{org.core}' with sanctioned INN data")
 
     def _is_mixed_language_text(self, text: str) -> bool:
         """

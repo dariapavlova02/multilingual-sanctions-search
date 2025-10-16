@@ -8,7 +8,7 @@ across a wide range of inputs.
 
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
+from ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
 
 # Configure Hypothesis settings for CI
 settings.register_profile("ci", suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=200)

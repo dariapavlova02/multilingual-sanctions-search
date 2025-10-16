@@ -27,10 +27,10 @@ class TestMainEndpoints:
         with patch('ai_service.main.orchestrator', None):
             response = self.client.get("/health")
 
-            assert response.status_code == 200
+            assert response.status_code == 503
             data = response.json()
             assert data["status"] == "initializing"
-            assert data["orchestrator"]["initialized"] is False
+            assert data["service"] == "AI Service"
 
     def test_health_check_with_orchestrator(self):
         """Test health check when orchestrator is initialized"""
@@ -41,7 +41,8 @@ class TestMainEndpoints:
             "services": {"normalization": "ready", "embeddings": "ready"}
         }
 
-        mock_orchestrator = Mock()
+        from tests.unit.api.test_runtime_health import healthy_runtime
+        mock_orchestrator = healthy_runtime()
         mock_orchestrator.get_processing_stats.return_value = mock_stats
 
         with patch('ai_service.main.orchestrator', mock_orchestrator):
@@ -50,10 +51,8 @@ class TestMainEndpoints:
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "healthy"
-            assert data["orchestrator"]["initialized"] is True
-            assert data["orchestrator"]["processed_total"] == 100
-            assert data["orchestrator"]["success_rate"] == 0.95
-            assert data["orchestrator"]["cache_hit_rate"] == 0.85
+            assert data["service"] == "AI Service"
+            mock_orchestrator.get_processing_stats.assert_not_called()
 
     def test_process_text_endpoint_success(self):
         """Test successful text processing endpoint"""
@@ -133,14 +132,14 @@ class TestMainEndpoints:
             assert data["embedding"] is None  # No embeddings requested
 
             # Verify orchestrator was called correctly
-            mock_orchestrator.process.assert_called_once_with(
-                text="ООО Ромашка, Иван Иванов",
-                generate_variants=True,
-                generate_embeddings=False,
-                remove_stop_words=True,
-                preserve_names=True,
-                enable_advanced_features=True
-            )
+            call = mock_orchestrator.process.await_args.kwargs
+            assert call["text"] == "ООО Ромашка, Иван Иванов"
+            assert call["generate_variants"] is True
+            assert call["generate_embeddings"] is False
+            assert call["remove_stop_words"] is True
+            assert call["preserve_names"] is True
+            assert call["enable_advanced_features"] is True
+            assert call["feature_flags"] is not None
 
     def test_process_text_no_orchestrator(self):
         """Test process endpoint when orchestrator not initialized"""
@@ -264,14 +263,14 @@ class TestMainEndpoints:
             assert data["processing_time"] == 0.02
 
             # Should call process with variants/embeddings disabled
-            mock_orchestrator.process.assert_called_once_with(
-                text="Иван Иванов",
-                generate_variants=False,
-                generate_embeddings=False,
-                remove_stop_words=False,
-                preserve_names=True,
-                enable_advanced_features=True
-            )
+            call = mock_orchestrator.process.await_args.kwargs
+            assert call["text"] == "Иван Иванов"
+            assert call["generate_variants"] is False
+            assert call["generate_embeddings"] is False
+            assert call["remove_stop_words"] is False
+            assert call["preserve_names"] is True
+            assert call["enable_advanced_features"] is True
+            assert call["feature_flags"] is not None
 
     def test_process_batch_endpoint_success(self):
         """Test successful batch processing endpoint"""
@@ -289,7 +288,11 @@ class TestMainEndpoints:
         )
 
         mock_orchestrator = AsyncMock()
-        mock_orchestrator.process_batch.return_value = [mock_result, mock_result]
+        from dataclasses import replace
+        mock_orchestrator.process_batch.return_value = [
+            replace(mock_result, original_text="text one"),
+            replace(mock_result, original_text="text two"),
+        ]
 
         request_data = {
             "texts": ["text one", "text two"],
@@ -357,33 +360,72 @@ class TestMainEndpoints:
             assert data["results"][0]["similarity"] == 0.95
             assert data["results"][1]["similarity"] == 0.87
 
+    def test_search_endpoint_runs_full_pipeline(self):
+        """The public search endpoint must not take the normalization fast path."""
+        search_result = UnifiedProcessingResult(
+            original_text="Ivan Petrov",
+            language="en",
+            language_confidence=0.99,
+            normalized_text="ivan petrov",
+            search_results={
+                "query": "ivan petrov",
+                "results": [{"doc_id": "person-1", "score": 0.97}],
+                "total_hits": 1,
+                "search_type": "hybrid",
+                "processing_time_ms": 12.0,
+            },
+        )
+        mock_orchestrator = Mock()
+        mock_orchestrator.search_service = object()
+        mock_orchestrator.process = AsyncMock(return_value=search_result)
+
+        with patch("ai_service.main.orchestrator", mock_orchestrator):
+            response = self.client.post(
+                "/search",
+                json={"query": "Ivan Petrov", "search_mode": "hybrid", "top_k": 5},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["total_hits"] == 1
+        assert response.json()["normalized_query"] == "ivan petrov"
+        call = mock_orchestrator.process.await_args.kwargs
+        assert call["force_full_pipeline"] is True
+        assert call["search_options"].top_k == 5
+
+    def test_search_endpoint_rejects_blank_query(self):
+        response = self.client.post("/search", json={"query": "   "})
+        assert response.status_code == 422
+
     @pytest.mark.asyncio
-    async def test_startup_event_success(self):
+    async def test_startup_event_success(self, monkeypatch):
         """Test successful startup event"""
-        mock_orchestrator = AsyncMock()
+        from tests.unit.api.test_runtime_health import healthy_runtime
+        mock_orchestrator = healthy_runtime()
+        mock_orchestrator.enable_search = False
+        monkeypatch.setattr('ai_service.main.orchestrator', None)
 
         with patch('ai_service.main.OrchestratorFactory') as mock_factory:
-            with patch('ai_service.main.check_spacy_models', return_value=True):
-                mock_factory.create_production_orchestrator = AsyncMock(return_value=mock_orchestrator)
+            mock_factory.create_production_orchestrator = AsyncMock(return_value=mock_orchestrator)
 
-                from ai_service.main import startup_event
-                await startup_event()
+            from ai_service.main import startup_event
+            await startup_event()
 
-                mock_factory.create_production_orchestrator.assert_called_once()
+            mock_factory.create_production_orchestrator.assert_called_once()
+            mock_orchestrator.normalization_service.initialize_runtime.assert_awaited_once()
+            mock_orchestrator.embeddings_service.initialize_runtime.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_startup_event_failure(self):
         """Test startup event with initialization failure"""
         with patch('ai_service.main.OrchestratorFactory') as mock_factory:
-            with patch('ai_service.main.check_spacy_models', return_value=True):
-                mock_factory.create_production_orchestrator.side_effect = Exception("Init failed")
+            mock_factory.create_production_orchestrator.side_effect = Exception("Init failed")
 
-                from ai_service.main import startup_event
+            from ai_service.main import startup_event
 
-                with pytest.raises(Exception) as exc_info:
-                    await startup_event()
+            with pytest.raises(Exception) as exc_info:
+                await startup_event()
 
-                assert "Init failed" in str(exc_info.value)
+            assert "Init failed" in str(exc_info.value)
 
     def test_admin_status_endpoint_unauthorized(self):
         """Test admin status without proper authentication"""
@@ -395,14 +437,15 @@ class TestMainEndpoints:
         headers = {"Authorization": "Bearer invalid-token"}
 
         with patch('ai_service.main.SECURITY_CONFIG') as mock_config:
-            mock_config.admin_api_key = "valid-token"
+            mock_config.admin_api_key = "v" * 32
 
             response = self.client.get("/admin/status", headers=headers)
             assert response.status_code == 401
 
     def test_admin_status_endpoint_success(self):
         """Test admin status with valid token"""
-        headers = {"Authorization": "Bearer valid-admin-token"}
+        valid_token = "v" * 32
+        headers = {"Authorization": f"Bearer {valid_token}"}
 
         mock_orchestrator = Mock()
         mock_stats = {
@@ -415,7 +458,7 @@ class TestMainEndpoints:
 
         with patch('ai_service.main.SECURITY_CONFIG') as mock_config:
             with patch('ai_service.main.orchestrator', mock_orchestrator):
-                mock_config.admin_api_key = "valid-admin-token"
+                mock_config.admin_api_key = valid_token
 
                 response = self.client.get("/admin/status", headers=headers)
 
@@ -423,6 +466,23 @@ class TestMainEndpoints:
                 data = response.json()
                 assert "detailed_stats" in data
                 assert data["detailed_stats"]["total_processed"] == 1000
+
+    def test_admin_router_requires_authentication(self):
+        """All routes mounted from the admin router must be protected."""
+        response = self.client.get("/admin/loading-status")
+        assert response.status_code == 403
+
+    def test_admin_router_accepts_valid_token(self):
+        """A configured administrator can access read-only admin state."""
+        valid_token = "a" * 32
+        with patch("ai_service.main.SECURITY_CONFIG") as mock_config:
+            mock_config.admin_api_key = valid_token
+            response = self.client.get(
+                "/admin/loading-status",
+                headers={"Authorization": f"Bearer {valid_token}"},
+            )
+
+        assert response.status_code == 200
 
     def test_cors_configuration(self):
         """Test CORS middleware configuration"""

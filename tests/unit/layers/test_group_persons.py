@@ -9,7 +9,7 @@ in text and applies gender inference and surname adjustment to each person.
 import pytest
 from typing import List, Dict, Any
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestGroupPersons:

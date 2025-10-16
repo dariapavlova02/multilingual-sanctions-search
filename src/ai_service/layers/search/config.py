@@ -7,24 +7,64 @@ helpers to load settings from environment variables or YAML files.
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from ...config.env_values import parse_boolean
 
 
-class ElasticsearchConfig(BaseModel):
+def _configuration_mapping(value, name):
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a configuration mapping")
+    return dict(value)
+
+
+def _translate_configuration_aliases(value):
+    payload = _configuration_mapping(value, "search")
+    aliases = {
+        "elasticsearch": {"es_hosts": "hosts", "es_timeout": "timeout",
+            "es_username": "username", "es_password": "password", "es_api_key": "api_key",
+            "es_ca_certs": "ca_certs", "enable_ssl_verification": "verify_certs"},
+        "vector_search": {"vector_dimension": "vector_dimension",
+            "vector_similarity_threshold": "similarity_threshold"},
+    }
+    for section, fields in aliases.items():
+        nested = payload.get(section, {})
+        if isinstance(nested, BaseModel):
+            nested = nested.model_dump(mode="python")
+        nested = _configuration_mapping(nested, section)
+        for alias, canonical in fields.items():
+            if alias not in payload:
+                continue
+            supplied = payload.pop(alias)
+            if canonical in nested and nested[canonical] != supplied:
+                label = "vector" if section == "vector_search" else "connection"
+                raise ValueError(f"Conflicting {label} configuration: {alias}")
+            nested[canonical] = supplied
+        if nested or section in payload:
+            payload[section] = nested
+    return payload
+
+
+class SearchConfigurationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_default=True, hide_input_in_errors=True)
+
+
+class ElasticsearchConfig(SearchConfigurationModel):
     """Elasticsearch connection configuration"""
 
     # Connection settings
     hosts: List[str] = Field(default=["localhost:9200"], description="Elasticsearch hosts")
     username: Optional[str] = Field(default=None, description="Elasticsearch username")
-    password: Optional[str] = Field(default=None, description="Elasticsearch password")
-    api_key: Optional[str] = Field(default=None, description="Elasticsearch API key")
+    password: Optional[str] = Field(default=None, repr=False, description="Elasticsearch password")
+    api_key: Optional[str] = Field(default=None, repr=False, description="Elasticsearch API key")
     ca_certs: Optional[str] = Field(default=None, description="Path to CA certificates")
     verify_certs: bool = Field(default=True, description="Verify SSL certificates")
-    scheme: Optional[str] = Field(default=None, description="Explicit connection scheme (http/https)")
+    scheme: Optional[Literal["http", "https"]] = Field(default=None, description="Explicit connection scheme (http/https)")
 
     # Connection pool settings
     max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retry attempts")
@@ -35,19 +75,25 @@ class ElasticsearchConfig(BaseModel):
 
     # Index settings
     default_index: str = Field(default="watchlist", description="Default index name")
-    ac_index: str = Field(default="ai_service_ac_patterns", description="AC search index name")
-    vector_index: str = Field(default="vectors", description="Vector search index name")
+    ac_index: str = Field(default="sanctions_ac_patterns", description="AC search index name")
+    vector_index: str = Field(default="sanctions_vectors", description="Vector search index name")
     
     @field_validator("hosts")
     @classmethod
     def validate_hosts(cls, v):
-        """Validate hosts format"""
-        if not v:
-            raise ValueError("At least one host must be specified")
-        for host in v:
-            if ":" not in host and not host.startswith("http"):
-                raise ValueError(f"Host must include port or scheme: {host}")
-        return v
+        from ...config.elasticsearch_hosts import validate_elasticsearch_hosts
+        return validate_elasticsearch_hosts(v)
+
+    @model_validator(mode="after")
+    def validate_credentials(self):
+        has_basic = self.username is not None or self.password is not None
+        if has_basic and (not self.username or not self.username.strip() or not self.password):
+            raise ValueError("Elasticsearch basic authentication requires username and password")
+        if self.api_key is not None and not self.api_key.strip():
+            raise ValueError("Elasticsearch API key cannot be empty")
+        if has_basic and self.api_key is not None:
+            raise ValueError("Configure either Elasticsearch basic authentication or an API key")
+        return self
 
     def normalized_hosts(self) -> List[str]:
         """Return hosts with explicit scheme."""
@@ -62,10 +108,6 @@ class ElasticsearchConfig(BaseModel):
             normalized.append(f"{base_scheme}://{host.strip('/')}".rstrip("/"))
         return normalized
 
-    @staticmethod
-    def _parse_bool(value: str) -> bool:
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
     @classmethod
     def from_sources(
         cls,
@@ -75,34 +117,22 @@ class ElasticsearchConfig(BaseModel):
         """Create configuration from combined YAML/env sources."""
 
         env = dict(env or {})
-        payload: Dict[str, Any] = dict(data or {})
+        payload: Dict[str, Any] = {} if data is None else _configuration_mapping(data, "elasticsearch")
 
         # Environment overrides
-        if env.get("ES_HOSTS"):
-            payload["hosts"] = [h.strip() for h in env["ES_HOSTS"].split(",") if h.strip()]
-        elif env.get("ELASTICSEARCH_HOSTS"):
-            # Support ELASTICSEARCH_HOSTS for backward compatibility
-            hosts_str = env["ELASTICSEARCH_HOSTS"]
-            if hosts_str.startswith("http://") or hosts_str.startswith("https://"):
-                payload["hosts"] = [hosts_str.strip()]
-            else:
-                payload["hosts"] = [h.strip() for h in hosts_str.split(",") if h.strip()]
-        else:
-            # Auto-detect environment and set appropriate Elasticsearch host
-            import socket
-            import os
+        if "ES_HOSTS" in env:
+            payload["hosts"] = [h.strip() for h in env["ES_HOSTS"].split(",")]
+        elif "ELASTICSEARCH_HOSTS" in env:
+            payload["hosts"] = [h.strip() for h in env["ELASTICSEARCH_HOSTS"].split(",")]
+        elif "ELASTICSEARCH_HOST" in env or "ES_HOST" in env:
+            host = env["ELASTICSEARCH_HOST"] if "ELASTICSEARCH_HOST" in env else env["ES_HOST"]
+            port = env.get("ELASTICSEARCH_PORT") or env.get("ES_PORT", "9200")
+            payload["hosts"] = [host if ":" in host else f"{host}:{port}"]
+        # With no environment override, preserve YAML and model defaults.
 
-            try:
-                # First check if we're running in Docker (production)
-                if os.path.exists('/.dockerenv') or os.environ.get('APP_ENV') == 'production':
-                    # Inside Docker container - use service name for internal communication
-                    payload["hosts"] = ["http://elasticsearch:9200"]
-                else:
-                    # Local development - use localhost
-                    payload["hosts"] = ["http://localhost:9200"]
-            except Exception:
-                # Fallback for any detection issues
-                payload["hosts"] = ["http://localhost:9200"]
+        if env.get("ES_INDEX_PREFIX"):
+            payload["ac_index"] = f"{env['ES_INDEX_PREFIX']}_ac_patterns"
+            payload["vector_index"] = f"{env['ES_INDEX_PREFIX']}_vectors"
 
         str_overrides = {
             "username": "ES_USERNAME",
@@ -117,40 +147,43 @@ class ElasticsearchConfig(BaseModel):
         }
 
         for field_name, env_key in str_overrides.items():
-            if env_key in env and env[env_key]:
-                payload[field_name] = env[env_key]
+            if env_key in env:
+                if field_name in {"username", "password", "api_key", "ca_certs"}:
+                    payload[field_name] = env[env_key] or None
+                elif env[env_key] or env_key == "ES_SCHEME":
+                    payload[field_name] = env[env_key]
 
         int_overrides = {
             "timeout": "ES_TIMEOUT",
             "max_retries": "ES_MAX_RETRIES",
         }
         for field_name, env_key in int_overrides.items():
-            if env_key in env and env[env_key]:
+            if env_key in env:
                 try:
                     payload[field_name] = int(env[env_key])
                 except ValueError:
-                    raise ValueError(f"Invalid integer value for {env_key}: {env[env_key]}") from None
+                    raise ValueError(f"Invalid integer value for {env_key}") from None
 
         float_overrides = {"smoke_test_timeout": "ES_SMOKE_TEST_TIMEOUT"}
         for field_name, env_key in float_overrides.items():
-            if env_key in env and env[env_key]:
+            if env_key in env:
                 try:
                     payload[field_name] = float(env[env_key])
                 except ValueError:
-                    raise ValueError(f"Invalid float value for {env_key}: {env[env_key]}") from None
+                    raise ValueError(f"Invalid float value for {env_key}") from None
 
         bool_overrides = {
             "verify_certs": "ES_VERIFY_CERTS",
             "retry_on_timeout": "ES_RETRY_ON_TIMEOUT",
         }
         for field_name, env_key in bool_overrides.items():
-            if env_key in env and env[env_key]:
-                payload[field_name] = cls._parse_bool(env[env_key])
+            if env_key in env:
+                payload[field_name] = parse_boolean(env[env_key], name=env_key)
 
         return cls(**payload)
 
 
-class ACSearchConfig(BaseModel):
+class ACSearchConfig(SearchConfigurationModel):
     """AC (exact/almost-exact) search configuration"""
     
     # Search parameters
@@ -168,6 +201,16 @@ class ACSearchConfig(BaseModel):
         },
         description="Field weights for scoring"
     )
+
+    @field_validator("field_weights")
+    @classmethod
+    def validate_field_weights(cls, weights):
+        if not weights or not any(weight > 0 for weight in weights.values()):
+            raise ValueError("At least one positive AC field weight is required")
+        if any(not name.strip() or not math.isfinite(weight) or weight < 0
+               for name, weight in weights.items()):
+            raise ValueError("AC field weights must have names and finite nonnegative values")
+        return weights
     
     # Query settings
     enable_phrase_queries: bool = Field(default=True, description="Enable phrase queries")
@@ -179,7 +222,7 @@ class ACSearchConfig(BaseModel):
     tie_breaker: float = Field(default=0.3, ge=0.0, le=1.0, description="DisMax tie breaker")
 
 
-class VectorSearchConfig(BaseModel):
+class VectorSearchConfig(SearchConfigurationModel):
     """Vector (kNN) search configuration"""
     
     # Vector search parameters
@@ -200,9 +243,32 @@ class VectorSearchConfig(BaseModel):
     enable_reranking: bool = Field(default=True, description="Enable result reranking")
 
 
-class HybridSearchConfig(BaseModel):
+class HybridSearchConfig(SearchConfigurationModel):
     """Hybrid search configuration combining AC and Vector search"""
     
+    @model_validator(mode="before")
+    @classmethod
+    def translate_compatibility_fields(cls, value):
+        if not isinstance(value, dict):
+            return value
+        return _translate_configuration_aliases(value)
+
+    @classmethod
+    def validated_copy(cls, config=None):
+        if config is None:
+            return cls.from_env()
+        if not isinstance(config, cls):
+            raise TypeError("Expected HybridSearchConfig")
+        return cls.model_validate(config.model_dump(mode="python"))
+
+    @property
+    def vector_dimension(self):
+        return self.vector_search.vector_dimension
+
+    @property
+    def vector_similarity_threshold(self):
+        return self.vector_search.similarity_threshold
+
     # Service configuration
     service_name: str = Field(default="hybrid_search", description="Service name for logging")
     enable_logging: bool = Field(default=True, description="Enable detailed logging")
@@ -237,7 +303,7 @@ class HybridSearchConfig(BaseModel):
     max_concurrent_requests: int = Field(default=10, ge=1, le=100, description="Maximum concurrent requests")
     
     # Fallback settings
-    enable_fallback: bool = Field(default=True, description="Enable fallback to local indexes")
+    enable_fallback: bool = Field(default=True, description="Legacy compatibility flag; local fallback is disabled for screening")
     fallback_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="Score threshold for fallback")
     fallback_timeout_ms: int = Field(default=2000, ge=100, le=10000, description="Fallback search timeout in milliseconds")
     fallback_max_results: int = Field(default=100, ge=10, le=500, description="Maximum results from fallback search")
@@ -271,13 +337,7 @@ class HybridSearchConfig(BaseModel):
     query_cache_ttl_seconds: int = Field(default=3600, ge=60, le=86400, description="Query cache TTL in seconds")
     
     # Security settings
-    enable_elasticsearch_auth: bool = Field(default=False, description="Enable Elasticsearch authentication")
-    es_auth_type: str = Field(default="basic", description="Elasticsearch authentication type (basic, api_key, ssl)")
-    es_username: Optional[str] = Field(default=None, description="Elasticsearch username")
-    es_password: Optional[str] = Field(default=None, description="Elasticsearch password")
-    es_api_key: Optional[str] = Field(default=None, description="Elasticsearch API key")
-    es_ca_certs: Optional[str] = Field(default=None, description="Elasticsearch CA certificates path")
-    enable_ssl_verification: bool = Field(default=True, description="Enable SSL certificate verification")
+    # Connection credentials and TLS settings live only in `elasticsearch`.
     enable_audit_logging: bool = Field(default=False, description="Enable audit logging for search operations")
     enable_rate_limiting: bool = Field(default=False, description="Enable rate limiting for search requests")
     rate_limit_requests_per_minute: int = Field(default=100, ge=10, le=10000, description="Rate limit requests per minute")
@@ -328,33 +388,22 @@ class HybridSearchConfig(BaseModel):
     ) -> "HybridSearchConfig":
         """Load configuration from YAML and environment overrides."""
 
-        env_map = dict(env or os.environ)
-        settings_locations: List[Path] = []
-
-        if settings_path:
-            settings_locations.append(Path(settings_path))
-        elif env_map.get("AI_SEARCH_SETTINGS_PATH"):
-            settings_locations.append(Path(env_map["AI_SEARCH_SETTINGS_PATH"]))
-
-        settings_locations.extend(
-            [
-                Path("config/settings.yaml"),
-                Path("config/search_settings.yaml"),
-                Path("settings.yaml"),
-            ]
-        )
-
+        env_map = dict(os.environ if env is None else env)
         yaml_payload: Dict[str, Any] = {}
-        for candidate in settings_locations:
-            if candidate and candidate.exists():
-                with candidate.open("r", encoding="utf-8") as f:
-                    raw = yaml.safe_load(f) or {}
-                yaml_payload = raw.get("search", raw)
-                break
+        selected_path = settings_path if settings_path is not None else env_map.get("AI_SEARCH_SETTINGS_PATH")
+        if selected_path is not None:
+            if not str(selected_path).strip():
+                raise ValueError("AI_SEARCH_SETTINGS_PATH cannot be empty")
+            with Path(selected_path).open("r", encoding="utf-8") as file:
+                raw = yaml.safe_load(file)
+            raw = _configuration_mapping({} if raw is None else raw, "settings")
+            yaml_payload = _configuration_mapping(raw.get("search", raw), "search")
 
-        es_settings = yaml_payload.get("elasticsearch", {})
-        ac_settings = yaml_payload.get("ac_search", {})
-        vector_settings = yaml_payload.get("vector_search", {})
+        yaml_payload = _translate_configuration_aliases(yaml_payload)
+
+        es_settings = _configuration_mapping(yaml_payload.get("elasticsearch", {}), "elasticsearch")
+        ac_settings = _configuration_mapping(yaml_payload.get("ac_search", {}), "ac_search")
+        vector_settings = _configuration_mapping(yaml_payload.get("vector_search", {}), "vector_search")
 
         config_payload: Dict[str, Any] = yaml_payload.copy()
         config_payload["elasticsearch"] = ElasticsearchConfig.from_sources(
@@ -362,27 +411,24 @@ class HybridSearchConfig(BaseModel):
             env=env_map,
         )
 
-        if env_map.get("ES_AC_FIELD_WEIGHTS"):
+        if "ES_AC_FIELD_WEIGHTS" in env_map:
             weights = {}
             for item in env_map["ES_AC_FIELD_WEIGHTS"].split(","):
-                if not item:
-                    continue
-                name, _, weight = item.partition(":")
-                if name and weight:
-                    try:
-                        weights[name.strip()] = float(weight)
-                    except ValueError:
-                        continue
-            if weights:
-                ac_settings = dict(ac_settings)
-                ac_settings["field_weights"] = weights
+                name, delimiter, weight = item.partition(":")
+                name = name.strip()
+                if not name or not delimiter or name in weights:
+                    raise ValueError("Invalid field mapping for ES_AC_FIELD_WEIGHTS")
+                try:
+                    weights[name] = float(weight)
+                except ValueError:
+                    raise ValueError("Invalid numeric value for ES_AC_FIELD_WEIGHTS") from None
+            ac_settings["field_weights"] = weights
 
-        if env_map.get("ES_VECTOR_DIMENSION"):
-            vector_settings = dict(vector_settings)
+        if "ES_VECTOR_DIMENSION" in env_map:
             try:
                 vector_settings["vector_dimension"] = int(env_map["ES_VECTOR_DIMENSION"])
             except ValueError:
-                pass
+                raise ValueError("Invalid integer value for ES_VECTOR_DIMENSION") from None
 
         if ac_settings:
             config_payload["ac_search"] = {**ac_settings}

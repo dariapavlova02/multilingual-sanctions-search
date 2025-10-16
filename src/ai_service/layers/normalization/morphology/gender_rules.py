@@ -1,6 +1,7 @@
 """Gender heuristics for Slavic surname normalization and preservation."""
 
 from typing import Optional, Tuple, List
+from functools import lru_cache
 
 
 FEMALE_SUFFIXES_RU = ["ова", "ева", "ина", "ына", "ая"]
@@ -590,7 +591,7 @@ def is_invariable_surname(token: str) -> bool:
 
     # Check if it's a declined form of -енко/-ко surnames
     # Порошенка -> Порошенко, Петренка -> Петренко
-    if token_lower.endswith("ка") and len(token) > 4:
+    if token_lower.endswith("енка") and len(token) > 4:
         candidate = token[:-2] + "ко"
         base = candidate[:-2]  # убрать "ко"
         if candidate.lower().endswith(("енко", "ко")) and len(base) >= 3:
@@ -814,6 +815,30 @@ def feminine_nominative_from(token: str, language: str) -> str:
         return token
 
 
+@lru_cache(maxsize=2)
+def _given_name_forms(language):
+    from ....data.dicts.russian_names import RUSSIAN_NAMES
+    from ....data.dicts.ukrainian_names import UKRAINIAN_NAMES
+    names = UKRAINIAN_NAMES if language == "uk" else RUSSIAN_NAMES
+    canonical = {name.casefold() for name in names}
+    forms = {}
+    for name, data in names.items():
+        for form in data.get("declensions", []):
+            forms.setdefault(form.casefold(), set()).add(name)
+    return canonical, forms
+
+
+def _known_given_nominative(token, language):
+    canonical, forms = _given_name_forms(language)
+    if token.casefold() in canonical:
+        return token
+    candidates = forms.get(token.casefold(), set())
+    if len(candidates) == 1:
+        result = next(iter(candidates))
+        return result.upper() if token.isupper() else result.lower() if token.islower() else result
+    return None
+
+
 def convert_given_name_to_nominative(token: str, language: str) -> str:
     """
     Convert a given name from genitive case to nominative case.
@@ -844,6 +869,10 @@ def convert_given_name_to_nominative_ru(token: str) -> str:
     Returns:
         Nominative form of the given name
     """
+    known = _known_given_nominative(token, "ru")
+    if known is not None:
+        return known
+
     token_lower = token.lower()
 
     # Enhanced rules based on comprehensive declension patterns
@@ -1492,6 +1521,10 @@ def convert_given_name_to_nominative_uk(token: str) -> str:
     Returns:
         Nominative form of the given name
     """
+    known = _known_given_nominative(token, "uk")
+    if known is not None:
+        return known
+
     token_lower = token.lower()
 
     # Enhanced Ukrainian declension patterns

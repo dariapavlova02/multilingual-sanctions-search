@@ -4,7 +4,7 @@
 """
 
 import pytest
-from src.ai_service.layers.unicode.unicode_service import UnicodeService
+from ai_service.layers.unicode.unicode_service import UnicodeService
 
 
 class TestApostropheNormalization:

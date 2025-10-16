@@ -8,10 +8,10 @@ Tests complex scenarios, error handling, and boundary conditions.
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.normalization.role_tagger_service import (
+from ai_service.layers.normalization.role_tagger_service import (
     RoleTaggerService, FSMState, TokenRole, RoleRules, Token
 )
-from src.ai_service.layers.normalization.lexicon_loader import Lexicons
+from ai_service.layers.normalization.lexicon_loader import Lexicons
 
 
 class TestRoleTaggerEdgeCases:

@@ -8,9 +8,9 @@ include tokenizer improvements properly.
 
 import pytest
 from unittest.mock import Mock, patch
-from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
-from src.ai_service.utils.feature_flags import FeatureFlags
-from src.ai_service.contracts.base_contracts import TokenTrace
+from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
+from ai_service.utils.feature_flags import FeatureFlags
+from ai_service.contracts.base_contracts import TokenTrace
 
 
 class TestTokenizerFlagPlumbing:
@@ -61,7 +61,7 @@ class TestTokenizerFlagPlumbing:
             'FIX_INITIALS_DOUBLE_DOT': 'true',
             'PRESERVE_HYPHENATED_CASE': 'true'
         }):
-            from src.ai_service.utils.feature_flags import FeatureFlagManager
+            from ai_service.utils.feature_flags import FeatureFlagManager
             manager = FeatureFlagManager()
             
             # Verify legacy keys are used as fallback

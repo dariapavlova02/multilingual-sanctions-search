@@ -5,8 +5,8 @@ Unit tests for NormalizationResult metadata fields and TokenTrace completeness.
 
 import pytest
 import asyncio
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.contracts.base_contracts import NormalizationResult
 
 
 class TestNormalizationResultFields:

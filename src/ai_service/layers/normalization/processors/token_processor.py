@@ -2,11 +2,13 @@
 
 import re
 import unicodedata
+from functools import lru_cache
 from typing import Dict, List, Set, Tuple, Optional, Any
 
 from ....data.dicts.stopwords import STOP_ALL
 from ....utils.logging_config import get_logger
 from ....utils.profiling import profile_function, profile_time
+from ..token_ops import collapse_double_dots_token
 
 # Import exclusion patterns at module level for efficiency
 try:
@@ -20,6 +22,33 @@ except ImportError:
         r'^\d{1,2}/\d{1,2}/\d{4}$',  # US date: 1/1/1980 or 01/01/1980
         r'^\d{2}-\d{2}-\d{4}$',      # US date with dashes: 01-01-1980
     ]
+
+
+@lru_cache(maxsize=1)
+def _known_name_forms():
+    from ....data.dicts.russian_names import RUSSIAN_NAMES
+    from ....data.dicts.ukrainian_names import UKRAINIAN_NAMES
+    from ....data.dicts.english_names import ENGLISH_NAMES
+
+    forms = set()
+    for dictionary in (RUSSIAN_NAMES, UKRAINIAN_NAMES, ENGLISH_NAMES):
+        for name, data in dictionary.items():
+            forms.add(name.casefold())
+            for key in ("variants", "diminutives", "declensions"):
+                forms.update(value.casefold() for value in data.get(key, []))
+    return forms
+
+
+@lru_cache(maxsize=4096)
+def _has_person_morphology(token: str, language: str) -> bool:
+    if language not in {"ru", "uk"} or not token.isalpha():
+        return False
+    from ..morphology_adapter import get_global_adapter
+
+    return any(
+        "Surn" in parse.tag
+        for parse in get_global_adapter().parse(token, language)
+    )
 
 
 class TokenProcessor:
@@ -39,7 +68,7 @@ class TokenProcessor:
         stop_words: Optional[Set[str]] = None,
         feature_flags: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
-        """Mirror the legacy behaviour of ``NormalizationService._strip_noise_and_tokenize``.
+        """Apply the canonical noise-removal and tokenization contract.
 
         Returns a tuple of ``(tokens, traces, metadata)`` where metadata currently
         exposes the list of quoted segments detected in the input (``quoted_segments``).
@@ -116,10 +145,20 @@ class TokenProcessor:
 
         filtered: List[str] = []
         for token in tokens:
+            if feature_flags and feature_flags.get("preserve_boundaries") and token.casefold() in {
+                ",", ";", "|", "и", "і", "та", "and", "&"
+            }:
+                filtered.append(token)
+                continue
             if remove_stop_words:
                 # Cache lower() result to avoid repeated calls
                 token_lower = token.lower()
-                if token_lower in effective_stop_words:
+                if token_lower in effective_stop_words and not (
+                    preserve_names and (
+                        token_lower in _known_name_forms()
+                        or _has_person_morphology(token_lower, language)
+                    )
+                ):
                     traces.append(f"Filtered stop word: '{token}'")
                     continue
 
@@ -299,17 +338,16 @@ class TokenProcessor:
         
         return processed_tokens
 
-    def _fix_initials_double_dot(self, tokens: List[str], traces: List[str]) -> List[str]:
+    def _fix_initials_double_dot(self, tokens: List[str], traces: List[Any]) -> List[str]:
         """Fix double dots in initials (И.. → И.)."""
         processed = []
         for token in tokens:
-            if re.match(r'^[A-Za-zА-Яа-яІЇЄҐіїєґ]\.\.+$', token):
-                # Replace multiple dots with single dot
-                fixed = re.sub(r'\.+$', '.', token)
-                processed.append(fixed)
+            fixed = collapse_double_dots_token(token)
+            processed.append(fixed)
+            if fixed != token:
                 traces.append(f"Fixed double dots: '{token}' → '{fixed}'")
-            else:
-                processed.append(token)
+                traces.append({"rule": "collapse_double_dots", "before": token,
+                               "after": fixed, "evidence": "initials"})
         return processed
 
     def _preserve_hyphenated_case(self, tokens: List[str], traces: List[str]) -> List[str]:
@@ -334,4 +372,3 @@ class TokenProcessor:
             else:
                 processed.append(token)
         return processed
-

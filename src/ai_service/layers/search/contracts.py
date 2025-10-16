@@ -91,10 +91,6 @@ class SearchOpts(BaseModel):
     timeout_ms: int = Field(default=5000, ge=100, le=30000, description="Search timeout in milliseconds")
     enable_highlighting: bool = Field(default=False, description="Enable search result highlighting")
     
-    class Config:
-        use_enum_values = True
-
-
 class SearchMetrics(BaseModel):
     """Search performance metrics"""
     

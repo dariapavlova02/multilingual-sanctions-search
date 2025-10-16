@@ -2,10 +2,11 @@
 
 import string
 
-from hypothesis import assume, given, strategies as st
+from hypothesis import given, strategies as st
 
-from src.ai_service.data.patterns.identifiers import (
+from ai_service.data.patterns.identifiers import (
     ISO_COUNTRY_CODES,
+    _validate_russian_inn,
     validate_ein,
     validate_edrpou,
     validate_iban,
@@ -123,11 +124,17 @@ def test_validate_ein_accepts_valid_values(ein: str):
     assert validate_ein(ein)
 
 
-@given(st.text(string.digits, min_size=9, max_size=9))
-def test_validate_ein_rejects_unknown_prefix(ein_digits: str):
-    prefix = ein_digits[:2]
-    assume(prefix not in VALID_EIN_PREFIXES)
-    assert not validate_ein(ein_digits)
+INVALID_EIN_PREFIXES = tuple(
+    f"{value:02d}" for value in range(100) if f"{value:02d}" not in VALID_EIN_PREFIXES
+)
+
+
+@given(
+    prefix=st.sampled_from(INVALID_EIN_PREFIXES),
+    suffix=st.text(string.digits, min_size=7, max_size=7),
+)
+def test_validate_ein_rejects_unknown_prefix(prefix: str, suffix: str):
+    assert not validate_ein(prefix + suffix)
 
 
 @st.composite
@@ -312,7 +319,7 @@ def test_validate_inn_rejects_corrupted_10_digit(inn: str):
     corrupted_check = (int(inn[-1]) + 1) % 10
     corrupted_inn = inn[:-1] + str(corrupted_check)
     if corrupted_inn != inn:  # Only test if we actually changed something
-        assert not validate_inn(corrupted_inn)
+        assert not _validate_russian_inn(corrupted_inn)
 
 
 @given(inn_12_digit_strings())
@@ -322,4 +329,4 @@ def test_validate_inn_rejects_corrupted_12_digit(inn: str):
     corrupted_check_1 = (int(inn[-2]) + 1) % 10
     corrupted_inn = inn[:-2] + str(corrupted_check_1) + inn[-1]
     if corrupted_inn != inn:
-        assert not validate_inn(corrupted_inn)
+        assert not _validate_russian_inn(corrupted_inn)

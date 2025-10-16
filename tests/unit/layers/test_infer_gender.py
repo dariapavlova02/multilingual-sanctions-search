@@ -9,7 +9,7 @@ and morphological metadata.
 import pytest
 from typing import Any, Dict, List, Tuple
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestInferGender:

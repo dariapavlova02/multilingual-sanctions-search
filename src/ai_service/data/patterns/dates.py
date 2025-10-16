@@ -14,25 +14,25 @@ from functools import lru_cache
 # Date patterns for different formats
 DATE_PATTERNS = [
     # DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
-    r"\b(0?[1-9]|[12][0-9]|3[01])[./\-](0?[1-9]|1[0-2])[./\-]((19|20)\d{2})\b",
+    r"\b(0?[1-9]|[12][0-9]|3[01])[./\-](0?[1-9]|1[0-2])[./\-]((?:19|20)\d{2})\b",
     
     # YYYY/MM/DD, YYYY-MM-DD, YYYY.MM.DD
-    r"\b((19|20)\d{2})[./\-](0?[1-9]|1[0-2])[./\-](0?[1-9]|[12][0-9]|3[01])\b",
+    r"\b((?:19|20)\d{2})[./\-](0?[1-9]|1[0-2])[./\-](0?[1-9]|[12][0-9]|3[01])\b",
     
     # MM/DD/YYYY (US format)
-    r"\b(0?[1-9]|1[0-2])[./\-](0?[1-9]|[12][0-9]|3[01])[./\-]((19|20)\d{2})\b",
+    r"\b(0?[1-9]|1[0-2])[./\-](0?[1-9]|[12][0-9]|3[01])[./\-]((?:19|20)\d{2})\b",
     
     # Russian date format
-    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+((19|20)\d{2})\b",
+    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+((?:19|20)\d{2})\b",
     
     # Ukrainian date format
-    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+((19|20)\d{2})(?:\s+року)?\b",
+    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+((?:19|20)\d{2})(?:\s+року)?\b",
     
     # English date format
-    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(0?[1-9]|[12][0-9]|3[01]),?\s+((19|20)\d{2})\b",
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(0?[1-9]|[12][0-9]|3[01]),?\s+((?:19|20)\d{2})\b",
     
     # English date format (month first)
-    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(January|February|March|April|May|June|July|August|September|October|November|December),?\s+((19|20)\d{2})\b",
+    r"\b(0?[1-9]|[12][0-9]|3[01])\s+(January|February|March|April|May|June|July|August|September|October|November|December),?\s+((?:19|20)\d{2})\b",
 ]
 
 # Month name mappings
@@ -77,13 +77,17 @@ def extract_birthdates_from_text(text: str) -> List[Dict]:
         List of found dates with metadata
     """
     found_dates = []
+    seen = set()
     
     for pattern in get_compiled_patterns():
         for match in pattern.finditer(text):
             try:
                 date_info = _parse_date_match(match)
                 if date_info:
-                    found_dates.append(date_info)
+                    key = (tuple(date_info["position"]), date_info["iso_format"])
+                    if key not in seen:
+                        seen.add(key)
+                        found_dates.append(date_info)
             except Exception:
                 # Skip invalid dates
                 continue

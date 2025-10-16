@@ -1,287 +1,117 @@
-"""
-Integration tests for configuration validation endpoints
-"""
+"""Authenticated configuration diagnostics against the production search contract."""
+
+import secrets
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
 
-from src.ai_service.main import app
-from src.ai_service.config.settings import SearchConfig
+import ai_service.main as main
+from ai_service.layers.search.config import HybridSearchConfig
+from ai_service.layers.search.hybrid_search_service import HybridSearchService
 
 
-class TestConfigValidationEndpoints:
-    """Test configuration validation endpoints"""
-    
-    def test_validate_config_endpoint_requires_auth(self):
-        """Test validate-config endpoint requires authentication"""
-        client = TestClient(app)
-        
-        response = client.post("/validate-config")
-        
-        assert response.status_code == 401
-        assert "Not authenticated" in response.json()["detail"]
-    
-    def test_validate_config_endpoint_with_invalid_token(self):
-        """Test validate-config endpoint with invalid token"""
-        client = TestClient(app)
-        
-        response = client.post(
-            "/validate-config",
-            headers={"Authorization": "Bearer invalid_token"}
-        )
-        
-        assert response.status_code == 401
-        assert "Invalid API key" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_validate_config_endpoint_no_orchestrator(self, mock_orchestrator):
-        """Test validate-config endpoint when orchestrator not initialized"""
-        mock_orchestrator = None
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/validate-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 503
-        assert "Orchestrator not initialized" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_validate_config_endpoint_success(self, mock_orchestrator):
-        """Test validate-config endpoint success"""
-        # Mock orchestrator with search service
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service._client_factory = MagicMock()
-        mock_search_service._client_factory.health_check.return_value = {"status": "green"}
-        mock_search_service._fallback_watchlist_service = MagicMock()
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/validate-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "search_service" in data
-        assert data["search_service"]["enabled"] is True
-        assert data["search_service"]["validation_passed"] is True
-        assert data["search_service"]["errors"] == []
-        assert data["search_service"]["warnings"] == []
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_validate_config_endpoint_with_errors(self, mock_orchestrator):
-        """Test validate-config endpoint with validation errors"""
-        # Mock orchestrator with search service that has invalid config
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service.config.validate.side_effect = Exception("Invalid configuration")
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/validate-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "search_service" in data
-        assert data["search_service"]["enabled"] is True
-        assert data["search_service"]["validation_passed"] is False
-        assert len(data["search_service"]["errors"]) > 0
-        assert "Invalid configuration" in data["search_service"]["errors"][0]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_validate_config_endpoint_with_warnings(self, mock_orchestrator):
-        """Test validate-config endpoint with warnings"""
-        # Mock orchestrator with search service that has warnings
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service._client_factory = MagicMock()
-        mock_search_service._client_factory.health_check.return_value = {"status": "yellow"}
-        mock_search_service._fallback_watchlist_service = None  # Missing fallback service
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/validate-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "search_service" in data
-        assert data["search_service"]["enabled"] is True
-        assert data["search_service"]["validation_passed"] is True
-        assert len(data["search_service"]["warnings"]) > 0
-        
-        # Check for specific warnings
-        warnings = data["search_service"]["warnings"]
-        assert any("Elasticsearch cluster status" in warning for warning in warnings)
-        assert any("Fallback enabled but watchlist service not available" in warning for warning in warnings)
-    
-    def test_config_status_endpoint_requires_auth(self):
-        """Test config-status endpoint requires authentication"""
-        client = TestClient(app)
-        
-        response = client.get("/config-status")
-        
-        assert response.status_code == 401
-        assert "Not authenticated" in response.json()["detail"]
-    
-    def test_config_status_endpoint_with_invalid_token(self):
-        """Test config-status endpoint with invalid token"""
-        client = TestClient(app)
-        
-        response = client.get(
-            "/config-status",
-            headers={"Authorization": "Bearer invalid_token"}
-        )
-        
-        assert response.status_code == 401
-        assert "Invalid API key" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_config_status_endpoint_no_orchestrator(self, mock_orchestrator):
-        """Test config-status endpoint when orchestrator not initialized"""
-        mock_orchestrator = None
-        
-        client = TestClient(app)
-        
-        response = client.get(
-            "/config-status",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 503
-        assert "Orchestrator not initialized" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_config_status_endpoint_success(self, mock_orchestrator):
-        """Test config-status endpoint success"""
-        # Mock orchestrator with search service
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service.config.get_reload_stats.return_value = {
-            "last_reload": "2023-01-01T00:00:00",
-            "reload_count": 5,
-            "watcher_running": True
-        }
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.get(
-            "/config-status",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "search_service" in data
-        assert data["search_service"]["enabled"] is True
-        assert data["search_service"]["hot_reload"] is True
-        assert "reload_stats" in data["search_service"]
-        assert data["search_service"]["reload_stats"]["reload_count"] == 5
-    
-    def test_reload_config_endpoint_requires_auth(self):
-        """Test reload-config endpoint requires authentication"""
-        client = TestClient(app)
-        
-        response = client.post("/reload-config")
-        
-        assert response.status_code == 401
-        assert "Not authenticated" in response.json()["detail"]
-    
-    def test_reload_config_endpoint_with_invalid_token(self):
-        """Test reload-config endpoint with invalid token"""
-        client = TestClient(app)
-        
-        response = client.post(
-            "/reload-config",
-            headers={"Authorization": "Bearer invalid_token"}
-        )
-        
-        assert response.status_code == 401
-        assert "Invalid API key" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_reload_config_endpoint_no_orchestrator(self, mock_orchestrator):
-        """Test reload-config endpoint when orchestrator not initialized"""
-        mock_orchestrator = None
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/reload-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 503
-        assert "Orchestrator not initialized" in response.json()["detail"]
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_reload_config_endpoint_success(self, mock_orchestrator):
-        """Test reload-config endpoint success"""
-        # Mock orchestrator with search service
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service.config._reload_configuration = MagicMock()
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/reload-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "message" in data
-        assert "Configuration reloaded successfully" in data["message"]
-        
-        # Verify reload method was called
-        mock_search_service.config._reload_configuration.assert_called_once()
-    
-    @patch('src.ai_service.main.orchestrator')
-    def test_reload_config_endpoint_error(self, mock_orchestrator):
-        """Test reload-config endpoint with error"""
-        # Mock orchestrator with search service that throws error
-        mock_search_service = MagicMock()
-        mock_search_service.config = SearchConfig()
-        mock_search_service.config._reload_configuration.side_effect = Exception("Reload failed")
-        
-        mock_orchestrator.search_service = mock_search_service
-        
-        client = TestClient(app)
-        
-        response = client.post(
-            "/reload-config",
-            headers={"Authorization": "Bearer test-token"}
-        )
-        
-        assert response.status_code == 500
-        data = response.json()
-        
-        assert "detail" in data
-        assert "Internal Server Error" in data["detail"]
+@pytest.fixture
+def config_api(monkeypatch):
+    token = secrets.token_hex(32)
+    monkeypatch.setattr(main.SECURITY_CONFIG, "admin_api_key", token)
+    service = HybridSearchService(HybridSearchConfig())
+    service.readiness = AsyncMock(return_value={"ac": "generation", "vectors": "generation"})
+    monkeypatch.setattr(main, "orchestrator", SimpleNamespace(search_service=service))
+    return TestClient(main.app), {"Authorization": f"Bearer {token}"}, service
+
+
+ENDPOINTS = [("POST", "/validate-config"), ("GET", "/config-status"), ("POST", "/reload-config")]
+
+
+@pytest.mark.parametrize("method,path", ENDPOINTS)
+def test_configuration_endpoints_require_authentication(config_api, method, path):
+    client, _, service = config_api
+    response = client.request(method, path)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not authenticated"
+    service.readiness.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method,path", ENDPOINTS)
+def test_configuration_endpoints_reject_invalid_token(config_api, method, path):
+    client, _, service = config_api
+    response = client.request(method, path, headers={"Authorization": "Bearer invalid-token"})
+    assert response.status_code == 401
+    assert "Invalid API key" in response.text
+    service.readiness.assert_not_awaited()
+
+
+@pytest.mark.parametrize("method,path", ENDPOINTS)
+def test_configuration_endpoints_require_orchestrator(config_api, monkeypatch, method, path):
+    client, headers, _ = config_api
+    monkeypatch.setattr(main, "orchestrator", None)
+    response = client.request(method, path, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Orchestrator not initialized"
+
+
+def test_validate_configuration_and_actual_index_readiness(config_api):
+    client, headers, service = config_api
+    response = client.post("/validate-config", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["search_service"] == {
+        "enabled": True, "validation_passed": True, "runtime_ready": True,
+        "errors": [], "warnings": [],
+    }
+    service.readiness.assert_awaited_once_with()
+
+
+def test_validation_rechecks_mutated_nested_values_without_echoing_secrets(config_api):
+    client, headers, service = config_api
+    sensitive_value = "https://user:private-password@example.invalid:9243"
+    service.config.elasticsearch.hosts = [sensitive_value]
+    response = client.post("/validate-config", headers=headers)
+    assert response.status_code == 200
+    result = response.json()["search_service"]
+    assert not result["validation_passed"]
+    assert not result["runtime_ready"]
+    assert any("elasticsearch.hosts" in error for error in result["errors"])
+    assert "private-password" not in response.text
+    service.readiness.assert_not_awaited()
+
+
+def test_valid_settings_do_not_imply_available_sanctions_indices(config_api):
+    client, headers, service = config_api
+    service.readiness.side_effect = RuntimeError("credential-or-private-index-detail")
+    response = client.post("/validate-config", headers=headers)
+    result = response.json()["search_service"]
+    assert result["validation_passed"]
+    assert not result["runtime_ready"]
+    assert result["warnings"]
+    assert "credential-or-private-index-detail" not in response.text
+
+
+def test_disabled_search_is_explicit(config_api, monkeypatch):
+    client, headers, _ = config_api
+    monkeypatch.setattr(main, "orchestrator", SimpleNamespace(search_service=None))
+    result = client.post("/validate-config", headers=headers).json()["search_service"]
+    assert not result["enabled"]
+    assert not result["validation_passed"]
+    assert not result["runtime_ready"]
+    assert not client.get("/config-status", headers=headers).json()["search_service"]["enabled"]
+
+
+def test_status_does_not_advertise_an_inactive_config_watcher(config_api):
+    client, headers, _ = config_api
+    result = client.get("/config-status", headers=headers).json()["search_service"]
+    assert result["enabled"]
+    assert result["hot_reload"] is False
+    assert result["change_application"] == "restart_required"
+    assert result["reload_stats"] == {}
+
+
+def test_reload_cannot_report_success_without_replacing_runtime_components(config_api):
+    client, headers, service = config_api
+    previous = service.config.model_dump()
+    response = client.post("/reload-config", headers=headers)
+    assert response.status_code == 409
+    assert "recreate the API service" in response.json()["detail"]
+    assert service.config.model_dump() == previous
+    service.readiness.assert_not_awaited()

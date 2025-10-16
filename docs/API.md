@@ -1,451 +1,114 @@
-# 📚 AI Service API Documentation
+# HTTP API
 
-## Overview
+Default local address: `http://127.0.0.1:8001`. The running version's `/docs` and
+`/openapi.json` provide the complete request and response schemas.
 
-AI Service provides RESTful API endpoints for text normalization, structured data extraction, and hybrid search capabilities with multilingual support (English, Russian, Ukrainian).
+## Endpoints
 
-## Base URL
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /normalize` | Normalize text without requiring loaded sanctions indices |
+| `POST /process` | Normalize, extract signals, search and return a decision |
+| `POST /process-batch` | Process 1–100 texts; inspect each item's `success` and `errors` |
+| `POST /search` | Search the imported sanctions snapshot |
+| `POST /search-similar` | Compare a query with 1–1,000 supplied candidates |
+| `GET /health/live` | Process liveness |
+| `GET /health/ready` | Models and complete screening snapshot readiness |
+| `GET /health` | Basic service and dependency state |
+| `GET /metrics` | Prometheus metrics |
 
-```
-Development: http://localhost:8000
-Production:  https://your-domain.com
-```
+Processing endpoints have no application authentication; the supplied Compose
+configuration binds the API to loopback. Administrative routes require
+`Authorization: Bearer <ADMIN_API_KEY>` with a key of at least 32 characters.
 
-## Authentication
-
-Most endpoints are public. Administrative endpoints require Bearer token authentication:
+## Search
 
 ```bash
-curl -H "Authorization: Bearer YOUR_API_KEY" \
-     -X POST http://localhost:8000/admin/clear-cache
+curl --fail http://127.0.0.1:8001/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"John Smith","search_mode":"hybrid","top_k":10,"threshold":0.7}'
 ```
 
-## Core Endpoints
-
-### 1. Text Processing
-
-#### `POST /process`
-
-Complete text processing through all 9 layers of the AI pipeline.
-
-**Request:**
-```json
-{
-  "text": "Иван Иванович Иванов 15.05.1985",
-  "options": {
-    "include_variants": true,
-    "include_embeddings": false,
-    "language": "auto"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "processed_text": "иван иванович иванов 15.05.1985",
-  "language": "ru",
-  "signals": {
-    "persons": [
-      {
-        "name": "Иван Иванович Иванов",
-        "confidence": 0.95,
-        "position": {"start": 0, "end": 21}
-      }
-    ],
-    "dates": [
-      {
-        "value": "15.05.1985",
-        "normalized": "1985-05-15",
-        "confidence": 0.98
-      }
-    ]
-  },
-  "variants": ["иван иванов", "ivan ivanov"],
-  "processing_time_ms": 45
-}
-```
-
-#### `POST /normalize`
-
-Text normalization only (layers 1-5).
-
-**Request:**
-```json
-{
-  "text": "Петров Пётр Петрович",
-  "language": "ru"
-}
-```
-
-**Response:**
-```json
-{
-  "normalized_text": "петров пётр петрович",
-  "language": "ru",
-  "tokens": [
-    {"original": "Петров", "normalized": "петров", "type": "surname"},
-    {"original": "Пётр", "normalized": "пётр", "type": "given_name"},
-    {"original": "Петрович", "normalized": "петрович", "type": "patronymic"}
-  ]
-}
-```
-
-### 2. Batch Processing
-
-#### `POST /process-batch`
-
-Process multiple texts efficiently.
-
-**Request:**
-```json
-{
-  "texts": [
-    "Иван Иванов",
-    "Anna Smith",
-    "Петро Петренко"
-  ],
-  "options": {
-    "include_variants": false,
-    "include_embeddings": false
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "results": [
-    {
-      "text": "Иван Иванов",
-      "processed_text": "иван иванов",
-      "language": "ru",
-      "signals": {...}
-    },
-    {
-      "text": "Anna Smith", 
-      "processed_text": "anna smith",
-      "language": "en",
-      "signals": {...}
-    }
-  ],
-  "total_processing_time_ms": 120
-}
-```
-
-### 3. Search Endpoints
-
-#### `POST /search`
-
-Hybrid search combining AC (Aho-Corasick) and vector search.
-
-**Request:**
-```json
-{
-  "query": "Иван Петров",
-  "search_type": "hybrid",
-  "options": {
-    "limit": 10,
-    "threshold": 0.7,
-    "include_ac": true,
-    "include_vector": true
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "results": [
-    {
-      "id": "person_123",
-      "name": "Иван Петрович Петров",
-      "score": 0.92,
-      "match_type": "hybrid",
-      "highlights": ["<mark>Иван</mark> <mark>Петров</mark>ич Петров"]
-    }
-  ],
-  "total_found": 1,
-  "search_time_ms": 25
-}
-```
-
-#### `POST /search/ac`
-
-AC-only search for exact and fuzzy matching.
-
-**Request:**
-```json
-{
-  "query": "ООО Ромашка",
-  "match_types": ["exact", "phrase", "ngram"],
-  "fuzzy": true,
-  "limit": 20
-}
-```
-
-#### `POST /search/vector`
-
-Vector-only semantic search.
-
-**Request:**
-```json
-{
-  "query": "John Smith",
-  "similarity_threshold": 0.8,
-  "limit": 15
-}
-```
-
-### 4. Embeddings
-
-#### `POST /embeddings/generate`
-
-Generate vector embeddings for text.
-
-**Request:**
-```json
-{
-  "texts": ["Иван Иванов", "Anna Smith"],
-  "model": "paraphrase-multilingual-MiniLM-L12-v2"
-}
-```
-
-**Response:**
-```json
-{
-  "embeddings": [
-    {
-      "text": "Иван Иванов",
-      "vector": [0.1234, -0.5678, ...], // 384 dimensions
-      "dimension": 384
-    }
-  ],
-  "model_used": "paraphrase-multilingual-MiniLM-L12-v2",
-  "generation_time_ms": 15
-}
-```
-
-### 5. Administrative Endpoints 🔒
-
-#### `POST /admin/clear-cache`
-
-Clear all caches.
-
-**Response:**
-```json
-{
-  "message": "Cache cleared successfully",
-  "cleared_entries": 1250
-}
-```
-
-#### `POST /admin/reset-stats`
-
-Reset processing statistics.
-
-**Response:**
-```json
-{
-  "message": "Statistics reset successfully",
-  "reset_timestamp": "2024-01-15T10:30:00Z"
-}
-```
-
-### 6. Information Endpoints
-
-#### `GET /health`
-
-Service health check.
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "uptime_seconds": 3600,
-  "memory_usage_mb": 256,
-  "cache_stats": {
-    "hit_rate": 0.78,
-    "total_entries": 5000
-  }
-}
-```
-
-#### `GET /stats`
-
-Processing statistics.
-
-**Response:**
-```json
-{
-  "total_requests": 10000,
-  "avg_processing_time_ms": 35,
-  "cache_hit_rate": 0.78,
-  "language_distribution": {
-    "ru": 0.45,
-    "en": 0.35,
-    "uk": 0.20
-  },
-  "error_rate": 0.01
-}
-```
-
-#### `GET /languages`
-
-Supported languages.
-
-**Response:**
-```json
-{
-  "supported_languages": ["ru", "en", "uk"],
-  "default_language": "auto",
-  "detection_confidence_threshold": 0.8
-}
-```
-
-## Error Handling
-
-### Error Response Format
-
-```json
-{
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Invalid input text",
-    "details": {
-      "field": "text",
-      "issue": "Text cannot be empty"
-    }
-  },
-  "request_id": "req_123456789"
-}
-```
-
-### Common Error Codes
-
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| `VALIDATION_ERROR` | 400 | Invalid request parameters |
-| `PROCESSING_ERROR` | 500 | Text processing failed |
-| `LANGUAGE_NOT_SUPPORTED` | 400 | Unsupported language |
-| `RATE_LIMIT_EXCEEDED` | 429 | Too many requests |
-| `UNAUTHORIZED` | 401 | Invalid API key |
-| `SEARCH_UNAVAILABLE` | 503 | Search service down |
-
-## Rate Limiting
-
-- **Public endpoints**: 1000 requests/minute per IP
-- **Authenticated endpoints**: 5000 requests/minute per API key
-- **Batch processing**: 100 requests/minute
-
-## Performance
-
-### Expected Latencies
-
-| Operation | P50 | P95 | P99 |
-|-----------|-----|-----|-----|
-| Single text processing | 15ms | 45ms | 80ms |
-| Batch processing (10 items) | 80ms | 150ms | 250ms |
-| Hybrid search | 20ms | 50ms | 100ms |
-| Embedding generation | 10ms | 25ms | 45ms |
-
-### Throughput
-
-- **Single instance**: ~1000 requests/second
-- **Batch processing**: ~100 batches/second
-- **Search queries**: ~500 queries/second
-
-## SDK Examples
-
-### Python
-
-```python
-import httpx
-
-client = httpx.Client(base_url="http://localhost:8000")
-
-# Process text
-response = client.post("/process", json={
-    "text": "Иван Иванов",
-    "options": {"include_variants": True}
-})
-result = response.json()
-
-# Search
-response = client.post("/search", json={
-    "query": "Иван Петров",
-    "search_type": "hybrid"
-})
-results = response.json()["results"]
-```
-
-### JavaScript
-
-```javascript
-const response = await fetch('http://localhost:8000/process', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    text: 'Иван Иванов',
-    options: { include_variants: true }
-  })
-});
-
-const result = await response.json();
-console.log(result.processed_text);
-```
-
-## Configuration
-
-### Environment Variables
+| Field | Default | Accepted values |
+| --- | --- | --- |
+| `query` | Required | Nonblank text; default limit 10,000 characters |
+| `search_mode` | `hybrid` | `ac`, `fuzzy`, `vector`, `hybrid` |
+| `top_k` | `10` | Integer 1–100 |
+| `threshold` | `0.7` | Number 0–1 |
+| `enable_escalation` | `true` | Boolean |
+
+The response includes `query`, `normalized_query`, `results`, `total_hits`,
+`search_type`, `processing_time_ms`, `success` and `errors`. Candidates contain
+source metadata, scores and match evidence. `total_hits` counts returned
+candidates, not the full corpus. An empty successful result is specific to the
+query, threshold and loaded snapshot; it is not a clearance decision.
+
+Use the documented request fields. `language`, `entity_types`, `client_id` and
+internal fusion settings are not public `/search` options. Unknown fields may be
+ignored by the current request models.
+
+## Normalization and processing
 
 ```bash
-# Service Configuration
-APP_ENV=production
-WORKERS=4
-DEBUG=false
-
-# Security
-ADMIN_API_KEY=your-secure-key
-
-# Search Configuration
-ELASTICSEARCH_URL=http://localhost:9200
-ENABLE_VECTOR_SEARCH=true
-
-# Performance
-CACHE_TTL=3600
-MAX_BATCH_SIZE=100
+curl --fail http://127.0.0.1:8001/normalize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Ивана Петрова","language":"ru"}'
 ```
 
-### Feature Flags
+`/normalize` accepts `language` (`auto`, `ru`, `uk`, `en`), `remove_stop_words`,
+`apply_lemmatization`, `clean_unicode`, `preserve_names` and `options.flags`.
+`apply_stemming: true` is unsupported and returns 422.
 
-```python
-# config/settings.py
-FEATURE_FLAGS = {
-    "use_factory_normalizer": True,
-    "enable_search_optimizations": True,
-    "enhanced_accuracy_mode": False
-}
-```
+`/process` detects language and accepts `text`, `generate_variants` (default true),
+`generate_embeddings` (false), `cache_result` (true) and optional `options.flags`.
+It returns normalized text, tokens and traces, signals, search results, decision,
+variants when requested and an embedding when requested. Explicitly requesting an
+unavailable generation stage fails the request.
 
-## Monitoring
+Decision fields include `risk_level`, `risk_score`, `decision_reasons`,
+`decision_details`, `review_required` and `required_additional_fields`. An empty
+additional-fields list does not cancel an ownership-review requirement. Source
+positions and identifier association follow the [evidence contract](ARCHITECTURE.md#normalization-and-evidence).
 
-### Metrics Endpoints
+`/process-batch` accepts generation flags and `max_concurrent` from 1–32, default
+10. Results retain input order. HTTP 200 does not mean every item succeeded;
+failed items omit partial results. `total_processing_time` sums item times and
+is not parallel wall-clock time.
 
-- `GET /metrics` - Prometheus metrics
-- `GET /health/detailed` - Detailed health information
+## Administration
 
-### Key Metrics
+| Route | Behavior |
+| --- | --- |
+| `/admin/ac-patterns/bulk`, `/admin/vectors/bulk` | Submit incremental upserts |
+| `/admin/ac-patterns/upload`, `/admin/vectors/upload` | Submit uploaded data |
+| `/admin/loading-status/{job_id}` | Read job progress and completion |
+| `/admin/indices`, `/admin/indices/{index_name}` | Inspect or delete configured indices; check HTTP methods in OpenAPI |
+| `/clear-cache`, `/health/detailed` | Cache maintenance and component diagnostics |
+| `/config-status`, `/validate-config` | Active settings and runtime-readiness diagnostics |
+| `/reload-config` | Returns 409; settings require service recreation |
 
-- `ai_service_requests_total` - Total requests
-- `ai_service_processing_duration_seconds` - Processing latency
-- `ai_service_cache_hit_rate` - Cache effectiveness
-- `ai_service_errors_total` - Error count
+Accepted ingestion is not completed ingestion. For vector imports also inspect
+`snapshot_ready`, `missing_or_changed_vectors` and `extra_vectors`; a completed
+partial job may leave the whole snapshot unavailable. See [snapshot loading](DEPLOYMENT.md#load-a-snapshot).
 
-## Support
+## Failures and limits
 
-For API support and questions:
-- Documentation: [docs/](./)
-- Issues: GitHub Issues
-- Status: `/health` endpoint
+Blank and invisible-only inputs return 422. Missing or incomplete indices,
+backend failures, generation changes and exhausted processing capacity return 503.
+The default body limits are 1 MiB for ordinary requests and 26 MiB for uploads
+including multipart overhead, with a 25 MiB file limit.
+
+| Status | Meaning |
+| --- | --- |
+| `401` / `403` | Invalid or missing administrative credentials |
+| `408` | Body-read deadline exceeded |
+| `409` | Operation conflicts with the current state, including live reload |
+| `413` | Body too large |
+| `422` | Invalid input or unsupported option |
+| `429` | Request rate limit exceeded |
+| `500` | Internal processing failure |
+| `503` | Dependency, snapshot, capacity or processing-deadline failure |
+
+Errors omit internal exception payloads. [Configuration](CONFIGURATION.md) describes
+the admission and model-queue limits; [Security](../SECURITY.md) describes the local
+access and logging boundary.

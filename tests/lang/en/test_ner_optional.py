@@ -6,32 +6,22 @@ in English text normalization.
 """
 
 import pytest
-from src.ai_service.layers.normalization.ner_gateways.spacy_en import (
+from ai_service.layers.normalization.ner_gateways.spacy_en import (
     SpacyEnNER, 
     NERHints, 
     get_spacy_en_ner, 
     clear_spacy_en_ner,
-    SPACY_EN_AVAILABLE
 )
-from src.ai_service.layers.normalization.role_tagger_service import RoleTaggerService
-from src.ai_service.layers.normalization.lexicon_loader import clear_lexicon_cache, get_lexicons
+from ai_service.layers.normalization.role_tagger_service import RoleTaggerService
+from ai_service.layers.normalization.lexicon_loader import clear_lexicon_cache, get_lexicons
 from pathlib import Path
+from ai_service.data.resources import LEXICONS_DIR
 
 
 @pytest.fixture(autouse=True)
 def setup_teardown_lexicons():
     """Setup and teardown lexicons for each test."""
     clear_lexicon_cache()
-    base_path = Path(__file__).resolve().parents[3] / "data" / "lexicons"
-    base_path.mkdir(parents=True, exist_ok=True)
-    
-    # Create necessary lexicon files
-    for lang in ["ru", "uk", "en"]:
-        (base_path / f"stopwords_{lang}.txt").touch()
-        (base_path / f"stopwords_{lang}_init.txt").touch()
-    (base_path / "legal_forms.txt").touch()
-    (base_path / "payment_context.txt").touch()
-    
     get_lexicons()
     yield
     clear_lexicon_cache()
@@ -44,7 +34,6 @@ def role_tagger():
     return RoleTaggerService(lexicons)
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_org_suppresses_person_candidate(role_tagger):
     """
     Test that NER organization entities suppress person candidates.
@@ -64,10 +53,9 @@ def test_ner_org_suppresses_person_candidate(role_tagger):
     # So we check by position
     assert len(tags) == 5
     # Check that we get some role assignments
-    assert any(tag.role.value != "unknown" for tag in tags)
+    assert tags[1].role.value == tags[2].role.value == "org"
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_person_enhances_confidence(role_tagger):
     """
     Test that NER person hints increase confidence for person candidates.
@@ -85,10 +73,10 @@ def test_ner_person_enhances_confidence(role_tagger):
     # Both tokens should be person candidates
     assert len(tags) == 2
     assert tags[0].role.value in ["given", "surname", "person_candidate", "unknown"]
-    assert tags[1].role.value in ["given", "surname", "person_candidate", "unknown"]
+    assert tags[1].role.value in ["given", "surname"]
+    assert all("ner_person_span" in tag.evidence for tag in tags)
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_mixed_entities(role_tagger):
     """
     Test handling of mixed person and organization entities.
@@ -109,7 +97,6 @@ def test_ner_mixed_entities(role_tagger):
     assert any(tag.role.value != "unknown" for tag in tags)
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_no_hints(role_tagger):
     """
     Test that role tagger works without NER hints.
@@ -125,7 +112,6 @@ def test_ner_no_hints(role_tagger):
     assert tags[1].role.value in ["given", "surname", "person_candidate", "unknown"]
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_empty_hints(role_tagger):
     """
     Test that role tagger works with empty NER hints.
@@ -142,7 +128,6 @@ def test_ner_empty_hints(role_tagger):
     assert tags[1].role.value in ["given", "surname", "person_candidate", "unknown"]
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_spacy_en_ner_extraction():
     """
     Test spaCy English NER entity extraction.
@@ -166,7 +151,6 @@ def test_spacy_en_ner_extraction():
     assert "Apple" in org_text or "Inc" in org_text
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_spacy_en_ner_singleton():
     """
     Test that spaCy English NER uses singleton pattern.
@@ -177,35 +161,28 @@ def test_spacy_en_ner_singleton():
     assert ner1 is ner2
 
 
-def test_spacy_en_ner_not_available():
-    """
-    Test behavior when spaCy English NER is not available.
-    """
-    if not SPACY_EN_AVAILABLE:
-        with pytest.raises(RuntimeError):
-            SpacyEnNER()
-        
-        ner = get_spacy_en_ner()
-        assert ner is None
+def test_spacy_en_ner_not_available(monkeypatch):
+    from ai_service.layers.normalization.ner_gateways.unified_spacy_gateway import UnifiedSpacyGateway
+    gateway = UnifiedSpacyGateway()
+    def unavailable(name, **kwargs):
+        raise OSError("controlled missing model")
+    monkeypatch.setattr("spacy.load", unavailable)
+    with pytest.raises(RuntimeError):
+        SpacyEnNER(gateway)
+    gateway.close()
 
 
 def test_clear_spacy_en_ner():
     """
     Test clearing the spaCy English NER singleton.
     """
-    if SPACY_EN_AVAILABLE:
-        # Get initial instance
-        ner1 = get_spacy_en_ner()
-        assert ner1 is not None
-        
-        # Clear and get new instance
-        clear_spacy_en_ner()
-        ner2 = get_spacy_en_ner()
-        assert ner2 is not None
-        assert ner1 is not ner2  # Should be different instances
+    ner1 = get_spacy_en_ner()
+    assert ner1 is not None
+    clear_spacy_en_ner()
+    ner2 = get_spacy_en_ner()
+    assert ner2 is not None and ner1 is not ner2
 
 
-@pytest.mark.skipif(not SPACY_EN_AVAILABLE, reason="spaCy en_core_web_sm model not available")
 def test_ner_hints_dataclass():
     """
     Test NERHints dataclass functionality.

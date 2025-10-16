@@ -1,3 +1,4 @@
+from ai_service.data.resources import PACKAGE_DATA_DIR
 """
 Decision Logic Module
 
@@ -128,7 +129,7 @@ class DecisionLogic:
         """Load name dictionaries to enhance language patterns"""
         try:
             # Get data directory
-            data_dir = Path(__file__).parent.parent.parent.parent.parent / "data"
+            data_dir = PACKAGE_DATA_DIR
 
             # Load diminutives (which include common names)
             ru_names = set()

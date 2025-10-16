@@ -7,15 +7,15 @@ with 4 specific scenarios: skip, high, medium, and low risk.
 
 import pytest
 
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.contracts.decision_contracts import (
     DecisionInput,
     RiskLevel,
     SmartFilterInfo,
     SignalsInfo,
     SimilarityInfo,
 )
-from src.ai_service.core.decision_engine import DecisionEngine
-from src.ai_service.config.settings import DecisionConfig
+from ai_service.core.decision_engine import DecisionEngine
+from ai_service.config.settings import DecisionConfig
 
 
 class TestDecisionEngineCore:

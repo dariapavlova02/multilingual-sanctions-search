@@ -11,10 +11,10 @@ import time
 import statistics
 from typing import List, Dict, Any
 
-from src.ai_service.utils.lru_cache_ttl import LruTtlCache, CacheManager
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService
-from src.ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
-from src.ai_service.monitoring.cache_metrics import CacheMetrics, MetricsCollector
+from ai_service.utils.lru_cache_ttl import LruTtlCache, CacheManager
+from ai_service.layers.normalization.tokenizer_service import TokenizerService
+from ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
+from ai_service.monitoring.cache_metrics import CacheMetrics, MetricsCollector
 
 
 class TestP95ShortTextPerformance:

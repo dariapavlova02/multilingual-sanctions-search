@@ -7,8 +7,8 @@ functionality of the cached tokenizer service.
 """
 
 import pytest
-from src.ai_service.layers.normalization.tokenizer_service import CachedTokenizerService, TokenizationResult
-from src.ai_service.utils.lru_cache_ttl import LruTtlCache
+from ai_service.layers.normalization.tokenizer_service import CachedTokenizerService, TokenizationResult
+from ai_service.utils.lru_cache_ttl import LruTtlCache
 
 
 class TestCachedTokenizerService:

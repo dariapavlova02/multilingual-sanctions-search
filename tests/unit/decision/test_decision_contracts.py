@@ -8,7 +8,7 @@ enum values, dataclass serialization, and basic validation.
 import pytest
 from dataclasses import asdict
 
-from src.ai_service.contracts.decision_contracts import (
+from ai_service.contracts.decision_contracts import (
     DecisionInput,
     DecisionOutput,
     RiskLevel,
@@ -16,7 +16,7 @@ from src.ai_service.contracts.decision_contracts import (
     SignalsInfo,
     SimilarityInfo,
 )
-from src.ai_service.core.decision_engine import DecisionConfig, DecisionEngine
+from ai_service.core.decision_engine import DecisionConfig, DecisionEngine
 
 
 class TestRiskLevel:
@@ -240,7 +240,9 @@ class TestDecisionOutput:
             "risk": "low",
             "score": 0.3,
             "reasons": ["Low confidence"],
-            "details": {"test": "data"}
+            "details": {"test": "data"},
+            "review_required": False,
+            "required_additional_fields": [],
         }
         assert data == expected
 

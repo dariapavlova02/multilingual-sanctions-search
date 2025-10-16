@@ -3,8 +3,10 @@ Identifier extractor for organizations and persons.
 """
 
 from typing import Any, Dict, List, Set
+import re
 
 from .base_extractor import BaseExtractor
+from ....utils.source_text_view import SourceTextView
 
 
 class IdentifierExtractor(BaseExtractor):
@@ -60,12 +62,13 @@ class IdentifierExtractor(BaseExtractor):
             )
 
             found_ids = []
+            view = SourceTextView.from_text(text)
 
             for pattern, compiled_regex in get_compiled_patterns_cached():
                 if pattern.type not in id_types:
                     continue
 
-                for match in compiled_regex.finditer(text):
+                for match in compiled_regex.finditer(view.text):
                     # Handle patterns with multiple capture groups (e.g. passport series + number)
                     if pattern.type in ['passport_rf', 'passport_ua'] and len(match.groups()) > 1:
                         # Combine multiple groups for passport patterns
@@ -92,14 +95,21 @@ class IdentifierExtractor(BaseExtractor):
                         "position": match.span(),
                         "valid": is_valid,
                     }
-                    found_ids.append(id_info)
+                    found_ids.append(view.restore_evidence(id_info))
 
             # Remove duplicates by value
             unique_ids = []
             seen_values = set()
             for id_info in found_ids:
-                if id_info["value"] not in seen_values:
-                    seen_values.add(id_info["value"])
+                span = id_info["position"]
+                start, end = view.matching_span(*span)
+                value_matches = list(re.finditer(
+                    r"(?<!\w)" + re.escape(id_info["value"]) + r"(?!\w)", view.text[start:end]))
+                if len(value_matches) == 1:
+                    span = view.original_span(start + value_matches[0].start(), start + value_matches[0].end())
+                occurrence = (id_info["value"], span)
+                if occurrence not in seen_values:
+                    seen_values.add(occurrence)
                     unique_ids.append(id_info)
 
             entity_type = "organization" if id_types == self._org_id_types else "person"

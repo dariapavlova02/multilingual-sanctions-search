@@ -9,8 +9,8 @@ norm(norm(x)) == norm(x)
 
 import pytest
 from hypothesis import given, strategies as st, assume, settings, HealthCheck
-from src.ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
-from src.ai_service.utils.feature_flags import FeatureFlags
+from ai_service.layers.normalization.processors.normalization_factory import NormalizationFactory, NormalizationConfig
+from ai_service.utils.feature_flags import FeatureFlags
 
 
 class TestNormalizationIdempotency:

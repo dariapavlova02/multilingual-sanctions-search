@@ -9,7 +9,7 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.ai_service.layers.search.sanctioned_inn_cache import get_inn_cache, lookup_sanctioned_inn
+from ai_service.layers.search.sanctioned_inn_cache import get_inn_cache, lookup_sanctioned_inn
 
 def test_direct_cache_lookup():
     """Test direct lookup in the INN cache."""

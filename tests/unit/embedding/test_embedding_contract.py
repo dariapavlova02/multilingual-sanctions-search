@@ -6,6 +6,8 @@ import pytest
 from ai_service.config import EmbeddingConfig
 from ai_service.layers.embeddings.embedding_service import EmbeddingService
 
+pytestmark = pytest.mark.model
+
 
 class TestEmbeddingContract:
     """Test embedding service contract - only vector generation, no indexing"""
@@ -129,15 +131,19 @@ class TestEmbeddingContract:
         # Should only have vector generation methods
         expected_methods = {
             'encode_one', 'encode_batch', 'encode',  # Vector generation
+            'encode_one_async', 'encode_batch_async',
+            'generate_embeddings', 'generate_embeddings_async',
             'get_embedding_dimension', 'get_model_info',  # Info methods
             'warmup', 'clear_preprocessing_cache', 'get_cache_stats',  # Utility methods
             'initialize',  # Initialization method
+            'initialize_runtime', 'runtime_health_check', 'close', 'get_inference_stats',
             '_load_model', '_warmup', '_get_cached_preprocessing'  # Internal methods
         }
         
-        # Get only callable methods (not attributes)
-        actual_methods = {method for method in dir(service) 
-                         if callable(getattr(service, method)) and 
+        # The service adds vector generation and lifecycle operations. BaseService
+        # logging/metrics remain visible through ordinary Python introspection.
+        actual_methods = {method for method, value in EmbeddingService.__dict__.items()
+                         if callable(value) and
                          (not method.startswith('_') or method in {'_load_model', '_warmup', '_get_cached_preprocessing'})}
         
         # Should not have more methods than expected

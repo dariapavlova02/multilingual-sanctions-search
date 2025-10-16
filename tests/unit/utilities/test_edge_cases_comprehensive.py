@@ -9,12 +9,12 @@ import os
 import tempfile
 import json
 
-from src.ai_service.layers.unicode.unicode_service import UnicodeService
-from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
-from src.ai_service.layers.embeddings.embedding_service import EmbeddingService
-from src.ai_service.core.cache_service import CacheService
-# from src.ai_service.indexer import load_watchlist_index  # Function not available
-from src.ai_service.exceptions import (
+from ai_service.layers.unicode.unicode_service import UnicodeService
+from ai_service.layers.language.language_detection_service import LanguageDetectionService
+from ai_service.layers.embeddings.embedding_service import EmbeddingService
+from ai_service.core.cache_service import CacheService
+# from ai_service.indexer import load_watchlist_index  # Function not available
+from ai_service.exceptions import (
     ValidationAPIError,
     InternalServerError,
     ServiceUnavailableError

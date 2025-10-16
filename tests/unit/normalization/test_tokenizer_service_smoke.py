@@ -7,7 +7,7 @@ without external dependencies.
 """
 
 import pytest
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
+from ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
 
 
 class TestTokenizerServiceSmoke:
@@ -60,7 +60,7 @@ class TestTokenizerServiceSmoke:
         service = TokenizerService(fix_initials_double_dot=False)
         
         tokens = ["И..", "П..", "A.."]
-        processed_tokens, traces = service._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = service._apply_post_processing_rules(tokens)
         
         # Should remain unchanged
         assert processed_tokens == tokens
@@ -71,7 +71,7 @@ class TestTokenizerServiceSmoke:
         service = TokenizerService(preserve_hyphenated_case=True)
         
         tokens = ["Петрова-Сидорова", "Jean-Luc", "Smith--Jones"]
-        processed_tokens, traces = service._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = service._apply_post_processing_rules(tokens)
         
         # Tokens should remain unchanged
         assert processed_tokens == tokens
@@ -88,7 +88,7 @@ class TestTokenizerServiceSmoke:
         service = TokenizerService(preserve_hyphenated_case=False)
         
         tokens = ["Петрова-Сидорова", "Jean-Luc"]
-        processed_tokens, traces = service._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = service._apply_post_processing_rules(tokens)
         
         # Tokens should remain unchanged
         assert processed_tokens == tokens
@@ -233,7 +233,7 @@ class TestTokenizerServiceSmoke:
         service.clear_cache()
         
         # With cache (if provided)
-        from src.ai_service.utils.lru_cache_ttl import LruTtlCache
+        from ai_service.utils.lru_cache_ttl import LruTtlCache
         cache = LruTtlCache(maxsize=100, ttl_seconds=300)
         service_with_cache = TokenizerService(cache=cache)
         service_with_cache.clear_cache()  # Should not raise exception
@@ -246,7 +246,7 @@ class TestTokenizerServiceSmoke:
         )
         
         tokens = ["И..", "Петрова-Сидорова", "А..", "Jean-Luc"]
-        processed_tokens, traces = service._apply_post_processing_rules(tokens)
+        processed_tokens, traces, _token_traces = service._apply_post_processing_rules(tokens)
         
         # Check processed tokens
         assert processed_tokens == ["И.", "Петрова-Сидорова", "А.", "Jean-Luc"]

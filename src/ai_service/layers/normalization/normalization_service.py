@@ -10,7 +10,7 @@ by the NormalizationFactory and its processors.
 import json
 import time
 import unicodedata
-from pathlib import Path
+from dataclasses import fields
 from typing import Dict, Optional, Set, List, Tuple
 
 from ...config import LANGUAGE_CONFIG
@@ -22,12 +22,8 @@ from ...data.patterns.identifiers import (
 from ...utils.logging_config import get_logger
 from ...utils.feature_flags import get_feature_flag_manager, FeatureFlags
 from ..language.language_detection_service import LanguageDetectionService
-from ..unicode.unicode_service import UnicodeService
-from .morphology.gender_rules import prefer_feminine_form
-from .morphology_adapter import MorphologyAdapter, get_global_adapter
+from .morphology_adapter import get_global_adapter
 from .processors.normalization_factory import NormalizationFactory, NormalizationConfig
-from .lexicon_loader import get_lexicons
-from .role_tagger import RoleTagger, TokenRole
 from .homoglyph_detector import HomoglyphDetector
 
 # Check for optional dependencies
@@ -61,7 +57,6 @@ class NormalizationService:
 
         # Core services
         self.language_service = LanguageDetectionService()
-        self.unicode_service = UnicodeService()
         # Use global adapter for better caching across requests
         self.morphology_adapter = get_global_adapter()
         self.homoglyph_detector = HomoglyphDetector()
@@ -76,13 +71,6 @@ class NormalizationService:
             diminutive_maps,
         )
 
-        # Initialize role tagger for stopword and organization filtering
-        lexicons = get_lexicons()
-        self.role_tagger = RoleTagger(window=3)
-
-        # Initialize legacy service for fallback
-        self._legacy_service = None
-
         # Statistics tracking
         self._stats = {
             'total_requests': 0,
@@ -90,219 +78,10 @@ class NormalizationService:
             'failed_requests': 0,
             'avg_processing_time': 0.0,
             'languages_detected': {'ru': 0, 'uk': 0, 'en': 0, 'mixed': 0, 'unknown': 0},
-            'implementation_usage': {'factory': 0, 'legacy': 0, 'dual': 0}
         }
 
         self.logger.info("NormalizationService initialized as thin facade with feature flags")
 
-    def _is_latin_token(self, token: str) -> bool:
-        """Check if a token contains primarily Latin characters."""
-        if not token:
-            return False
-
-        cyrillic_chars = sum(1 for c in token if '\u0400' <= c <= '\u04FF' or c in 'ЁёІіЇїЄєҐґ')
-        latin_chars = sum(1 for c in token if 'A' <= c <= 'Z' or 'a' <= c <= 'z')
-
-        # Consider token Latin if it has Latin chars and more Latin than Cyrillic
-        return latin_chars > 0 and latin_chars > cyrillic_chars
-
-    def _has_mixed_scripts(self, text: str) -> bool:
-        """Check if text contains both Latin and Cyrillic characters."""
-        has_latin = any('A' <= c <= 'Z' or 'a' <= c <= 'z' for c in text)
-        has_cyrillic = any('\u0400' <= c <= '\u04FF' or c in 'ЁёІіЇїЄєҐґ' for c in text)
-        return has_latin and has_cyrillic
-
-    def _extract_persons_from_sequence(self, personal_sequence: List[Tuple[str, str]]) -> List[str]:
-        """
-        Extract individual persons from a sequence of personal tokens.
-
-        Improved logic for person boundary detection:
-        - Groups based on role patterns (initials -> given -> patronymic -> surname)
-        - Handles mixed language scenarios
-        - Supports multiple person detection
-        """
-        if not personal_sequence:
-            return []
-
-        persons = []
-        current_person = []
-
-        i = 0
-        while i < len(personal_sequence):
-            role, token = personal_sequence[i]
-            titlecased_token = self._to_title(token)
-
-            # Add current token to person (but skip punctuation/formatting tokens)
-            if role != "unknown":
-                current_person.append(titlecased_token)
-
-            # Determine if this is the end of a person
-            is_person_end = self._is_person_boundary(personal_sequence, i)
-
-            if is_person_end:
-                if current_person:
-                    persons.append(" ".join(current_person))
-                    current_person = []
-
-            i += 1
-
-        # Add any remaining tokens as the last person
-        if current_person:
-            persons.append(" ".join(current_person))
-
-        # Handle "Last, First" reordering for single person
-        if (len(persons) == 1 and len(personal_sequence) >= 3
-            and personal_sequence[0][0] == "surname" and personal_sequence[1][1] == ","
-            and personal_sequence[2][0] == "given"):
-            # Reorder from "Last, First" to "First Last"
-            surname = personal_sequence[0][1]
-            given = personal_sequence[2][1]
-            persons[0] = f"{self._to_title(given)} {self._to_title(surname)}"
-
-        return persons
-
-    def _is_person_boundary(self, sequence: List[Tuple[str, str]], current_index: int) -> bool:
-        """
-        Determine if current position is a boundary between two persons.
-
-        Person boundary rules:
-        1. After surname, if next token is initial/given (start of new person)
-        2. After patronymic, if next token is not surname (unusual but possible)
-        3. At end of sequence
-        4. Before/after unknown tokens (separators like "and", "та")
-        """
-        if current_index >= len(sequence) - 1:
-            return True  # End of sequence
-
-        current_role, current_token = sequence[current_index]
-        next_role, next_token = sequence[current_index + 1]
-
-        # Rule 1: Surname followed by initial/given indicates new person
-        if current_role == "surname" and next_role in ("initial", "given"):
-            # Exception: Check for patronymic patterns (Russian/Ukrainian)
-            # If next is given and followed by patronymic, it's same person
-            if (next_role == "given" and current_index + 2 < len(sequence)
-                and sequence[current_index + 2][0] == "patronymic"):
-                return False  # Same person continues
-
-            # Exception: Initials immediately following surname are likely same person
-            # e.g., "Иванов И.И." should be one person, not two
-            if next_role == "initial":
-                return False  # Same person continues with initials
-
-            return True  # New person starts
-
-        # Rule 2: Patronymic followed by initial/given (rare but possible)
-        if current_role == "patronymic" and next_role in ("initial", "given"):
-            return True
-
-        # Rule 3: Unknown tokens are separators
-        # Exception: Handle "Last, First" format - comma between surname and given name
-        if current_role == "unknown" or next_role == "unknown":
-            # Check for "Last, First" pattern: surname followed by comma followed by given
-            if (current_role == "surname" and next_role == "unknown"
-                and current_index + 2 < len(sequence)
-                and sequence[current_index + 1][1] == ","
-                and sequence[current_index + 2][0] == "given"):
-                return False  # Don't split on comma in "Last, First" format
-
-            # Also handle when we're at the comma itself
-            if (current_role == "unknown" and sequence[current_index][1] == ","
-                and current_index > 0 and current_index + 1 < len(sequence)
-                and sequence[current_index - 1][0] == "surname"
-                and sequence[current_index + 1][0] == "given"):
-                return False  # Don't split at comma in "Last, First" format
-
-            return True
-
-        # Rule 4: Given name followed by given name (indicates two different people)
-        if current_role == "given" and next_role == "given":
-            return True
-
-        return False
-
-    def _has_mixed_personal_names(self, text: str) -> bool:
-        """Check if text likely contains both Latin and Cyrillic personal names."""
-        if not self._has_mixed_scripts(text):
-            return False
-
-        # Look for connecting words that suggest multiple people (not business/payment contexts)
-        connectors = ['та', 'и', 'and', '&']  # Removed comma and pipe as they're too general
-        text_lower = text.lower()
-
-        # Also exclude contexts that suggest business/payment rather than personal names
-        business_keywords = ['оплата', 'платеж', 'payment', 'café', 'restaurant', '→', '->']
-        if any(keyword in text_lower for keyword in business_keywords):
-            return False
-
-        # Check if any connector appears between Latin and Cyrillic text
-        for connector in connectors:
-            if connector in text_lower:
-                parts = text_lower.split(connector)
-                if len(parts) >= 2:
-                    # Check if we have Latin in one part and Cyrillic in another
-                    has_latin_part = any(any('a' <= c <= 'z' for c in part) for part in parts)
-                    has_cyrillic_part = any(any('\u0430' <= c <= '\u044f' or c in 'ёіїєґ' for c in part) for part in parts)
-                    if has_latin_part and has_cyrillic_part:
-                        return True
-
-        return False
-
-    def _could_be_personal_name(self, token: str) -> bool:
-        """Check if a Latin token could be a personal name (not numbers, symbols, etc.)."""
-        if not token:
-            return False
-
-        # Remove common non-name patterns
-        if len(token) <= 2 and not token.isalpha():
-            return False
-
-        # Check for numbers or symbols that suggest it's not a name
-        has_digits = any(c.isdigit() for c in token)
-        has_symbols = any(c in '()[]{}@#$%^&*+=<>?/\\|~`' for c in token)
-
-        if has_digits or has_symbols:
-            return False
-
-        # Must be primarily alphabetic
-        alpha_chars = sum(1 for c in token if c.isalpha())
-        return alpha_chars >= len(token) * 0.8
-
-    def _to_title(self, word: str) -> str:
-        """
-        Convert word to title case while preserving apostrophes and hyphens.
-
-        Args:
-            word: Input word to convert
-
-        Returns:
-            Word in title case (first letter uppercase, rest lowercase)
-        """
-        if not word:
-            return word
-
-        # Handle hyphenated words - apply titlecase to each segment
-        if '-' in word:
-            segments = word.split('-')
-            return '-'.join(self._to_title(segment) for segment in segments)
-
-        # Handle single word - first letter uppercase, rest lowercase
-        if len(word) == 1:
-            return word.upper()
-
-        # Handle apostrophes - capitalize letter after apostrophe
-        # Check ASCII apostrophe (Unicode normalization converts all to ASCII)
-        result = word[0].upper()
-        i = 1
-        while i < len(word):
-            if word[i] == "'" and i + 1 < len(word):
-                result += word[i] + word[i + 1].upper()
-                i += 2
-            else:
-                result += word[i].lower()
-                i += 1
-
-        return result
 
     def _apply_language_specific_apostrophe_normalization(
         self,
@@ -326,64 +105,12 @@ class NormalizationService:
 
         return result
 
-    def _apply_role_filtering(self, text: str, language: str, feature_flags: Optional[FeatureFlags] = None) -> Tuple[str, List[Dict]]:
-        """
-        Apply role-based filtering to remove stopwords and organizations.
-        
-        Args:
-            text: Input text
-            language: Language code
-            feature_flags: Feature flags for configuration
-            
-        Returns:
-            Tuple of (filtered_text, trace_entries)
-        """
-        # Simple tokenization for role tagging
-        import re
-        tokens = re.findall(r'\S+', text)
-        
-        if not tokens:
-            return text, []
-        
-        # Tag tokens with roles
-        role_tags = self.role_tagger.tag(tokens, language)
-        
-        # Get person candidates (exclude stopwords and organizations)
-        person_candidates = self.role_tagger.get_person_candidates(role_tags)
-        
-        # Get organization spans for trace
-        org_spans = self.role_tagger.get_organization_spans(role_tags)
-        
-        # Count filtered tokens
-        stopword_count = self.role_tagger.get_stopword_count(role_tags)
-        org_count = self.role_tagger.get_organization_count(role_tags)
-        
-        # Build trace entries
-        trace_entries = []
-        
-        # Note: Remove non-TokenTrace entries from trace to avoid validation errors
-        # Stopword and organization filtering information is already captured in
-        # individual token trace entries via their notes and rules
-        #
-        # if stopword_count > 0:
-        #     trace_entries.append({
-        #         "type": "role",
-        #         "action": "stopword_filtered",
-        #         "count": stopword_count
-        #     })
-        #
-        # for start_idx, end_idx, span_text in org_spans:
-        #     trace_entries.append({
-        #         "type": "role",
-        #         "action": "org_span",
-        #         "form": tokens[start_idx] if start_idx < len(tokens) else "",
-        #         "span": span_text
-        #     })
-        
-        # Keep all tokens but mark roles in trace
-        filtered_text = text
-        
-        return filtered_text, trace_entries
+
+    async def initialize_runtime(self):
+        await self.normalization_factory.ner_gateway.initialize_runtime()
+
+    def runtime_health_check(self):
+        return self.normalization_factory.ner_gateway.runtime_health_check()
 
     async def normalize_async(
         self,
@@ -393,8 +120,8 @@ class NormalizationService:
         remove_stop_words: bool = True,
         preserve_names: bool = True,
         enable_advanced_features: bool = True,
-        user_id: Optional[str] = None,
-        request_context: Optional[Dict] = None,
+        enable_morphology: Optional[bool] = None,
+        strict_stopwords: Optional[bool] = None,
         # Ukrainian-specific flags
         preserve_feminine_suffix_uk: bool = False,
         enable_spacy_uk_ner: bool = False,
@@ -403,10 +130,10 @@ class NormalizationService:
         enable_en_nickname_expansion: bool = True,
         enable_spacy_en_ner: bool = False,
         # Russian-specific flags
-        ru_yo_strategy: str = "fold",
+        ru_yo_strategy: str = "preserve",
         enable_ru_nickname_expansion: bool = True,
         enable_spacy_ru_ner: bool = False,
-        # Feature flags for safe rollout
+        # Processing feature flags
         feature_flags: Optional[FeatureFlags] = None,
     ) -> NormalizationResult:
         """
@@ -418,8 +145,6 @@ class NormalizationService:
             remove_stop_words: Remove stop words during tokenization
             preserve_names: Preserve name-specific punctuation
             enable_advanced_features: Enable morphology and advanced processing
-            user_id: User ID for consistent feature flag rollout
-            request_context: Additional context for implementation selection
             preserve_feminine_suffix_uk: Preserve Ukrainian feminine suffixes (-ська/-цька)
             enable_spacy_uk_ner: Enable spaCy Ukrainian NER
             en_use_nameparser: Use nameparser for English names
@@ -432,6 +157,7 @@ class NormalizationService:
         Returns:
             NormalizationResult with normalized text and metadata
         """
+        effective_flags = self.feature_flags.get_flags(feature_flags)
         start_time = time.time()
         self._stats['total_requests'] += 1
 
@@ -452,7 +178,6 @@ class NormalizationService:
                 # Log security warnings for potential homoglyph attacks
                 suspicious_chars = homoglyph_analysis.get('suspicious_chars', [])
                 self.logger.warning(f"Homoglyph attack detected: {len(suspicious_chars)} suspicious characters")
-                self.logger.warning(f"Original text: '{text}'")
 
             # Use the normalized text for further processing
             text = normalized_text
@@ -468,59 +193,19 @@ class NormalizationService:
                 self._stats['languages_detected'].setdefault(detected_language, 0)
                 self._stats['languages_detected'][detected_language] += 1
 
-            # Use passed feature flags or fall back to global flags
-            effective_flags = feature_flags or self.feature_flags._flags
+            if strict_stopwords is not None:
+                effective_flags.strict_stopwords = strict_stopwords
+            if enable_morphology is not None:
+                enable_advanced_features = enable_morphology
             
-            # Apply role-based filtering (stopwords and organizations)
-            filtered_text, role_trace_entries = self._apply_role_filtering(text, detected_language, effective_flags)
-            
-            # Determine implementation based on feature flags
-            use_factory = effective_flags.use_factory_normalizer or self.feature_flags.should_use_factory(
-                language=detected_language,
-                user_id=user_id,
-                request_context=request_context
+            result = await self._process_with_factory(
+                text, detected_language, remove_stop_words,
+                preserve_names, enable_advanced_features,
+                preserve_feminine_suffix_uk, enable_spacy_uk_ner,
+                en_use_nameparser, enable_en_nickname_expansion, enable_spacy_en_ner,
+                ru_yo_strategy, enable_ru_nickname_expansion, enable_spacy_ru_ner,
+                effective_flags,
             )
-
-            monitoring_config = self.feature_flags.get_monitoring_config()
-
-            # Log implementation choice if enabled
-            if monitoring_config['log_implementation_choice']:
-                self.logger.info(f"Using {'factory' if use_factory else 'legacy'} implementation for language={detected_language}")
-
-            # Dual processing mode for comparison
-            if monitoring_config['enable_dual_processing']:
-                result = await self._dual_process(
-                    filtered_text, detected_language, remove_stop_words,
-                    preserve_names, enable_advanced_features,
-                    preserve_feminine_suffix_uk, enable_spacy_uk_ner,
-                    en_use_nameparser, enable_en_nickname_expansion, enable_spacy_en_ner,
-                    ru_yo_strategy, enable_ru_nickname_expansion, enable_spacy_ru_ner,
-                    effective_flags
-                )
-                self._stats['implementation_usage']['dual'] += 1
-            elif use_factory:
-                result = await self._process_with_factory(
-                    filtered_text, detected_language, remove_stop_words,
-                    preserve_names, enable_advanced_features,
-                    preserve_feminine_suffix_uk, enable_spacy_uk_ner,
-                    en_use_nameparser, enable_en_nickname_expansion, enable_spacy_en_ner,
-                    ru_yo_strategy, enable_ru_nickname_expansion, enable_spacy_ru_ner,
-                    effective_flags
-                )
-                self._stats['implementation_usage']['factory'] += 1
-            else:
-                result = await self._process_with_legacy(
-                    filtered_text, detected_language, remove_stop_words,
-                    preserve_names, enable_advanced_features,
-                    effective_flags
-                )
-                self._stats['implementation_usage']['legacy'] += 1
-
-            # Add role filtering trace entries to result
-            if role_trace_entries and hasattr(result, 'trace') and result.trace:
-                result.trace.extend(role_trace_entries)
-            elif role_trace_entries:
-                result.trace = role_trace_entries
 
             # Add homoglyph analysis to result
             if homoglyph_analysis:
@@ -564,84 +249,42 @@ class NormalizationService:
                 persons=[],
             )
 
-    def normalize_sync(
-        self,
-        text: str,
-        *,
-        language: Optional[str] = None,
-        remove_stop_words: bool = True,
-        preserve_names: bool = True,
-        enable_advanced_features: bool = True,
-        preserve_feminine_suffix_uk: bool = False,
-        enable_spacy_uk_ner: bool = False,
-    ) -> NormalizationResult:
-        """
-        Synchronous normalization entrypoint.
+    def normalize_sync(self, text: str, *, language=None, **options) -> NormalizationResult:
+        """Normalize synchronously using the same options and pipeline as async calls."""
+        from ...utils.async_bridge import run_sync
 
-        This is a convenience wrapper that runs the async implementation
-        in a new event loop if needed.
-        """
-        import asyncio
+        return run_sync(self.normalize_async(text, language=language, **options))
 
-        try:
-            # Try to get current event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If loop is running, we need to use run_in_executor
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self.normalize_async(
-                        text,
-                        language=language,
-                        remove_stop_words=remove_stop_words,
-                        preserve_names=preserve_names,
-                        enable_advanced_features=enable_advanced_features,
-                        preserve_feminine_suffix_uk=preserve_feminine_suffix_uk,
-                        enable_spacy_uk_ner=enable_spacy_uk_ner,
-                    ))
-                    return future.result()
-            else:
-                # No running loop, we can use asyncio.run
-                return asyncio.run(self.normalize_async(
-                    text,
-                    language=language,
-                    remove_stop_words=remove_stop_words,
-                    preserve_names=preserve_names,
-                    enable_advanced_features=enable_advanced_features,
-                    preserve_feminine_suffix_uk=preserve_feminine_suffix_uk,
-                    enable_spacy_uk_ner=enable_spacy_uk_ner,
-                ))
-        except RuntimeError:
-            # No event loop, create one
-            return asyncio.run(self.normalize_async(
-                text,
-                language=language,
-                remove_stop_words=remove_stop_words,
-                preserve_names=preserve_names,
-                enable_advanced_features=enable_advanced_features,
-                preserve_feminine_suffix_uk=preserve_feminine_suffix_uk,
-                enable_spacy_uk_ner=enable_spacy_uk_ner,
-            ))
-
-    def normalize(
-        self,
-        text: str,
-        language: Optional[str] = None,
-        remove_stop_words: bool = True,
-        preserve_names: bool = True,
-        enable_advanced_features: bool = True,
-        preserve_feminine_suffix_uk: bool = False,
-        enable_spacy_uk_ner: bool = False,
-    ) -> NormalizationResult:
-        """Legacy compatibility method."""
+    def normalize(self, text: str, language=None, remove_stop_words=True,
+                  preserve_names=True, enable_advanced_features=True, **options):
+        """Compatibility entry point for positional normalization options."""
         return self.normalize_sync(
-            text,
-            language=language,
-            remove_stop_words=remove_stop_words,
-            preserve_names=preserve_names,
-            enable_advanced_features=enable_advanced_features,
-            preserve_feminine_suffix_uk=preserve_feminine_suffix_uk,
-            enable_spacy_uk_ner=enable_spacy_uk_ner,
+            text, language=language, remove_stop_words=remove_stop_words,
+            preserve_names=preserve_names, enable_advanced_features=enable_advanced_features,
+            **options,
+        )
+
+    _normalize_sync = normalize_sync
+
+    def _tag_roles(self, tokens, language="ru", quoted_segments=None):
+        return self.normalization_factory.role_classifier.tag_tokens(
+            tokens, language, quoted_segments
+        )[0]
+
+    def _morph_nominal(self, token, language="ru"):
+        return self.morphology_adapter.to_nominative(token, language)
+
+    def infer_gender(self, elements, language="ru"):
+        return self.normalization_factory.gender_processor.infer_gender_scores(elements, language)
+
+    def adjust_surname_gender(self, lemma, language, gender, gap, original=None):
+        processor = self.normalization_factory.gender_processor
+        return processor.adjust_surname_with_evidence(lemma, language, gender, gap, original)
+
+    def group_persons(self, tagged_tokens, language="ru"):
+        tokens = [token for token, _ in tagged_tokens]
+        return self.normalization_factory._extract_persons(
+            tagged_tokens, tokens, [role for _, role in tagged_tokens], language
         )
 
     def validate_identifier(self, identifier: str, identifier_type: str) -> bool:
@@ -839,8 +482,8 @@ class NormalizationService:
         """Load diminutive to full name mappings from JSON dictionaries."""
         maps: Dict[str, Dict[str, str]] = {}
 
-        base_path = Path(__file__).resolve().parents[4]
-        data_dir = base_path / "data"
+        from ...data.resources import PACKAGE_DATA_DIR
+        data_dir = PACKAGE_DATA_DIR
 
         for lang in ("ru", "uk"):
             path = data_dir / f"diminutives_{lang}.json"
@@ -898,19 +541,26 @@ class NormalizationService:
             remove_stop_words=remove_stop_words,
             preserve_names=preserve_names,
             enable_advanced_features=enable_advanced_features,
+            enable_morphology=enable_advanced_features,
             language=language,
             preserve_feminine_suffix_uk=preserve_feminine_suffix_uk,
             enable_spacy_uk_ner=enable_spacy_uk_ner,
             en_use_nameparser=en_use_nameparser,
+            enable_nameparser_en=en_use_nameparser,
             enable_en_nickname_expansion=enable_en_nickname_expansion,
+            enable_en_nicknames=enable_en_nickname_expansion,
             enable_spacy_en_ner=enable_spacy_en_ner,
             ru_yo_strategy=ru_yo_strategy,
             yo_strategy=ru_yo_strategy,  # Use ru_yo_strategy for yo_strategy
             enable_ru_nickname_expansion=enable_ru_nickname_expansion,
             enable_spacy_ru_ner=enable_spacy_ru_ner,
         )
+        # Use the same effective configuration for direct and orchestrated calls.
+        # Request-level processing options remain explicit arguments above.
+        for field in fields(config):
+            if hasattr(feature_flags, field.name):
+                setattr(config, field.name, getattr(feature_flags, field.name))
         result = await self.normalization_factory.normalize_text(text, config, feature_flags)
-        result = self._enforce_nominative_and_gender(result, language)
 
         # Apply language-specific apostrophe normalization
         result = self._apply_language_specific_apostrophe_normalization(result, language)
@@ -975,267 +625,6 @@ class NormalizationService:
 
         return result
 
-    async def _process_with_legacy(
-        self,
-        text: str,
-        language: str,
-        remove_stop_words: bool,
-        preserve_names: bool,
-        enable_advanced_features: bool,
-        feature_flags: Optional[FeatureFlags] = None,
-    ) -> NormalizationResult:
-        """Process with legacy implementation."""
-        if self._legacy_service is None:
-            from .normalization_service_legacy import NormalizationService as LegacyService
-            self._legacy_service = LegacyService()
-
-        # Legacy service is synchronous, so we run it in executor
-        import asyncio
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            self._legacy_service.normalize,
-            text,
-            language,
-            remove_stop_words,
-            preserve_names,
-            enable_advanced_features,
-        )
-        return self._enforce_nominative_and_gender(result, language)
-
-    async def _dual_process(
-        self,
-        text: str,
-        language: str,
-        remove_stop_words: bool,
-        preserve_names: bool,
-        enable_advanced_features: bool,
-        preserve_feminine_suffix_uk: bool = False,
-        enable_spacy_uk_ner: bool = False,
-        en_use_nameparser: bool = True,
-        enable_en_nickname_expansion: bool = True,
-        enable_spacy_en_ner: bool = False,
-        ru_yo_strategy: str = "preserve",
-        enable_ru_nickname_expansion: bool = True,
-        enable_spacy_ru_ner: bool = False,
-        feature_flags: Optional[FeatureFlags] = None,
-    ) -> NormalizationResult:
-        """Process with both implementations for comparison."""
-        import asyncio
-
-        # Run both implementations concurrently
-        factory_task = asyncio.create_task(
-            self._process_with_factory(text, language, remove_stop_words, preserve_names, enable_advanced_features,
-                                     preserve_feminine_suffix_uk, enable_spacy_uk_ner,
-                                     en_use_nameparser, enable_en_nickname_expansion, enable_spacy_en_ner,
-                                     ru_yo_strategy, enable_ru_nickname_expansion, enable_spacy_ru_ner, feature_flags)
-        )
-        legacy_task = asyncio.create_task(
-            self._process_with_legacy(text, language, remove_stop_words, preserve_names, enable_advanced_features, feature_flags)
-        )
-
-        factory_result, legacy_result = await asyncio.gather(factory_task, legacy_task, return_exceptions=True)
-
-        # Log comparison results
-        if not isinstance(factory_result, Exception) and not isinstance(legacy_result, Exception):
-            parity_match = factory_result.normalized == legacy_result.normalized
-            self.logger.info(
-                f"Dual processing comparison: parity={parity_match}, "
-                f"factory='{factory_result.normalized}', legacy='{legacy_result.normalized}'"
-            )
-
-        # Return factory result by default, fallback to legacy on error
-        if isinstance(factory_result, Exception):
-            self.logger.warning(f"Factory failed in dual mode: {factory_result}")
-            return legacy_result if not isinstance(legacy_result, Exception) else self._build_error_result(text, str(factory_result))
-
-        return factory_result
-
-    def _enforce_nominative_and_gender(
-        self,
-        result: NormalizationResult,
-        language: Optional[str],
-    ) -> NormalizationResult:
-        """Force nominative outputs and retain feminine surname endings when needed."""
-
-        # TEMPORARY FIX: Disable duplicate morphology that corrupts factory results
-        print(f"DEBUG: _enforce_nominative_and_gender DISABLED to prevent double morphology")
-        return result
-
-        if not self.feature_flags.enforce_nominative():
-            return result
-
-        if not result.trace:
-            return result
-
-        lang = (language or result.language or "ru").lower()
-        if lang not in {"ru", "uk", "en"}:
-            return result
-
-        adapter = self.morphology_adapter
-        preserve_feminine = self.feature_flags.preserve_feminine_surnames()
-        personal_roles = {"given", "patronymic", "surname", "initial", "unknown"}
-
-        given_gender = "unknown"
-        personal_sequence = []
-
-        # Note: Original morphology logic was here but caused double processing
-        # since the factory already handles morphology correctly
-
-        for trace in result.trace:
-            role = trace.role
-            if role == "given" and given_gender == "unknown":
-                detected_gender = adapter.detect_gender(trace.output, lang)
-                if detected_gender in {"femn", "masc"}:
-                    given_gender = detected_gender
-
-            # Apply gender-based surname preservation for feminine names
-            # Only apply if we have detected feminine gender from a given name in this sequence
-            if (role == "surname" and preserve_feminine and given_gender == "femn"
-                and lang in ("ru", "uk")):  # Only for languages with gendered surnames
-                before_preserve = trace.output
-                preferred = prefer_feminine_form(before_preserve, given_gender, lang)
-                payload = {
-                    "type": "morph",
-                    "action": "preserve_feminine",
-                    "token": before_preserve,
-                    "gender_context": given_gender,
-                    "language": lang,
-                }
-                if preferred != before_preserve:
-                    trace.output = preferred
-                    payload["result"] = preferred
-                    # Log successful gender-based transformation
-                    self.logger.debug(f"Applied feminine form: {before_preserve} -> {preferred}")
-                trace.notes = self._append_trace_note(trace.notes, payload)
-
-            # Don't collect personal sequence here to avoid duplicates
-
-        # Remove duplicate traces and collect personal sequence, but allow duplicate initials
-        seen_tokens = set()
-        unique_traces = []
-        for trace in result.trace:
-            # For initials, allow duplicates (И. И. Петров)
-            # For other roles, check for duplicates
-            if trace.role != 'initial':
-                token_key = (trace.token, trace.role)
-                if token_key not in seen_tokens:
-                    seen_tokens.add(token_key)
-                    unique_traces.append(trace)
-                else:
-                    # Update existing trace with new output
-                    for existing_trace in unique_traces:
-                        if existing_trace.token == trace.token and existing_trace.role == trace.role:
-                            existing_trace.output = trace.output
-                            break
-            else:
-                # For initials, always add (allow duplicates)
-                unique_traces.append(trace)
-        
-        # Update result.trace with unique traces
-        result.trace = unique_traces
-        
-        # Collect personal sequence from unique traces
-        for trace in result.trace:
-            role = trace.role
-            if role in personal_roles:
-                # Skip punctuation and separators
-                # Filter separators and connectors, but be language-specific
-                # In English, comma might be name formatting ("Last, First")
-                if trace.output in {';', '|', '&', 'и', 'та', 'and'}:
-                    continue
-                # For non-English languages, also filter comma
-                if trace.output == ',' and lang != 'en':
-                    continue
-                # Skip Latin tokens in Cyrillic languages (mixed script filtering)
-                # But allow Latin tokens if: 1) mixed personal names context OR 2) organizational context with clear names
-                if lang in ("ru", "uk") and self._is_latin_token(trace.output):
-                    original_text = getattr(result, 'original_text', '')
-                    is_mixed_context = self._has_mixed_personal_names(original_text)
-                    is_personal_name = self._could_be_personal_name(trace.output)
-
-                    # More conservative: require mixed context AND personal name,
-                    # OR organizational keywords with clear English names
-                    has_org_context = any(word in original_text.lower() for word in ['llc', 'company', 'corp', 'ltd', 'inc'])
-                    is_clear_english_name = (trace.output.isalpha() and
-                                            len(trace.output) > 2 and
-                                            trace.output[0].isupper() and
-                                            not any(c in trace.output for c in 'áéíóúàèìòùâêîôûäëïöüç'))
-
-                    if not ((is_mixed_context and is_personal_name) or
-                            (has_org_context and is_clear_english_name)):
-                        continue
-                personal_sequence.append((role, trace.output))
-
-        person_tokens = [token for _, token in personal_sequence]
-
-        if person_tokens:
-            # Remove duplicates while preserving order, but allow duplicate initials
-            seen = set()
-            unique_person_tokens = []
-            for i, (role, token) in enumerate(personal_sequence):
-                # For initials, allow duplicates (И. И. Петров)
-                # For other roles, skip if we've already processed this token
-                if role != 'initial' and token.lower() in seen:
-                    continue
-                    
-                if role != 'initial':
-                    seen.add(token.lower())
-                    
-                unique_person_tokens.append(token)
-            
-            # Apply titlecase to person tokens
-            titlecased_tokens = []
-            for token in unique_person_tokens:
-                titlecased_token = self._to_title(token)
-                titlecased_tokens.append(titlecased_token)
-            
-            # Enhanced person grouping with improved logic
-            persons_text = self._extract_persons_from_sequence(personal_sequence)
-
-            if len(persons_text) > 1:
-                result.normalized = " | ".join(persons_text)
-            elif persons_text:
-                # Single person extracted - use the cleaned person text instead of raw tokens
-                result.normalized = persons_text[0]
-            else:
-                result.normalized = " ".join(titlecased_tokens)
-            person_tokens = titlecased_tokens  # Update person_tokens for tokens field
-
-        organization_tokens = list(result.organizations_core or [])
-        if not organization_tokens:
-            organization_tokens = [trace.output for trace in result.trace if trace.role == "org"]
-
-        result.tokens = person_tokens + organization_tokens
-
-        if result.persons:
-            seq_index = 0
-            for person in result.persons:
-                roles = person.get("roles", [])
-                new_tokens = []
-                for _ in roles:
-                    if seq_index >= len(personal_sequence):
-                        break
-                    _, token_value = personal_sequence[seq_index]
-                    new_tokens.append(token_value)
-                    seq_index += 1
-                if new_tokens:
-                    person["tokens"] = new_tokens
-            result.persons_core = [person.get("tokens", []) for person in result.persons]
-        else:
-            result.persons_core = [person_tokens] if person_tokens else []
-
-        if given_gender in {"femn", "masc"}:
-            result.person_gender = given_gender
-
-        return result
-
-    @staticmethod
-    def _append_trace_note(existing: Optional[str], payload: Dict[str, str]) -> str:
-        serialized = json.dumps(payload, ensure_ascii=False)
-        if existing:
-            return f"{existing}; {serialized}"
-        return serialized
 
     def _build_error_result(self, text: str, error_msg: str) -> NormalizationResult:
         """Build error result for failed processing."""

@@ -6,7 +6,7 @@ Tests the internal utility methods that support tokenization functionality.
 """
 
 import pytest
-from src.ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
+from ai_service.layers.normalization.tokenizer_service import TokenizerService, TokenizationResult
 
 
 class TestTokenizerServiceUtils:

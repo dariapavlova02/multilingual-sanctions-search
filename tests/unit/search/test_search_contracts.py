@@ -3,7 +3,7 @@ Unit tests for search contracts and data transformations.
 """
 
 import pytest
-from src.ai_service.contracts.search_contracts import (
+from ai_service.contracts.search_contracts import (
     SearchOpts, SearchMode, SearchType, ACScore, VectorHit, Candidate,
     SearchInfo, SearchResult, SearchMetrics, extract_search_candidates,
     create_search_info
@@ -220,7 +220,7 @@ class TestExtractSearchCandidates:
         candidates = extract_search_candidates(signals_result)
         
         expected = ["иван петров", "и. петров", "ivan petrov", "мария сидорова", "м. сидорова"]
-        assert set(candidates) == set(expected)
+        assert {candidate["name"] for candidate in candidates} == set(expected)
     
     def test_extract_from_organizations(self):
         """Test extracting candidates from organizations."""
@@ -241,7 +241,7 @@ class TestExtractSearchCandidates:
         candidates = extract_search_candidates(signals_result)
         
         expected = ["ооо приватбанк", "приватбанк", "privatbank", "apple inc", "apple"]
-        assert set(candidates) == set(expected)
+        assert {candidate["name"] for candidate in candidates} == set(expected)
     
     def test_extract_mixed_entities(self):
         """Test extracting candidates from mixed entities."""
@@ -263,7 +263,7 @@ class TestExtractSearchCandidates:
         candidates = extract_search_candidates(signals_result)
         
         expected = ["иван петров", "и. петров", "ооо приватбанк", "приватбанк"]
-        assert set(candidates) == set(expected)
+        assert {candidate["name"] for candidate in candidates} == set(expected)
     
     def test_extract_empty_result(self):
         """Test extracting from empty signals result."""
@@ -290,7 +290,7 @@ class TestExtractSearchCandidates:
         candidates = extract_search_candidates(signals_result)
         
         expected = ["иван петров", "и. петров"]
-        assert set(candidates) == set(expected)
+        assert {candidate["name"] for candidate in candidates} == set(expected)
 
 
 class TestCreateSearchInfo:
@@ -298,7 +298,7 @@ class TestCreateSearchInfo:
     
     def test_create_search_info_with_results(self):
         """Test creating SearchInfo from SearchResult with results."""
-        from src.ai_service.contracts.search_contracts import SearchResult, ACScore, VectorHit, Candidate
+        from ai_service.contracts.search_contracts import SearchResult, ACScore, VectorHit, Candidate
         
         # Create mock search result
         ac_results = [
@@ -387,7 +387,7 @@ class TestCreateSearchInfo:
     
     def test_create_search_info_empty_results(self):
         """Test creating SearchInfo from empty SearchResult."""
-        from src.ai_service.contracts.search_contracts import SearchResult
+        from ai_service.contracts.search_contracts import SearchResult
         
         search_result = SearchResult(
             candidates=[],

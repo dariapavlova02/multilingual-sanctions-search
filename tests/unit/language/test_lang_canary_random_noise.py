@@ -8,8 +8,8 @@ on random noise and meaningless input strings.
 import pytest
 import random
 import string
-from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
-from src.ai_service.config import LANGUAGE_CONFIG
+from ai_service.layers.language.language_detection_service import LanguageDetectionService
+from ai_service.config import LANGUAGE_CONFIG
 
 
 class TestLanguageDetectionCanaryRandomNoise:

@@ -5,6 +5,10 @@ Defines contracts for integrating HybridSearchService into the existing pipeline
 without breaking existing layer contracts.
 """
 
+from ..utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, TypedDict
 from enum import Enum
@@ -291,6 +295,8 @@ def extract_search_candidates(signals_result: Any) -> List[SearchCandidate]:
             aliases = _get(person, 'aliases')
             if aliases:
                 for alias in aliases:
+                    if not alias or not str(alias).strip():
+                        continue
                     candidates.append(SearchCandidate(
                         id=_get(person, 'id', ''),
                         name=alias,
@@ -315,6 +321,8 @@ def extract_search_candidates(signals_result: Any) -> List[SearchCandidate]:
             aliases = _get(org, 'aliases')
             if aliases:
                 for alias in aliases:
+                    if not alias or not str(alias).strip():
+                        continue
                     candidates.append(SearchCandidate(
                         id=_get(org, 'id', ''),
                         name=alias,
@@ -394,7 +402,7 @@ def create_search_info(search_result: SearchResult) -> SearchInfo:
     high_confidence_matches = 0
 
     # Debug logging
-    print(f"[CHECK] DEBUG: Processing {len(search_result.candidates)} candidates for high_confidence_matches")
+    logger.debug(f"[CHECK] DEBUG: Processing {len(search_result.candidates)} candidates for high_confidence_matches")
 
     for i, c in enumerate(search_result.candidates):
         # Determine if this is a vector match based on search_mode or search_type
@@ -424,18 +432,18 @@ def create_search_info(search_result: SearchResult) -> SearchInfo:
             actual_score = 0.0
 
         # Debug candidate details
-        print(f"   Candidate {i}: score={actual_score:.3f}, is_vector={is_vector_match}")
+        logger.debug(f"   Candidate {i}: score={actual_score:.3f}, is_vector={is_vector_match}")
         if hasattr(c, 'search_mode'):
-            print(f"      search_mode={c.search_mode}")
+            logger.debug(f"      search_mode={c.search_mode}")
         if hasattr(c, 'search_type'):
-            print(f"      search_type={c.search_type}")
+            logger.debug(f"      search_type={c.search_type}")
 
         # Apply strict thresholds
         if is_vector_match:
             # Vector match - very high threshold to prevent false positives
             threshold = 0.90
             passes = actual_score >= threshold
-            print(f"      Vector threshold: {actual_score:.3f} >= {threshold} = {passes}")
+            logger.debug(f"      Vector threshold: {actual_score:.3f} >= {threshold} = {passes}")
             if passes:
                 high_confidence_matches += 1
         else:
@@ -445,11 +453,11 @@ def create_search_info(search_result: SearchResult) -> SearchInfo:
             else:
                 threshold = 0.80  # Higher threshold for AC/exact matches
             passes = actual_score >= threshold
-            print(f"      AC/Fuzzy threshold: {actual_score:.3f} >= {threshold} = {passes}")
+            logger.debug(f"      AC/Fuzzy threshold: {actual_score:.3f} >= {threshold} = {passes}")
             if passes:
                 high_confidence_matches += 1
 
-    print(f"[TARGET] FINAL: high_confidence_matches = {high_confidence_matches}")
+    logger.debug(f"[TARGET] FINAL: high_confidence_matches = {high_confidence_matches}")
 
     return SearchInfo(
         has_exact_matches=has_exact,

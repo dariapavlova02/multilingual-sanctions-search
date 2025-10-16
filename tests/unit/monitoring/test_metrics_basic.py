@@ -99,7 +99,7 @@ async def test_metrics_service_basic_operations(simple_metrics_service):
     """Test basic MetricsService operations"""
 
     # Register test metrics first
-    from src.ai_service.monitoring.metrics_service import MetricDefinition, MetricType
+    from ai_service.monitoring.metrics_service import MetricDefinition, MetricType
     simple_metrics_service.register_metric(MetricDefinition(
         name="test.counter",
         metric_type=MetricType.COUNTER,

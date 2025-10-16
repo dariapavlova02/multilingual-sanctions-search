@@ -6,8 +6,8 @@ import asyncio
 import time
 import statistics
 import pytest
-from src.ai_service.core.orchestrator_factory_with_search import OrchestratorFactoryWithSearch
-from src.ai_service.contracts.search_contracts import SearchOpts, SearchMode
+from ai_service.core.orchestrator_factory_with_search import OrchestratorFactoryWithSearch
+from ai_service.contracts.search_contracts import SearchOpts, SearchMode
 
 
 @pytest.mark.performance

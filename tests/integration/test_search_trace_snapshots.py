@@ -7,9 +7,9 @@ import pytest
 from unittest.mock import Mock, patch
 from typing import Dict, Any, List
 
-from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator
-from src.ai_service.utils.feature_flags import FeatureFlags
-from src.ai_service.contracts.trace_models import SearchTrace
+from ai_service.core.unified_orchestrator import UnifiedOrchestrator
+from ai_service.utils.feature_flags import FeatureFlags
+from ai_service.contracts.trace_models import SearchTrace
 from tests.utils.snapshots import (
     normalize_trace_for_snapshot,
     create_stable_snapshot,

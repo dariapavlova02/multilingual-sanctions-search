@@ -193,6 +193,7 @@ class TestUnifiedOrchestrator:
             remove_stop_words=False,
             preserve_names=False,
             enable_advanced_features=False,
+            force_full_pipeline=True,
         )
 
         # Verify normalization service received correct flags
@@ -246,7 +247,7 @@ class TestUnifiedOrchestrator:
             enable_embeddings=False,
         )
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         # Core processing should work
         assert result.success is True
@@ -269,7 +270,7 @@ class TestUnifiedOrchestrator:
             side_effect=Exception("Normalization failed")
         )
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         # Should handle error gracefully
         assert result.success is False
@@ -290,7 +291,7 @@ class TestUnifiedOrchestrator:
 
         mock_services["normalization_service"].normalize_async = slow_normalize
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         # Should complete but be slow
         assert result.success is True
@@ -320,7 +321,7 @@ class TestUnifiedOrchestrator:
     async def test_signals_integration(self, orchestrator, mock_services):
         """Test signals service integration with normalization results"""
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         # Verify signals service received normalization result
         call_args = mock_services["signals_service"].extract_signals.call_args
@@ -335,7 +336,7 @@ class TestUnifiedOrchestrator:
     async def test_trace_preservation(self, orchestrator, mock_services):
         """Test that token traces are preserved through the pipeline"""
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         # Verify traces are preserved
         assert len(result.trace) == 2
@@ -347,7 +348,9 @@ class TestUnifiedOrchestrator:
     async def test_language_hint(self, orchestrator, mock_services):
         """Test language hint override"""
 
-        await orchestrator.process(text="Test", language_hint="en")
+        await orchestrator.process(
+            text="Test", language_hint="en", force_full_pipeline=True
+        )
 
         # Should use hint instead of detection
         call_args = mock_services["normalization_service"].normalize_async.call_args
@@ -356,7 +359,7 @@ class TestUnifiedOrchestrator:
     async def test_result_serialization(self, orchestrator, mock_services):
         """Test that result can be serialized to dict"""
 
-        result = await orchestrator.process(text="Test")
+        result = await orchestrator.process(text="Test", force_full_pipeline=True)
 
         data = result.to_dict()
 
@@ -619,7 +622,7 @@ class TestUnifiedOrchestratorEdgeCases:
         )
 
         # Should handle the error gracefully
-        result = await orchestrator.process("Test text")
+        result = await orchestrator.process("Test text", force_full_pipeline=True)
         assert result.success is False
         assert len(result.errors) > 0
 

@@ -350,20 +350,21 @@
     "input": "Dr. John A. Smith Jr.",
     "expected_personas": [
       {
-        "normalized": "John Smith",
+        "normalized": "John A. Smith",
         "tokens": [
           {"text": "John", "lemma": "John", "role": "given"},
+          {"text": "A.", "lemma": "A.", "role": "initial"},
           {"text": "Smith", "lemma": "Smith", "role": "surname"}
         ],
         "language": "en",
         "trace": {
-          "rules": ["nfkc", "title_suffix_filter", "role_tagger:given+surname"],
+          "rules": ["nfkc", "title_suffix_filter", "middle_name_preserved", "role_tagger:given+initial+surname"],
           "gender": "male",
           "warnings": []
         }
       }
     ],
-    "notes": "Титулы и суффиксы не попадают в итоговую строку"
+    "notes": "Титулы и суффиксы не попадают в итоговую строку; инициал сохраняется как идентификационный признак"
   },
   {
     "id": "en_nickname",
@@ -394,20 +395,21 @@
     "input": "Mary Jane Watson",
     "expected_personas": [
       {
-        "normalized": "Mary Watson",
+        "normalized": "Mary Jane Watson",
         "tokens": [
           {"text": "Mary", "lemma": "Mary", "role": "given"},
+          {"text": "Jane", "lemma": "Jane", "role": "given"},
           {"text": "Watson", "lemma": "Watson", "role": "surname"}
         ],
         "language": "en",
         "trace": {
-          "rules": ["nfkc", "middle_name_filter", "role_tagger:given+surname"],
+          "rules": ["nfkc", "middle_name_preserved", "role_tagger:given+given+surname"],
           "gender": "female",
           "warnings": []
         }
       }
     ],
-    "notes": "Middle name убирается из normalized"
+    "notes": "Middle name сохраняется как идентификационный признак"
   },
   {
     "id": "en_apostrophe",

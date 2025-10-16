@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from ..utils.logging_config import get_logger
+from ..utils.source_text_view import without_format_controls
+from ..data.patterns.identifiers import get_compiled_patterns_cached
 
 
 class EmbeddingPreprocessor:
@@ -55,7 +57,6 @@ class EmbeddingPreprocessor:
             r"\bpassport\s*№\s*\d+\b",  # passport №12345
             r"\bID\s*\d+\b",  # ID12345
             r"\b№\s*\d+\b",  # №12345
-            r"\bИНН\s*\d+\b",  # ИНН1234567890
             r"\bЄДРПОУ\s*\d+\b",  # ЄДРПОУ1234567890
             r"\bОГРН\s*\d+\b",  # ОГРН1234567890
             r"\bVAT\s*\d+\b",  # VAT1234567890
@@ -76,7 +77,7 @@ class EmbeddingPreprocessor:
                 r"\b(?:dob|дата рождения|дата народження|birth)\s*:?\s*(\d{2}/\d{2}/\d{4})\b",  # dob:01/01/1980
             ],
             "gender": [
-                r"\b(?:gender|пол|стать)\s*:?\s*([MFmf])\b",  # gender:M, пол:М
+                r"\b(?:gender|пол|стать)\s*:?\s*([MFmfМмЖжЧч])\b",  # gender:M, пол:М, стать:Ч
                 r"\b(?:male|female|мужской|женский|чоловічий|жіночий)\b",  # Full words
             ]
         }
@@ -84,6 +85,8 @@ class EmbeddingPreprocessor:
         # Compile patterns for efficiency
         self.compiled_date_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.date_patterns]
         self.compiled_id_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.id_patterns]
+        self.compiled_tax_patterns = [compiled for spec, compiled in get_compiled_patterns_cached()
+                                     if spec.type == "inn"]
         self.compiled_attribute_patterns = {
             attr: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
             for attr, patterns in self.attribute_patterns.items()
@@ -115,7 +118,9 @@ class EmbeddingPreprocessor:
         }
         
         if config_path is None:
-            config_path = "config/embedding_preprocessor_config.json"
+            from ai_service.data.resources import CONFIG_DIR
+
+            config_path = CONFIG_DIR / "embedding_preprocessor_config.json"
         
         config_file = Path(config_path)
         if config_file.exists():
@@ -152,7 +157,7 @@ class EmbeddingPreprocessor:
             return ""
 
         # Start with the input text
-        normalized = text.strip()
+        normalized = without_format_controls(text).strip()
 
         if include_attrs:
             # Extract attributes from text and provided attributes
@@ -162,12 +167,17 @@ class EmbeddingPreprocessor:
                 for key, value in attributes.items():
                     extracted_attrs[key] = value
             
+            # Remove attribute annotations from the main text before appending
+            # their normalized representation.
+            for patterns in self.compiled_attribute_patterns.values():
+                for pattern in patterns:
+                    normalized = pattern.sub("", normalized)
+
             # Remove dates and IDs from the main text
             for pattern in self.compiled_date_patterns:
                 normalized = pattern.sub("", normalized)
             
-            for pattern in self.compiled_id_patterns:
-                normalized = pattern.sub("", normalized)
+            normalized = self._remove_identifiers(normalized)
             
             # Add attributes to the text
             if extracted_attrs:
@@ -180,8 +190,7 @@ class EmbeddingPreprocessor:
                 normalized = pattern.sub("", normalized)
 
             # Remove IDs
-            for pattern in self.compiled_id_patterns:
-                normalized = pattern.sub("", normalized)
+            normalized = self._remove_identifiers(normalized)
 
         # Clean up the text
         if fold_spaces:
@@ -191,11 +200,20 @@ class EmbeddingPreprocessor:
         # Remove leading/trailing whitespace
         normalized = normalized.strip()
 
-        self.logger.debug(
-            f"Normalized '{text}' -> '{normalized}' (include_attrs={include_attrs})"
-        )
+        self.logger.debug("Embedding input normalized (include_attrs=%s)", include_attrs)
 
         return normalized
+
+    def _remove_identifiers(self, text):
+        for pattern in self.compiled_tax_patterns:
+            # Shared extraction also has context-only numeric matches. Remove
+            # the full span only when it includes an explicit identifier label;
+            # a bare number in an organization name is not sufficient evidence.
+            text = pattern.sub(lambda match: "" if match.span(0) != match.span(1)
+                               else match.group(0), text)
+        for pattern in self.compiled_id_patterns:
+            text = pattern.sub("", text)
+        return text
 
     def _extract_attributes_from_text(self, text: str) -> Dict[str, str]:
         """Extract attributes from text using patterns"""
@@ -238,9 +256,9 @@ class EmbeddingPreprocessor:
         elif attr_name == "gender":
             # Normalize gender to M/F
             value_lower = value.lower()
-            if value_lower in ["m", "male", "мужской", "чоловічий"]:
+            if value_lower in ["m", "м", "ч", "male", "мужской", "чоловічий"]:
                 return "M"
-            elif value_lower in ["f", "female", "женский", "жіночий"]:
+            elif value_lower in ["f", "ж", "female", "женский", "жіночий"]:
                 return "F"
             else:
                 return value.upper()
@@ -249,19 +267,15 @@ class EmbeddingPreprocessor:
 
     def _normalize_date(self, date_str: str) -> str:
         """Normalize date string to YYYY-MM-DD format"""
-        # Try different date formats
-        date_patterns = [
-            (r"(\d{4})-(\d{1,2})-(\d{1,2})", r"\1-\2-\3"),  # YYYY-MM-DD
-            (r"(\d{1,2})\.(\d{1,2})\.(\d{4})", r"\3-\1-\2"),  # DD.MM.YYYY
-            (r"(\d{1,2})/(\d{1,2})/(\d{4})", r"\3-\1-\2"),  # DD/MM/YYYY
-        ]
-        
-        for pattern, replacement in date_patterns:
-            match = re.match(pattern, date_str)
-            if match:
-                year, month, day = match.groups()
-                # Pad with zeros
-                return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        iso_match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", date_str)
+        if iso_match:
+            year, month, day = iso_match.groups()
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+        local_match = re.fullmatch(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", date_str)
+        if local_match:
+            day, month, year = local_match.groups()
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
         
         return date_str  # Return as-is if no pattern matches
 

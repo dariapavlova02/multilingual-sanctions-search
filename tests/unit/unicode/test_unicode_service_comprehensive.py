@@ -72,15 +72,13 @@ class TestUnicodeService:
         """Test aggressive normalization mode"""
         # Test with emoji and special characters
         text_with_emoji = "Hello 👋 World 🌍"
-        result = self.service.normalize_text(text_with_emoji, aggressive=True)
+        conservative = self.service.normalize_text(text_with_emoji, aggressive=False)
+        aggressive = self.service.normalize_text(text_with_emoji, aggressive=True)
 
-        # Aggressive mode applies ASCII folding but doesn't remove emoji
-        normalized_text = result["normalized"]
-        assert "hello" in normalized_text.lower()
-        assert "world" in normalized_text.lower()
-        # Note: emoji are preserved in current implementation
-        assert "👋" in normalized_text
-        assert "🌍" in normalized_text
+        # The cleanup contract preserves emoji normally and removes them when
+        # aggressive cleanup is explicitly requested.
+        assert conservative["normalized"] == text_with_emoji
+        assert aggressive["normalized"] == "Hello World"
 
     def test_normalize_text_mixed_scripts(self):
         """Test normalization with mixed scripts"""
@@ -375,4 +373,3 @@ class TestUnicodeServiceIntegration:
         # Both modes should preserve core content (case preserved)
         assert "cafe" in normalized_text.lower() or "jose" in normalized_text.lower()
         assert len(normalized_text) > 0
-

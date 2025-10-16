@@ -6,9 +6,9 @@ long words, and numeric/punctuation dominance.
 """
 
 import pytest
-from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
-from src.ai_service.config import LANGUAGE_CONFIG
-from src.ai_service.utils.types import LanguageDetectionResult
+from ai_service.layers.language.language_detection_service import LanguageDetectionService
+from ai_service.config import LANGUAGE_CONFIG
+from ai_service.utils.types import LanguageDetectionResult
 
 
 class TestLanguageDetectionEdgeCases:

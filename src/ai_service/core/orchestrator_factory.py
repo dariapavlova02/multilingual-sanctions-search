@@ -7,11 +7,12 @@ into the unified orchestrator architecture.
 
 from typing import Optional
 
-from ..config import SERVICE_CONFIG, FEATURE_FLAGS
+from ..config import SERVICE_CONFIG
+from ..utils.feature_flags import get_feature_flag_manager
 from ..exceptions import ServiceInitializationError
 # EmbeddingService imported locally to avoid circular imports
 from ..layers.language.language_detection_service import LanguageDetectionService
-from ..layers.normalization.factory_wrapper import FactoryBasedNormalizationService
+from ..layers.normalization.normalization_service import NormalizationService
 from ..layers.signals.signals_service import SignalsService
 from ..layers.smart_filter.smart_filter_adapter import SmartFilterAdapter
 from ..layers.unicode.unicode_service import UnicodeService
@@ -115,10 +116,10 @@ class OrchestratorFactory:
             # Normalization service - always required, THE CORE
             if normalization_service is None:
                 try:
-                    normalization_service = FactoryBasedNormalizationService()
-                    logger.info("Using FactoryBasedNormalizationService with morphological processing")
+                    normalization_service = NormalizationService()
+                    logger.info("Using NormalizationService with morphological processing")
                 except Exception as e:
-                    logger.error(f"Failed to initialize factory-based normalization service: {e}")
+                    logger.error(f"Failed to initialize normalization service: {e}")
                     raise ServiceInitializationError(f"Normalization service: {e}")
 
             # Signals service - always required
@@ -141,8 +142,7 @@ class OrchestratorFactory:
                     logger.info("Smart filter adapter initialized")
                 except Exception as e:
                     logger.warning(f"Failed to initialize smart filter adapter: {e}")
-                    smart_filter_service = None
-                    enable_smart_filter = False
+                    raise ServiceInitializationError("Configured smart filter could not initialize") from e
 
             # Variants service - optional
             if enable_variants and variants_service is None:
@@ -153,8 +153,7 @@ class OrchestratorFactory:
                     logger.info("Variants service initialized")
                 except Exception as e:
                     logger.warning(f"Failed to initialize variants service: {e}")
-                    variants_service = None
-                    enable_variants = False
+                    raise ServiceInitializationError("Configured variants service could not initialize") from e
 
             # Embeddings service - optional
             if enable_embeddings and embeddings_service is None:
@@ -167,8 +166,7 @@ class OrchestratorFactory:
                     logger.info("Embeddings service initialized")
                 except Exception as e:
                     logger.warning(f"Failed to initialize embeddings service: {e}")
-                    embeddings_service = None
-                    enable_embeddings = False
+                    raise ServiceInitializationError("Configured embedding service could not initialize") from e
 
             # Decision engine - optional
             if enable_decision_engine and decision_engine is None:
@@ -178,8 +176,7 @@ class OrchestratorFactory:
                     logger.info("Decision engine initialized with unified config (ENV overrides supported)")
                 except Exception as e:
                     logger.warning(f"Failed to initialize decision engine: {e}")
-                    decision_engine = None
-                    enable_decision_engine = False
+                    raise ServiceInitializationError("Configured decision engine could not initialize") from e
 
             # Search service - optional
             if enable_search and search_service is None:
@@ -192,18 +189,7 @@ class OrchestratorFactory:
                     logger.info("Search service initialized")
                 except Exception as e:
                     logger.warning(f"Failed to initialize HybridSearchService: {e}")
-                    logger.info("Falling back to MockSearchService for development/testing")
-                    # Force use MockSearchService when Elasticsearch is not available
-                    try:
-                        from ..layers.search.mock_search_service import MockSearchService
-                        search_service = MockSearchService()
-                        search_service.initialize()
-                        logger.info("[OK] MockSearchService initialized successfully - search escalation available")
-                        # Keep enable_search=True so search layer still runs with mock
-                    except Exception as mock_e:
-                        logger.error(f"[ERROR] Critical: Failed to initialize MockSearchService: {mock_e}")
-                        search_service = None
-                        enable_search = False
+                    raise ServiceInitializationError("Configured search service could not initialize") from e
 
             # Metrics service - optional but recommended for production
             metrics_service = None
@@ -233,7 +219,7 @@ class OrchestratorFactory:
                 decision_engine=decision_engine,
                 metrics_service=metrics_service,
                 search_service=search_service,
-                default_feature_flags=FEATURE_FLAGS,
+                default_feature_flags=get_feature_flag_manager().get_flags(),
                 # Configuration
                 enable_smart_filter=enable_smart_filter,
                 enable_variants=enable_variants,
@@ -281,10 +267,10 @@ class OrchestratorFactory:
         logger.info("Creating production orchestrator")
 
         return await OrchestratorFactory.create_orchestrator(
-            enable_smart_filter=True,
-            enable_variants=True,
-            enable_embeddings=True,
-            enable_decision_engine=True,    # Enable automated decision making
-            enable_search=True,             # Enable hybrid search service
+            enable_smart_filter=SERVICE_CONFIG.enable_smart_filter,
+            enable_variants=SERVICE_CONFIG.enable_variants,
+            enable_embeddings=SERVICE_CONFIG.enable_embeddings,
+            enable_decision_engine=SERVICE_CONFIG.enable_decision_engine,
+            enable_search=SERVICE_CONFIG.enable_search,
             allow_smart_filter_skip=False,  # Don't skip processing - always normalize
         )

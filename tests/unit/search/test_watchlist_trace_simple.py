@@ -5,7 +5,7 @@ Tests the trace functionality without heavy dependencies.
 
 import pytest
 from unittest.mock import Mock, patch
-from src.ai_service.contracts.trace_models import SearchTrace, SearchTraceHit, SearchTraceStep
+from ai_service.contracts.trace_models import SearchTrace, SearchTraceHit, SearchTraceStep
 
 
 class TestWatchlistTraceSimple:

@@ -11,10 +11,10 @@ import pytest
 import asyncio
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.normalization.processors.normalization_factory import (
+from ai_service.layers.normalization.processors.normalization_factory import (
     NormalizationFactory, NormalizationConfig
 )
-from src.ai_service.utils.feature_flags import FeatureFlagManager
+from ai_service.utils.feature_flags import FeatureFlagManager
 
 
 class TestTraceSmoke:
@@ -35,7 +35,7 @@ class TestTraceSmoke:
     @pytest.fixture
     def normalization_factory(self, mock_feature_flags):
         """Create normalization factory with mocked dependencies."""
-        with patch('src.ai_service.layers.normalization.processors.normalization_factory.get_feature_flag_manager', return_value=mock_feature_flags):
+        with patch('ai_service.layers.normalization.processors.normalization_factory.get_feature_flag_manager', return_value=mock_feature_flags):
             factory = NormalizationFactory()
             factory.feature_flags = mock_feature_flags
             return factory
@@ -306,15 +306,15 @@ class TestTraceSmoke:
     def test_trace_smoke_imports(self):
         """Smoke test that all required trace components can be imported."""
         # Test imports for tokenizer tracing
-        from src.ai_service.layers.normalization.token_ops import (
+        from ai_service.layers.normalization.token_ops import (
             collapse_double_dots, normalize_hyphenated_name
         )
 
         # Test imports for role tagger tracing
-        from src.ai_service.layers.normalization.role_tagger import RoleTagger
+        from ai_service.layers.normalization.role_tagger import RoleTagger
 
         # Test imports for search tracing
-        from src.ai_service.contracts.search_contracts import (
+        from ai_service.contracts.search_contracts import (
             SearchTraceStep, create_ac_tier0_trace, create_knn_fallback_trace,
             create_hybrid_rerank_trace
         )

@@ -3,7 +3,7 @@ Unit tests for Enhanced SmartFilter with AC integration
 """
 
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from ai_service.layers.smart_filter.smart_filter_service import SmartFilterService, FilterResult
 from ai_service.layers.patterns.unified_pattern_service import UnifiedPatternService, UnifiedPattern
@@ -20,11 +20,13 @@ class TestEnhancedSmartFilter:
     @pytest.fixture
     def smart_filter_with_ac(self, pattern_service):
         """Create SmartFilterService with AC integration enabled"""
-        return SmartFilterService(
+        service = SmartFilterService(
             enable_aho_corasick=True,
             pattern_service=pattern_service,
             enable_terrorism_detection=False,  # Disable for cleaner testing
         )
+        service._search_ac_candidates = AsyncMock(return_value=[])
+        return service
 
     @pytest.fixture
     def smart_filter_without_ac(self):

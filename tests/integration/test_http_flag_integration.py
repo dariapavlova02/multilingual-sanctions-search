@@ -9,9 +9,9 @@ import pytest
 import asyncio
 from typing import Dict, Any
 
-from src.ai_service.utils.feature_flags import FeatureFlags
-from src.ai_service.main import _merge_feature_flags
-from src.ai_service.utils.feature_flags import get_feature_flag_manager
+from ai_service.utils.feature_flags import FeatureFlags
+from ai_service.main import _merge_feature_flags
+from ai_service.utils.feature_flags import get_feature_flag_manager
 
 
 class TestHttpFlagIntegration:
@@ -169,7 +169,7 @@ class TestHttpFlagIntegration:
         
         try:
             # Load flags from environment
-            from src.ai_service.utils.feature_flags import get_feature_flag_manager
+            from ai_service.utils.feature_flags import get_feature_flag_manager
             flags = get_feature_flag_manager()._flags
             
             # Check that flags were loaded from environment
@@ -234,7 +234,6 @@ class TestHttpFlagIntegration:
     def test_feature_flags_backward_compatibility(self):
         """Test that existing flags are not affected by new validation flags."""
         flags = FeatureFlags(
-            use_factory_normalizer=True,
             fix_initials_double_dot=True,
             preserve_hyphenated_case=True,
             # Validation flags
@@ -252,7 +251,6 @@ class TestHttpFlagIntegration:
         flags_dict = flags.to_dict()
         
         # Check that existing flags are still present
-        assert 'use_factory_normalizer' in flags_dict
         assert 'fix_initials_double_dot' in flags_dict
         assert 'preserve_hyphenated_case' in flags_dict
         

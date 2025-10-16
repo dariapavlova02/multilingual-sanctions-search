@@ -33,17 +33,20 @@ class TestEmbeddingConfig:
     def test_custom_config(self):
         """Test custom configuration values"""
         config = EmbeddingConfig(
-            model_name="custom-model",
+            model_name="custom/model",
+            revision="a" * 40,
+            dimension=768,
             device="cuda",
             batch_size=32,
             enable_index=True
         )
-        assert config.model_name == "custom-model"
+        assert config.model_name == "custom/model"
         assert config.device == "cuda"
         assert config.batch_size == 32
         assert config.enable_index is True
 
 
+@pytest.mark.model
 class TestEmbeddingService:
     """Test embedding service functionality"""
 

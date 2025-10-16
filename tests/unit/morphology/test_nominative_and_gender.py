@@ -8,11 +8,11 @@ nominative case while preserving feminine surname endings when appropriate.
 import pytest
 from unittest.mock import Mock, patch
 
-from src.ai_service.layers.normalization.morphology_adapter import (
+from ai_service.layers.normalization.morphology_adapter import (
     MorphologyAdapter,
     MorphParse,
 )
-from src.ai_service.layers.normalization.morphology.gender_rules import (
+from ai_service.layers.normalization.morphology.gender_rules import (
     is_likely_feminine_surname,
     prefer_feminine_form,
     FEMALE_SUFFIXES_RU,
@@ -257,8 +257,8 @@ class TestNominativeAndGenderIntegration:
         with patch.object(adapter, 'parse') as mock_parse:
             # Mock parse for "Анна" (given name)
             mock_parse.side_effect = [
-                [MorphParse("Анна", "анна", 0.9, "NOUN,femn,sing,nomn", "femn", "nomn")],
-                [MorphParse("Иванова", "иванов", 0.9, "NOUN,femn,sing,nomn", "femn", "nomn")]
+                [MorphParse(nominative="Анна", normal="анна", score=0.9, tag="NOUN,femn,sing,nomn", gender="femn", case="nomn")],
+                [MorphParse(nominative="Иванова", normal="иванов", score=0.9, tag="NOUN,femn,sing,nomn", gender="femn", case="nomn")],
             ]
             
             # Test given name detection
@@ -277,10 +277,9 @@ class TestNominativeAndGenderIntegration:
         with patch.object(adapter, 'parse') as mock_parse:
             # Mock parse for "Олена" (given name)
             mock_parse.side_effect = [
-                [MorphParse("Олена", "олена", 0.9, "NOUN,femn,sing,nomn", "femn", "nomn")],
-                [MorphParse("Ковальська", "ковальський", 0.9, "NOUN,femn,sing,nomn", "femn", "nomn")]
+                [MorphParse(nominative="Олена", normal="олена", score=0.9, tag="NOUN,femn,sing,nomn", gender="femn", case="nomn")],
+                [MorphParse(nominative="Ковальська", normal="ковальський", score=0.9, tag="NOUN,femn,sing,nomn", gender="femn", case="nomn")],
             ]
-            
             # Test given name detection
             gender = adapter.detect_gender("Олена", "uk")
             assert gender == "femn"
@@ -297,8 +296,8 @@ class TestNominativeAndGenderIntegration:
         with patch.object(adapter, 'parse') as mock_parse:
             # Mock parse for "Иван" (given name)
             mock_parse.side_effect = [
-                [MorphParse("Иван", "иван", 0.9, "NOUN,masc,sing,nomn", "masc", "nomn")],
-                [MorphParse("Петров", "петров", 0.9, "NOUN,masc,sing,nomn", "masc", "nomn")]
+                [MorphParse(nominative="Иван", normal="иван", score=0.9, tag="NOUN,masc,sing,nomn", gender="masc", case="nomn")],
+                [MorphParse(nominative="Петров", normal="петров", score=0.9, tag="NOUN,masc,sing,nomn", gender="masc", case="nomn")],
             ]
             
             # Test given name detection
@@ -316,7 +315,7 @@ class TestNominativeAndGenderIntegration:
         
         with patch.object(adapter, 'parse') as mock_parse:
             mock_parse.return_value = [
-                MorphParse("Петрова", "петров", 0.9, "NOUN,femn,sing,nomn", "femn", "nomn")
+                MorphParse(nominative="Петрова", normal="петров", score=0.9, tag="NOUN,femn,sing,nomn", gender="femn", case="nomn"),
             ]
             
             # Test that already nominative forms are unchanged
@@ -330,9 +329,8 @@ class TestNominativeAndGenderIntegration:
         
         with patch.object(adapter, 'parse') as mock_parse:
             mock_parse.return_value = [
-                MorphParse("Шевченко", "шевченко", 0.9, "NOUN,masc,sing,nomn", "masc", "nomn")
+                MorphParse(nominative="Шевченко", normal="шевченко", score=0.9, tag="NOUN,masc,sing,nomn", gender="masc", case="nomn"),
             ]
-            
             # Test that invariable surnames are not changed
             nominative = adapter.to_nominative("Шевченко", "uk")
             assert nominative == "Шевченко"

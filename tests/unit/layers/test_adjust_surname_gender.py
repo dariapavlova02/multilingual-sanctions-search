@@ -9,7 +9,7 @@ and confidence gap.
 import pytest
 from typing import Optional
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestAdjustSurnameGender:

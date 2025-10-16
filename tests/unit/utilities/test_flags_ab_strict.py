@@ -8,67 +8,7 @@ Checks:
  3) remove_stop_words=False → STOP_ALL words are not removed.
 """
 
-import sys
-import os
-import types
 import pytest
-
-# Ensure src/ is on sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src')))
-
-# Lightweight stubs for optional heavy deps (spaCy/NTLK) to allow import in CI sandboxes
-if 'spacy' not in sys.modules:
-    spacy_stub = types.ModuleType('spacy')
-    def _spacy_load(*args, **kwargs):
-        class _Tok:
-            def __init__(self, t):
-                self.text = t
-                self.is_space = (t.strip() == "")
-        class _Doc:
-            def __init__(self, text):
-                self._tokens = [
-                    _Tok(t) for t in text.split() if t and t.strip()
-                ]
-            def __iter__(self):
-                return iter(self._tokens)
-        class _NLP:
-            def __call__(self, text):
-                return _Doc(text)
-        return _NLP()
-    spacy_stub.load = _spacy_load
-    sys.modules['spacy'] = spacy_stub
-
-if 'nltk' not in sys.modules:
-    nltk_stub = types.ModuleType('nltk')
-    corpus_stub = types.ModuleType('nltk.corpus')
-    stem_stub = types.ModuleType('nltk.stem')
-    tokenize_stub = types.ModuleType('nltk.tokenize')
-
-    class _Porter:
-        def stem(self, s):
-            return s
-
-    class _Snowball:
-        def __init__(self, *_args, **_kwargs):
-            pass
-        def stem(self, s):
-            return s
-
-    def _words(_lang):
-        return []
-
-    def _word_tokenize(text):
-        return text.split()
-
-    corpus_stub.stopwords = types.SimpleNamespace(words=_words)
-    stem_stub.PorterStemmer = lambda: _Porter()
-    stem_stub.SnowballStemmer = lambda *_a, **_k: _Snowball()
-    tokenize_stub.word_tokenize = _word_tokenize
-
-    sys.modules['nltk'] = nltk_stub
-    sys.modules['nltk.corpus'] = corpus_stub
-    sys.modules['nltk.stem'] = stem_stub
-    sys.modules['nltk.tokenize'] = tokenize_stub
 
 from ai_service.layers.normalization.normalization_service import NormalizationService
 from ai_service.data.dicts.stopwords import STOP_ALL

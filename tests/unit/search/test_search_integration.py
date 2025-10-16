@@ -4,11 +4,11 @@ Unit tests for search integration functionality.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from src.ai_service.core.search_integration import SearchIntegration, create_search_integration
-from src.ai_service.contracts.search_contracts import (
+from ai_service.core.search_integration import SearchIntegration, create_search_integration
+from ai_service.contracts.search_contracts import (
     SearchOpts, SearchMode, SearchType, Candidate, SearchInfo
 )
-from src.ai_service.contracts.base_contracts import NormalizationResult
+from ai_service.contracts.base_contracts import NormalizationResult
 
 
 class TestSearchIntegration:
@@ -99,7 +99,7 @@ class TestSearchIntegration:
     
     def test_create_decision_input_with_search(self, mock_signals_result):
         """Test create_decision_input_with_search."""
-        from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+        from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
         
         integration = SearchIntegration(None)
         
@@ -141,7 +141,7 @@ class TestSearchIntegration:
     
     def test_create_decision_input_without_search(self, mock_signals_result):
         """Test create_decision_input_with_search without search info."""
-        from src.ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
+        from ai_service.contracts.decision_contracts import DecisionInput, SmartFilterInfo, SignalsInfo, SimilarityInfo
         
         integration = SearchIntegration(None)
         
@@ -316,7 +316,7 @@ class TestSearchIntegrationErrorHandling:
     @pytest.mark.asyncio
     async def test_elasticsearch_connection_error(self, mock_normalization_result, mock_signals_result):
         """Test handling of Elasticsearch connection errors."""
-        from src.ai_service.exceptions import ElasticsearchConnectionError
+        from ai_service.exceptions import ElasticsearchConnectionError
         
         # Mock service to raise ElasticsearchConnectionError
         mock_service = MagicMock()
@@ -335,7 +335,7 @@ class TestSearchIntegrationErrorHandling:
     @pytest.mark.asyncio
     async def test_search_timeout_error(self, mock_normalization_result, mock_signals_result):
         """Test handling of search timeout errors."""
-        from src.ai_service.exceptions import SearchTimeoutError
+        from ai_service.exceptions import SearchTimeoutError
         
         # Mock service to raise SearchTimeoutError
         mock_service = MagicMock()
@@ -354,7 +354,7 @@ class TestSearchIntegrationErrorHandling:
     @pytest.mark.asyncio
     async def test_search_service_error(self, mock_normalization_result, mock_signals_result):
         """Test handling of general search service errors."""
-        from src.ai_service.exceptions import SearchServiceError
+        from ai_service.exceptions import SearchServiceError
         
         # Mock service to raise SearchServiceError
         mock_service = MagicMock()

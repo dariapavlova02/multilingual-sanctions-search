@@ -285,7 +285,10 @@ class OrganizationContextRule(FSMTransitionRule):
                 # Check both global and language-specific legal forms
                 if (is_legal_form(context[i].text, self.lexicons) or 
                     is_legal_form_lang(context[i].text, token.lang, self.lexicons)):
-                    return True
+                    # A nearby legal form does not make every surrounding person
+                    # an organization. Keep the adjacent name and explicit CAPS span.
+                    if token.is_all_caps or token.pos in {i, i + 1}:
+                        return True
         
         return False
     
@@ -434,7 +437,7 @@ class LegalFormRule(FSMTransitionRule):
         evidence.append(f"form_{token.text}")
         evidence.append(f"lang_{token.lang}")
 
-        return state, TokenRole.UNKNOWN, "legal_form_detected", evidence
+        return state, TokenRole.ORG, "org_legal_form_context", evidence + ["org_legal_form_context"]
 
 
 class PersonStopwordRule(FSMTransitionRule):
@@ -746,6 +749,11 @@ class DefaultPersonRule(FSMTransitionRule):
             elif predicted_role == "patronymic":
                 return FSMState.DONE, TokenRole.PATRONYMIC, "patronymic_detected", evidence + [f"morphology_{predicted_role}"]
 
+            # A patronymic can precede the surname. Reaching a complete FSM
+            # state does not invalidate a lexically recognized name component.
+            if predicted_role in {"given", "surname"}:
+                return state, TokenRole(predicted_role), f"{predicted_role}_detected", evidence + [f"morphology_{predicted_role}"]
+
         # Enhanced fallback logic - check dictionaries directly if classifier failed
         if self.role_classifier:
             # If classifier returned "unknown", try direct dictionary lookup
@@ -807,7 +815,7 @@ class DefaultPersonRule(FSMTransitionRule):
 class RoleTaggerService:
     """FSM-based role tagger service with detailed tracing."""
     
-    def __init__(self, stopwords=None, org_legal_forms=None, lang='auto', strict_stopwords=False, role_classifier=None):
+    def __init__(self, stopwords=None, org_legal_forms=None, lang='auto', strict_stopwords=False, role_classifier=None, *, lexicons=None, window=3, rules=None):
         """
         Initialize role tagger service.
 
@@ -819,7 +827,23 @@ class RoleTaggerService:
             role_classifier: RoleClassifier - role classifier for morphological analysis
         """
         # Load default lexicons if not provided
-        self.lexicons = get_lexicons()
+        from copy import deepcopy
+
+        if isinstance(stopwords, Lexicons):
+            if lexicons is not None:
+                raise ValueError("Pass lexicons only once")
+            lexicons, stopwords = stopwords, None
+            if isinstance(org_legal_forms, RoleRules):
+                if rules is not None:
+                    raise ValueError("Pass role rules only once")
+                rules, org_legal_forms = org_legal_forms, None
+        from dataclasses import fields
+
+        defaults = get_lexicons()
+        self.lexicons = Lexicons(**{
+            field.name: deepcopy(getattr(lexicons, field.name, getattr(defaults, field.name)))
+            for field in fields(Lexicons)
+        })
 
         # Store role classifier and language
         self.role_classifier = role_classifier
@@ -837,10 +861,12 @@ class RoleTaggerService:
             self.lexicons.legal_forms.update(org_legal_forms)
 
         # Initialize rules
-        self.rules = RoleRules(strict_stopwords=strict_stopwords)
+        self.rules = deepcopy(rules) if rules is not None else RoleRules(
+            strict_stopwords=strict_stopwords, org_context_window=window
+        )
 
         # Set context window for organization detection
-        self.window = 3
+        self.window = self.rules.org_context_window
 
         # Pre-compile regex patterns for efficiency
         self._init_patterns()
@@ -891,7 +917,7 @@ class RoleTaggerService:
         Args:
             tokens: List of token strings
             lang: Language code
-            flags: Feature flags (for future use)
+            flags: Optional enable_ner, ner_hints and exact source_text for those spans
             
         Returns:
             List of RoleTag objects with detailed tracing
@@ -905,11 +931,59 @@ class RoleTaggerService:
         token_objects = self._create_token_objects(tokens, lang)
         
         # Apply FSM processing
-        role_tags = self._process_with_fsm(token_objects, lang)
+        ner_roles = self._ner_token_roles(tokens, flags)
+        role_tags = self._process_with_fsm(token_objects, lang, ner_roles)
         
         logger.debug(f"Tagged tokens: {self._get_role_summary(role_tags)}")
         return role_tags
     
+    @staticmethod
+    def _ner_token_roles(tokens, flags):
+        if not isinstance(flags, dict) or not flags.get("enable_ner") or flags.get("ner_hints") is None:
+            return {}
+        hints = flags["ner_hints"]
+        text = flags.get("source_text", " ".join(tokens))
+        cursor, result = 0, {}
+        for index, token in enumerate(tokens):
+            start = text.find(token, cursor)
+            if start < 0:
+                raise ValueError("NER token view does not match source_text")
+            end = start + len(token)
+            cursor = end
+            person = any(a <= start < end <= b for a, b in hints.person_spans)
+            organization = any(a <= start < end <= b for a, b in hints.org_spans)
+            if person != organization and index not in flags.get("protected_indices", set()):
+                result[index] = "PER" if person else "ORG"
+        return result
+
+    def _apply_ner_role(self, tag, label, state, token, tokens):
+        # Numeric evidence, document markers and initials remain governed by their
+        # dedicated rules, even if a model includes them in an organization span.
+        from .processors.role_classifier import _is_business_document_marker
+        if (not label or token.looks_like_initial or any(c.isdigit() for c in token.text)
+                or _is_business_document_marker(token.text)
+                or not any(c.isalpha() for c in token.text)):
+            return tag
+        if label == "ORG":
+            # A model label must not erase dictionary/morphology evidence for a
+            # person. Lowercase avoids the classifier's generic title-case guess.
+            known_role = (self.role_classifier._classify_personal_role(token.text.lower(), token.lang)
+                          if self.role_classifier else "unknown")
+            adjacent_initial = any(t.looks_like_initial for t in tokens[max(0, token.pos - 1):token.pos + 2])
+            compound_name = any(c in token.text for c in "-'’")
+            if known_role in {"given", "surname", "patronymic", "initial"} or adjacent_initial or compound_name:
+                tag.evidence.append("ner_org_person_conflict")
+                return tag
+            return RoleTag(TokenRole.ORG, tag.confidence, "ner_organization", [*tag.evidence, "ner_org_span"])
+        if tag.role in {TokenRole.GIVEN, TokenRole.SURNAME, TokenRole.PATRONYMIC, TokenRole.INITIAL}:
+            tag.evidence.append("ner_person_span")
+            return tag
+        if tag.role != TokenRole.UNKNOWN:
+            return tag
+        rule = DefaultPersonRule(self.role_classifier, token.lang, self.lexicons)
+        _, role, _, evidence = rule.apply(state, token, tokens)
+        return RoleTag(role, tag.confidence, "ner_person", evidence + ["ner_person_span"])
+
     def _create_token_objects(self, tokens: List[str], lang: str) -> List[Token]:
         """Convert token strings to Token objects with features."""
         token_objects = []
@@ -937,7 +1011,7 @@ class RoleTaggerService:
         
         return token_objects
     
-    def _process_with_fsm(self, tokens: List[Token], lang: str) -> List[RoleTag]:
+    def _process_with_fsm(self, tokens: List[Token], lang: str, ner_roles=None) -> List[RoleTag]:
         """Process tokens through FSM."""
         role_tags = []
         current_state = FSMState.START
@@ -945,6 +1019,7 @@ class RoleTaggerService:
         for i, token in enumerate(tokens):
             # Apply rules in order of priority
             role_tag = self._apply_rules(current_state, token, tokens)
+            role_tag = self._apply_ner_role(role_tag, (ner_roles or {}).get(i), current_state, token, tokens)
             
             # Set state information in the tag BEFORE updating state
             role_tag.state_from = current_state

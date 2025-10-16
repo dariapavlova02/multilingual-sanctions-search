@@ -6,6 +6,9 @@ Much faster than AC search or Elasticsearch for INN-specific queries.
 """
 
 import json
+import os
+import re
+from ...data.resources import PACKAGE_DATA_DIR
 import time
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -17,10 +20,13 @@ logger = get_logger(__name__)
 class SanctionedINNCache:
     """Fast in-memory cache for sanctioned INNs."""
 
-    def __init__(self):
+    def __init__(self, data_dir=None):
         self.cache: Dict[str, Dict[str, Any]] = {}
         self.loaded_at: Optional[float] = None
-        self.cache_file = Path(__file__).parent.parent.parent / "data" / "sanctioned_inns_cache.json"
+        self.data_dir = Path(data_dir or os.getenv("SANCTIONS_DATA_DIR") or PACKAGE_DATA_DIR).resolve()
+        self.cache_file = self.data_dir / "sanctioned_inns_cache.json"
+        self._source_state = None
+        self._all_records = {}
         self.stats = {
             "total_inns": 0,
             "persons": 0,
@@ -30,38 +36,45 @@ class SanctionedINNCache:
             "misses": 0
         }
 
+    def _current_source_state(self):
+        files = [self.data_dir / name for name in ("sanctioned_persons.json", "sanctioned_companies.json")]
+        return tuple((str(path), path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.stat().st_size)
+                     for path in files if path.exists())
+
     def load_cache(self) -> bool:
-        """Load sanctioned INNs cache from file."""
-        try:
-            if not self.cache_file.exists():
-                logger.warning(f"INN cache file not found: {self.cache_file}")
-                return False
+        """Build the derived lookup from current sources, never a stale export."""
+        state = self._current_source_state()
+        records = {}
+        for name, entity_type, fields in (
+            ("sanctioned_persons.json", "person", ("itn", "itn_import")),
+            ("sanctioned_companies.json", "organization", ("tax_number",)),
+        ):
+            path = self.data_dir / name
+            if not path.exists():
+                continue
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            for row in rows:
+                numbers = set()
+                for field in fields:
+                    value = row.get(field)
+                    if value is not None:
+                        numbers.update(re.findall(r"(?<!\d)\d{8,12}(?!\d)", str(value)))
+                record = {**row, "type": entity_type, "source": "ukrainian_sanctions"}
+                for number in numbers:
+                    records.setdefault(number, []).append(record)
+        self._all_records = records
+        self.cache = {number: matches[0] for number, matches in records.items()}
+        self._source_state = state
+        self.loaded_at = time.time()
+        self.stats.update({"total_inns": len(self.cache),
+                           "persons": sum(row["type"] == "person" for row in self.cache.values()),
+                           "organizations": sum(row["type"] == "organization" for row in self.cache.values())})
+        return bool(state)
 
-            start_time = time.time()
-            with open(self.cache_file, 'r', encoding='utf-8') as f:
-                self.cache = json.load(f)
-
-            self.loaded_at = time.time()
-            load_time = (self.loaded_at - start_time) * 1000
-
-            # Update statistics
-            self.stats["total_inns"] = len(self.cache)
-            for inn_data in self.cache.values():
-                if inn_data.get("type") == "person":
-                    self.stats["persons"] += 1
-                elif inn_data.get("type") == "organization":
-                    self.stats["organizations"] += 1
-
-            logger.info(
-                f"[OK] Loaded {self.stats['total_inns']} sanctioned INNs "
-                f"({self.stats['persons']} persons, {self.stats['organizations']} orgs) "
-                f"in {load_time:.2f}ms"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"[ERROR] Failed to load INN cache: {e}")
-            return False
+    def lookup_all(self, inn: str):
+        if self._source_state != self._current_source_state():
+            self.load_cache()
+        return [dict(record) for record in self._all_records.get(str(inn).strip(), [])]
 
     def lookup(self, inn: str) -> Optional[Dict[str, Any]]:
         """
@@ -75,7 +88,9 @@ class SanctionedINNCache:
         """
         self.stats["lookups"] += 1
 
-        if not self.cache and not self.load_cache():
+        if self._source_state != self._current_source_state():
+            self.load_cache()
+        if self.loaded_at is None and not self.load_cache():
             self.stats["misses"] += 1
             return None
 
@@ -137,7 +152,8 @@ _inn_cache_instance: Optional[SanctionedINNCache] = None
 def get_inn_cache() -> SanctionedINNCache:
     """Get global INN cache instance."""
     global _inn_cache_instance
-    if _inn_cache_instance is None:
+    expected_dir = Path(os.getenv("SANCTIONS_DATA_DIR") or PACKAGE_DATA_DIR).resolve()
+    if _inn_cache_instance is None or _inn_cache_instance.data_dir != expected_dir:
         _inn_cache_instance = SanctionedINNCache()
         _inn_cache_instance.load_cache()
     return _inn_cache_instance

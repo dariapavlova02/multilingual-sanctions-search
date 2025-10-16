@@ -3,17 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from elasticsearch import AsyncElasticsearch
-try:
-    from elasticsearch.exceptions import ElasticsearchException
-except ImportError:
-    from elasticsearch.exceptions import RequestError as ElasticsearchException
 
 from ...utils.logging_config import get_logger
 from .config import HybridSearchConfig, ElasticsearchConfig
+
+
+def build_client_kwargs(config: ElasticsearchConfig) -> Dict[str, Any]:
+    """One connection contract for search, administration and ingestion."""
+    kwargs = {
+        "hosts": config.normalized_hosts(),
+        "request_timeout": config.timeout,
+        "max_retries": config.max_retries,
+        "retry_on_timeout": config.retry_on_timeout,
+        "verify_certs": config.verify_certs,
+        "connections_per_node": 50,
+        "http_compress": True,
+        "sniff_on_start": False,
+        "sniff_on_node_failure": False,
+    }
+    if config.api_key:
+        kwargs["api_key"] = config.api_key
+    elif config.username and config.password:
+        kwargs["basic_auth"] = (config.username, config.password)
+    if config.ca_certs:
+        kwargs["ca_certs"] = config.ca_certs
+    return kwargs
 
 
 class ElasticsearchClientFactory:
@@ -24,110 +43,95 @@ class ElasticsearchClientFactory:
         config: Optional[HybridSearchConfig] = None,
     ) -> None:
         self.logger = get_logger(__name__)
-        self.config = config or HybridSearchConfig.from_env()
+        self.config = HybridSearchConfig.validated_copy(config)
         self.es_config: ElasticsearchConfig = self.config.elasticsearch
         self._clients: Dict[str, AsyncElasticsearch] = {}
         self._lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closed = False
 
     def _build_es_config(self) -> Dict[str, Any]:
         """Build Elasticsearch client configuration with connection pooling."""
-        es_config = {
-            "hosts": self.es_config.normalized_hosts(),
-            "timeout": self.es_config.timeout,
-            "max_retries": self.es_config.max_retries,
-            "retry_on_timeout": self.es_config.retry_on_timeout,
-            "verify_certs": self.es_config.verify_certs,
-            # Enhanced connection pooling settings for production
-            "maxsize": 50,  # Increased from 25 - Maximum number of connections in the pool
-            "http_compress": True,  # Enable HTTP compression
-            "sniff_on_start": False,  # Disable sniffing for external ES
-            "sniff_on_connection_fail": False,  # Disable sniffing for external ES
-            "sniff_timeout": 10,  # Timeout for sniffing
-            # Connection settings
-            "http_auth": None,  # Will be set below if needed
-            "headers": {
-                "User-Agent": "ai-service-search/1.0.0"
-            }
-        }
-        
-        # Add authentication
-        if self.es_config.api_key:
-            es_config["api_key"] = self.es_config.api_key
-        elif self.es_config.username and self.es_config.password:
-            es_config["http_auth"] = (self.es_config.username, self.es_config.password)
-        
-        # Add CA certificates if provided
-        if self.es_config.ca_certs:
-            es_config["ca_certs"] = self.es_config.ca_certs
-            
-        return es_config
+        return build_client_kwargs(self.es_config)
+
+    def validate_connection_configuration(self, config: HybridSearchConfig) -> None:
+        if build_client_kwargs(config.elasticsearch) != self._build_es_config():
+            raise ValueError("Elasticsearch adapter and client connection settings differ")
 
     def get_hosts(self) -> List[str]:
         """Return normalized host list used by the factory."""
         return self.es_config.normalized_hosts()
 
-    async def _create_client(self, host: str) -> AsyncElasticsearch:
+    async def _create_client(self, host: Optional[str] = None) -> AsyncElasticsearch:
         """Create a new AsyncElasticsearch client for the given host."""
         es_config = self._build_es_config()
-        # Override hosts with single host for this client
-        es_config["hosts"] = [host]
+        if host is not None:
+            es_config["hosts"] = [host]
         
         return AsyncElasticsearch(**es_config)
 
     async def get_client(self, host: Optional[str] = None) -> AsyncElasticsearch:
         """Return cached client for host, creating it on first use."""
-        base_host = host or self.get_hosts()[0]
-        if not base_host:
-            raise RuntimeError("No Elasticsearch hosts configured")
+        if host is not None and host not in self.get_hosts():
+            raise ValueError("Explicit Elasticsearch host is not in the configured cluster")
+        cache_key = host if host is not None else "cluster"
 
         async with self._lock:
-            client = self._clients.get(base_host)
+            if self._closed:
+                raise RuntimeError("Elasticsearch client factory is closed")
+            client = self._clients.get(cache_key)
             if client is None:
-                client = await self._create_client(base_host)
-                self._clients[base_host] = client
+                client = await self._create_client(host)
+                self._clients[cache_key] = client
         return client
 
     async def close(self) -> None:
-        """Close all managed clients."""
-        async with self._lock:
-            clients = list(self._clients.values())
-            self._clients.clear()
-
-        for client in clients:
-            try:
-                await client.close()
-            except Exception as exc:  # pragma: no cover - best effort cleanup
-                self.logger.warning(f"Error closing Elasticsearch client: {exc}")
+        """Close every managed client and reject future connection creation."""
+        async with self._close_lock:
+            async with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                clients = list(self._clients.values())
+                self._clients.clear()
+            failed = False
+            for client in clients:
+                try:
+                    await client.close()
+                except Exception:
+                    failed = True
+                    self.logger.warning("Elasticsearch client cleanup failed")
+            if failed:
+                raise RuntimeError("Elasticsearch client cleanup failed")
 
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check against configured hosts."""
-        results = []
-        overall_status = "unhealthy"
-
-        for host in self.get_hosts():
-            client = await self.get_client(host)
+        async def check_host(host):
             host_result: Dict[str, Any] = {"host": host, "status": "unhealthy"}
             start = datetime.now()
             try:
-                # Use Elasticsearch cluster health API
-                response = await client.cluster.health(
-                    timeout=f"{int(self.es_config.smoke_test_timeout)}s"
-                )
-                host_result["elapsed_ms"] = (datetime.now() - start).total_seconds() * 1000
+                timeout = self.es_config.smoke_test_timeout
+                async with asyncio.timeout(timeout):
+                    client = await self.get_client(host)
+                    response = await client.options(request_timeout=timeout).cluster.health(
+                        timeout=f"{math.ceil(timeout * 1000)}ms"
+                    )
                 if response.get("status") in ["green", "yellow"]:
                     host_result["status"] = "healthy"
                     host_result["details"] = response
-                    overall_status = "healthy"
                 else:
-                    host_result["error"] = f"Cluster status: {response.get('status')}"
-            except ElasticsearchException as exc:
-                host_result["error"] = str(exc)
-            except Exception as exc:  # pragma: no cover - network errors depend on runtime
-                host_result["error"] = str(exc)
-            results.append(host_result)
+                    host_result["error"] = "Cluster health is not green or yellow"
+            except Exception as exc:
+                host_result["error"] = "Elasticsearch health check failed"
+                status = getattr(exc, "status_code", None)
+                if isinstance(status, int) and 100 <= status <= 599:
+                    host_result["status_code"] = status
+            host_result["elapsed_ms"] = (datetime.now() - start).total_seconds() * 1000
+            return host_result
 
+        results = await asyncio.gather(*(check_host(host) for host in self.get_hosts()))
         return {
-            "status": overall_status,
+            "status": "healthy" if any(result["status"] == "healthy" for result in results) else "unhealthy",
             "hosts": results,
             "timestamp": datetime.now().isoformat(),
         }

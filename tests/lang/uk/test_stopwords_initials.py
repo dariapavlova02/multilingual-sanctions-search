@@ -7,8 +7,8 @@ prepositions and conjunctions are not tagged as initials or name roles.
 """
 
 import pytest
-from src.ai_service.layers.normalization.role_tagger import RoleTagger
-from src.ai_service.layers.normalization.lexicon_loader import get_lexicons
+from ai_service.layers.normalization.role_tagger import RoleTagger
+from ai_service.layers.normalization.lexicon_loader import get_lexicons
 
 
 class TestUkrainianStopwordsInitials:

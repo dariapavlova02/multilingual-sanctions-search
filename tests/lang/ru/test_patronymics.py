@@ -7,9 +7,9 @@ and that ambiguous cases (like Belarusian surnames ending in -ович) are hand
 """
 
 import pytest
-from src.ai_service.layers.normalization.role_tagger_service import RoleTaggerService, RoleRules
-from src.ai_service.layers.normalization.lexicon_loader import get_lexicons
-from src.ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
+from ai_service.layers.normalization.role_tagger_service import RoleTaggerService, RoleRules
+from ai_service.layers.normalization.lexicon_loader import get_lexicons
+from ai_service.layers.normalization.morphology_adapter import MorphologyAdapter
 
 
 class TestRussianPatronymics:

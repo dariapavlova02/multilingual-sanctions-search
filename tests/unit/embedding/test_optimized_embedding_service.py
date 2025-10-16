@@ -7,6 +7,12 @@ import time
 from unittest.mock import Mock, patch, MagicMock
 
 from ai_service.layers.embeddings.optimized_embedding_service import OptimizedEmbeddingService
+from ai_service.config import EmbeddingConfig
+
+ALTERNATIVE = "sentence-transformers/all-MiniLM-L6-v2"
+
+def pad_rows(rows):
+    return [list(row) + [0.0] * (384 - len(row)) for row in rows]
 
 
 class TestOptimizedEmbeddingService:
@@ -19,7 +25,7 @@ class TestOptimizedEmbeddingService:
             max_cache_size=100,
             enable_batch_optimization=True,
             enable_gpu=False,  # Disable GPU for testing
-            thread_pool_size=2,
+            config=EmbeddingConfig(extra_models=[ALTERNATIVE]),
             precompute_common_patterns=False,  # Disable for faster test setup
         )
 
@@ -27,15 +33,15 @@ class TestOptimizedEmbeddingService:
         """Test service initialization"""
         assert optimized_service.max_cache_size == 100
         assert optimized_service.enable_batch_optimization is True
-        assert optimized_service.thread_pool_size == 2
+        assert optimized_service.get_inference_stats()["max_active"] == 1
         assert optimized_service.gpu_available is False  # Disabled for testing
         assert len(optimized_service.embedding_cache) == 0
 
     def test_cache_key_generation(self, optimized_service):
         """Test cache key generation"""
-        key1 = optimized_service._get_cache_key("test text", "model1")
-        key2 = optimized_service._get_cache_key("test text", "model2")
-        key3 = optimized_service._get_cache_key("other text", "model1")
+        key1 = optimized_service._get_cache_key("test text", optimized_service.default_model)
+        key2 = optimized_service._get_cache_key("test text", ALTERNATIVE)
+        key3 = optimized_service._get_cache_key("other text", optimized_service.default_model)
 
         # Same text, different model should have different keys
         assert key1 != key2
@@ -44,12 +50,12 @@ class TestOptimizedEmbeddingService:
         assert key1 != key3
 
         # Same inputs should produce same key
-        assert key1 == optimized_service._get_cache_key("test text", "model1")
+        assert key1 == optimized_service._get_cache_key("test text", optimized_service.default_model)
 
     def test_embedding_caching(self, optimized_service):
         """Test embedding caching functionality"""
         text = "test text"
-        model = "test_model"
+        model = optimized_service.default_model
         embedding = [0.1, 0.2, 0.3]
 
         # Initially no cache entry
@@ -67,28 +73,29 @@ class TestOptimizedEmbeddingService:
         service = OptimizedEmbeddingService(max_cache_size=2, precompute_common_patterns=False)
 
         # Add first embedding
-        service._cache_embedding("text1", "model", [0.1, 0.2])
+        service._cache_embedding("text1", service.default_model, [0.1, 0.2])
         assert len(service.embedding_cache) == 1
 
         # Add second embedding
-        service._cache_embedding("text2", "model", [0.3, 0.4])
+        service._cache_embedding("text2", service.default_model, [0.3, 0.4])
         assert len(service.embedding_cache) == 2
 
         # Add third embedding - should evict oldest
-        service._cache_embedding("text3", "model", [0.5, 0.6])
+        service._cache_embedding("text3", service.default_model, [0.5, 0.6])
         assert len(service.embedding_cache) == 2
 
         # text1 should be evicted, text2 and text3 should remain
-        assert service._get_cached_embedding("text1", "model") is None
-        assert service._get_cached_embedding("text2", "model") is not None
-        assert service._get_cached_embedding("text3", "model") is not None
+        assert service._get_cached_embedding("text1", service.default_model) is None
+        assert service._get_cached_embedding("text2", service.default_model) is not None
+        assert service._get_cached_embedding("text3", service.default_model) is not None
 
     @patch('sentence_transformers.SentenceTransformer')
     def test_optimized_embeddings_with_cache(self, mock_transformer_class, optimized_service):
         """Test optimized embedding generation with caching"""
         # Mock the transformer
         mock_model = Mock()
-        mock_model.encode.return_value = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.encode.return_value = pad_rows([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
         mock_transformer_class.return_value = mock_model
 
         texts = ["text1", "text2"]
@@ -117,7 +124,8 @@ class TestOptimizedEmbeddingService:
         """Test optimized embedding generation without caching"""
         # Mock the transformer
         mock_model = Mock()
-        mock_model.encode.return_value = [[0.1, 0.2, 0.3]]
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.encode.return_value = pad_rows([[0.1, 0.2, 0.3]])
         mock_transformer_class.return_value = mock_model
 
         text = "test text"
@@ -152,7 +160,8 @@ class TestOptimizedEmbeddingService:
 
         # Mock the transformer
         mock_model = Mock()
-        mock_model.encode.return_value = [[0.1, 0.2]] * 100  # 100 embeddings
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.encode.return_value = pad_rows([[0.1, 0.2]] * 100)  # 100 embeddings
         mock_transformer_class.return_value = mock_model
 
         # Large batch should trigger optimization
@@ -179,12 +188,13 @@ class TestOptimizedEmbeddingService:
         """Test optimized similarity search"""
         # Mock the transformer
         mock_model = Mock()
-        mock_model.encode.return_value = [
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.encode.return_value = pad_rows([
             [1.0, 0.0, 0.0],  # Query
             [0.9, 0.1, 0.0],  # Very similar
             [0.1, 0.9, 0.0],  # Less similar
             [0.0, 0.0, 1.0],  # Not similar
-        ]
+        ])
         mock_transformer_class.return_value = mock_model
 
         query = "test query"
@@ -211,9 +221,10 @@ class TestOptimizedEmbeddingService:
 
         # Mock the transformer
         mock_model = Mock()
+        mock_model.get_sentence_embedding_dimension.return_value = 384
         # Query + many candidates
         embeddings = [[1.0, 0.0]] + [[0.1, 0.9]] * 150
-        mock_model.encode.return_value = embeddings
+        mock_model.encode.return_value = pad_rows(embeddings)
         mock_transformer_class.return_value = mock_model
 
         query = "test query"
@@ -247,8 +258,8 @@ class TestOptimizedEmbeddingService:
     def test_cache_clearing(self, optimized_service):
         """Test cache clearing functionality"""
         # Add some items to cache
-        optimized_service._cache_embedding("text1", "model", [0.1, 0.2])
-        optimized_service._cache_embedding("text2", "model", [0.3, 0.4])
+        optimized_service._cache_embedding("text1", optimized_service.default_model, [0.1, 0.2])
+        optimized_service._cache_embedding("text2", optimized_service.default_model, [0.3, 0.4])
 
         assert len(optimized_service.embedding_cache) == 2
 
@@ -262,7 +273,8 @@ class TestOptimizedEmbeddingService:
         """Test cache warm-up functionality"""
         # Mock the transformer
         mock_model = Mock()
-        mock_model.encode.return_value = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.encode.return_value = pad_rows([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
         mock_transformer_class.return_value = mock_model
 
         texts = ["warm up text 1", "warm up text 2"]
@@ -289,39 +301,25 @@ class TestOptimizedEmbeddingService:
 
     @pytest.mark.asyncio
     async def test_async_optimized_methods(self, optimized_service):
-        """Test optimized async methods"""
-        with patch.object(optimized_service, 'get_embeddings_optimized') as mock_get_embeddings:
-            mock_get_embeddings.return_value = {
-                "success": True,
-                "embeddings": [[0.1, 0.2, 0.3]],
-                "processing_time": 0.001,
-            }
-
-            # Test async embedding generation
-            result = await optimized_service.get_embeddings_async_optimized(["test text"])
-
-            assert result["success"] is True
-            mock_get_embeddings.assert_called_once()
-
-        with patch.object(optimized_service, 'find_similar_texts_optimized') as mock_find_similar:
-            mock_find_similar.return_value = {
-                "success": True,
-                "results": [{"text": "similar", "similarity_score": 0.9, "rank": 1}],
-            }
-
-            # Test async similarity search
-            result = await optimized_service.find_similar_texts_async_optimized(
-                "query", ["candidate"]
-            )
-
-            assert result["success"] is True
-            mock_find_similar.assert_called_once()
+        with patch('sentence_transformers.SentenceTransformer') as loader:
+            model = Mock()
+            model.get_sentence_embedding_dimension.return_value = 384
+            model.encode.side_effect = lambda texts, **kwargs: pad_rows([[1.0] for _ in texts])
+            loader.return_value = model
+            sync = optimized_service.get_embeddings_optimized(["Example Person"])
+            async_result = await optimized_service.get_embeddings_async_optimized(["Example Person"])
+            assert sync["embeddings"] == async_result["embeddings"]
+            assert async_result["cache_hits"] == 1
+            assert model.encode.call_count == 1
+            result = await optimized_service.find_similar_texts_async_optimized("Example Person", ["Another Person"])
+            assert result["success"] and result["results"][0]["text"] == "Another Person"
 
     def test_performance_under_load(self, optimized_service):
         """Test performance with multiple concurrent operations"""
         with patch.object(optimized_service, '_load_model_optimized') as mock_load:
             mock_model = Mock()
-            mock_model.encode.return_value = [[0.1, 0.2, 0.3]] * 50
+            mock_model.get_sentence_embedding_dimension.return_value = 384
+            mock_model.encode.side_effect = lambda texts, **kwargs: pad_rows([[0.1, 0.2, 0.3] for _ in texts])
             mock_load.return_value = mock_model
 
             # Simulate multiple operations
@@ -346,7 +344,8 @@ class TestOptimizedEmbeddingService:
         """Test that performance metrics accumulate correctly"""
         with patch.object(optimized_service, '_load_model_optimized') as mock_load:
             mock_model = Mock()
-            mock_model.encode.return_value = [[0.1, 0.2, 0.3]]
+            mock_model.get_sentence_embedding_dimension.return_value = 384
+            mock_model.encode.return_value = pad_rows([[0.1, 0.2, 0.3]])
             mock_load.return_value = mock_model
 
             # Perform multiple operations
@@ -372,8 +371,8 @@ class TestOptimizedEmbeddingService:
                     text = f"thread_{thread_id}_text_{i}"
                     embedding = [float(thread_id), float(i)]
 
-                    optimized_service._cache_embedding(text, "model", embedding)
-                    cached = optimized_service._get_cached_embedding(text, "model")
+                    optimized_service._cache_embedding(text, optimized_service.default_model, embedding)
+                    cached = optimized_service._get_cached_embedding(text, optimized_service.default_model)
 
                     if cached != embedding:
                         errors.append(f"Cache mismatch in thread {thread_id}")

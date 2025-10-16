@@ -5,6 +5,7 @@ Birthdate extractor.
 from typing import Any, Dict, List
 
 from .base_extractor import BaseExtractor
+from ....utils.source_text_view import SourceTextView
 
 
 class BirthdateExtractor(BaseExtractor):
@@ -26,7 +27,8 @@ class BirthdateExtractor(BaseExtractor):
         try:
             from ....data.patterns.dates import extract_birthdates_from_text
 
-            birthdates = extract_birthdates_from_text(text)
+            view = SourceTextView.from_text(text)
+            birthdates = [view.restore_evidence(item) for item in extract_birthdates_from_text(view.text)]
             self._log_extraction_result(text, len(birthdates), "birthdate")
             return birthdates
 

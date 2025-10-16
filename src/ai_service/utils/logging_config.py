@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from .log_privacy import protect_configured_handlers, protect_logger
+
 try:
     import yaml
 
@@ -30,6 +32,9 @@ def setup_logging(
         log_level: Override log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_dir: Directory for log files
     """
+    log_level = log_level or os.environ.get("LOG_LEVEL", "INFO")
+    configured = False
+
     # Default paths
     if config_path is None:
         # Check if custom logging config is specified in environment
@@ -48,7 +53,7 @@ def setup_logging(
 
     # Create logs directory if it doesn't exist
     log_dir = Path(log_dir)
-    log_dir.mkdir(exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # Load configuration
     if Path(config_path).exists() and HAS_YAML:
@@ -61,24 +66,33 @@ def setup_logging(
                 if "filename" in handler_config:
                     filename = handler_config["filename"]
                     if not os.path.isabs(filename):
-                        handler_config["filename"] = str(log_dir / filename)
+                        # The YAML uses paths such as ``logs/service.log``.  The
+                        # selected log_dir already represents that directory,
+                        # so keep only the configured filename to avoid creating
+                        # an accidental ``logs/logs`` path locally.
+                        handler_config["filename"] = str(
+                            log_dir / Path(filename).name
+                        )
 
             # Override log level if specified
             if log_level:
                 level = getattr(logging, log_level.upper(), logging.INFO)
                 config["root"]["level"] = level
-                for logger_config in config.get("loggers", {}).values():
-                    logger_config["level"] = level
+                for name, logger_config in config.get("loggers", {}).items():
+                    if name == "ai_service" or name.startswith("ai_service."):
+                        logger_config["level"] = level
 
             logging.config.dictConfig(config)
-        except Exception as e:
-            print(f"Warning: Failed to load logging config: {e}")
-            # Fall through to basic config
-    else:
+            configured = True
+        except Exception:
+            # The fallback must still install privacy filters and must not echo
+            # parsing errors containing configuration values.
+            pass
+    if not configured:
         # Fallback to basic configuration
         logging.basicConfig(
             level=getattr(logging, log_level.upper() if log_level else "INFO"),
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            format="%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(funcName)s:%(lineno)d - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
@@ -88,6 +102,13 @@ def setup_logging(
         logging.getLogger("pymorphy3").setLevel(logging.WARNING)
         logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
         logging.getLogger("transformers").setLevel(logging.WARNING)
+
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.getLogger().setLevel(level)
+    for name, value in logging.Logger.manager.loggerDict.items():
+        if isinstance(value, logging.Logger) and (name == "ai_service" or name.startswith("ai_service.")):
+            value.setLevel(level)
+    protect_configured_handlers()
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -100,7 +121,7 @@ def get_logger(name: str) -> logging.Logger:
     Returns:
         Configured logger instance
     """
-    return logging.getLogger(name)
+    return protect_logger(logging.getLogger(name))
 
 
 def log_function_entry(logger: logging.Logger, func_name: str, **kwargs) -> None:

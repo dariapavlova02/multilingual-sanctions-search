@@ -86,13 +86,7 @@ NLP_EN = None
 NLP_UK = None
 NLP_RU = None
 
-# Start background model loading
-try:
-    from .async_model_loader import start_model_preloading
-    start_model_preloading()
-    logger.info("Started async model preloading")
-except ImportError as e:
-    logger.warning(f"Async model loading not available: {e}")
+# Model loading is owned by application startup and explicit requests.
 
 # Log final status
 _status = {

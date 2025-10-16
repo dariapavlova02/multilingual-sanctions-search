@@ -9,7 +9,7 @@ for legal forms and person stopwords.
 import pytest
 from typing import List, Dict, Any
 
-from src.ai_service.layers.normalization.role_tagger_service import RoleTaggerService
+from ai_service.layers.normalization.role_tagger_service import RoleTaggerService
 
 
 class TestRoleContextFiltering:

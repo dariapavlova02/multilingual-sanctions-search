@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Literal
 
 from ...utils.logging_config import get_logger
+from ...utils.source_text_view import without_format_controls
 
 
 class UnicodeService:
@@ -22,16 +23,16 @@ class UnicodeService:
         self.character_mapping = {
             # Apostrophe normalization for names (D'Artanyan, O'Connor, etc.)
             # All apostrophe variants → ASCII apostrophe for consistency
-            "'": "'",    # U+2019 Right single quotation mark → U+0027 ASCII apostrophe
-            "'": "'",    # U+2018 Left single quotation mark → U+0027 ASCII apostrophe
+            "\u2019": "'",  # U+2019 Right single quotation mark → U+0027 ASCII apostrophe
+            "\u2018": "'",  # U+2018 Left single quotation mark → U+0027 ASCII apostrophe
             "ʼ": "'",    # U+02BC Modifier letter apostrophe → U+0027 ASCII apostrophe
             "`": "'",    # U+0060 Grave accent → U+0027 ASCII apostrophe (common typo)
             "´": "'",    # U+00B4 Acute accent → U+0027 ASCII apostrophe (common typo)
 
             # Quote unification for company names ("Company Name")
             # All quote variants → standard ASCII double quote
-            """: '"',    # U+201C Left double quotation mark → U+0022 ASCII quote
-            """: '"',    # U+201D Right double quotation mark → U+0022 ASCII quote
+            "\u201c": '"',  # U+201C Left double quotation mark → U+0022 ASCII quote
+            "\u201d": '"',  # U+201D Right double quotation mark → U+0022 ASCII quote
             "«": '"',    # U+00AB Left-pointing double angle quotation mark → U+0022 ASCII quote
             "»": '"',    # U+00BB Right-pointing double angle quotation mark → U+0022 ASCII quote
 
@@ -123,156 +124,6 @@ class UnicodeService:
 
         self.logger.info("UnicodeService initialized")
 
-    def _attempt_encoding_recovery(self, text: str) -> str:
-        """Attempt to recover corrupted encoding"""
-        if not text:
-            return text
-
-        # List of common encoding problems
-        encoding_fixes = [
-            # Windows-1252 -> UTF-8 (most common problem)
-            ("\x80", "€"),
-            ("\x81", ""),
-            ("\x82", "‚"),
-            ("\x83", "ƒ"),
-            ("\x84", "„"),
-            ("\x85", "…"),
-            ("\x86", "†"),
-            ("\x87", "‡"),
-            ("\x88", "ˆ"),
-            ("\x89", "‰"),
-            ("\x8a", "Š"),
-            ("\x8b", "‹"),
-            ("\x8c", "Œ"),
-            ("\x8d", ""),
-            ("\x8e", "Ž"),
-            ("\x8f", ""),
-            ("\x90", ""),
-            ("\x91", ""),
-            ("\x92", ""),
-            ("\x93", '"'),
-            ("\x94", '"'),
-            ("\x95", "•"),
-            ("\x96", "–"),
-            ("\x97", "—"),
-            ("\x98", "˜"),
-            ("\x99", "™"),
-            ("\x9a", "š"),
-            ("\x9b", "›"),
-            ("\x9c", "œ"),
-            ("\x9d", ""),
-            ("\x9e", "ž"),
-            ("\x9f", "Ÿ"),
-            # CP1251 -> UTF-8 (Cyrillic)
-            ("\x80", "Ђ"),
-            ("\x81", "Ѓ"),
-            ("\x82", "‚"),
-            ("\x83", "ѓ"),
-            ("\x84", "„"),
-            ("\x85", "…"),
-            ("\x86", "†"),
-            ("\x87", "‡"),
-            ("\x88", "€"),
-            ("\x89", "‰"),
-            ("\x8a", "Љ"),
-            ("\x8b", "‹"),
-            ("\x8c", "Њ"),
-            ("\x8d", "Ќ"),
-            ("\x8e", "Ћ"),
-            ("\x8f", "Џ"),
-            ("\x90", "ђ"),
-            ("\x91", "ѓ"),
-            ("\x92", "‚"),
-            ("\x93", "ѓ"),
-            ("\x94", "„"),
-            ("\x95", "…"),
-            ("\x96", "†"),
-            ("\x97", "‡"),
-            ("\x98", "€"),
-            ("\x99", "‰"),
-            ("\x9a", "љ"),
-            ("\x9b", "‹"),
-            ("\x9c", "њ"),
-            ("\x9d", "ќ"),
-            ("\x9e", "ћ"),
-            ("\x9f", "џ"),
-        ]
-
-        # Apply fixes
-        recovered_text = text
-        for old_char, new_char in encoding_fixes:
-            recovered_text = recovered_text.replace(old_char, new_char)
-
-        # Assess recovery quality
-        if recovered_text != text:
-            # Cyrillic letters
-            cyrillic_count = len(
-                re.findall(r"[а-яёіїєґ]", recovered_text, re.IGNORECASE)
-            )
-            # Latin letters
-            latin_count = len(re.findall(r"[a-z]", recovered_text, re.IGNORECASE))
-            # Total score (Cyrillic is more important for our texts)
-            total_score = cyrillic_count * 2 + latin_count
-
-            # Check if text became more meaningful
-            if total_score > 0:
-                self.logger.info(
-                    f"Encoding recovery successful: {cyrillic_count} Cyrillic, {latin_count} Latin characters"
-                )
-                return recovered_text
-
-        # Try partial recovery for mixed encodings
-        if "Ð" in text or "Ñ" in text:
-            # Look for patterns of corrupted encoding and try to fix them partially
-            # Pattern for corrupted characters like Ð¸, Ð¹, etc.
-            partial_fixes = {
-                # Replace common corrupted sequences
-                "Ð¡": "С",
-                "Ðµ": "е",
-                "Ñ€": "р",
-                "Ð³": "г",
-                "Ð¸": "и",
-                "Ð¹": "й",
-                "Ð˜": "И",
-                "Ð²": "в",
-                "Ð°": "а",
-                "Ð½": "н",
-                "Ð¾": "о",
-                "Ð²": "в",
-                "Ñ": "с",
-                "Ñ‚": "т",
-                "Ñƒ": "у",
-                "Ñ„": "ф",
-                "Ñ…": "х",
-                "Ñ†": "ц",
-                "Ñ‡": "ч",
-                "Ñˆ": "ш",
-                "Ñ‰": "щ",
-                "ÑŠ": "ъ",
-                "Ñ‹": "ы",
-                "ÑŒ": "ь",
-                "Ñ": "э",
-                "ÑŽ": "ю",
-                "Ñ": "я",
-            }
-
-            partially_recovered = text
-            for corrupted, fixed in partial_fixes.items():
-                partially_recovered = partially_recovered.replace(corrupted, fixed)
-
-            # Assess partial recovery quality
-            if partially_recovered != text:
-                cyrillic_count = len(
-                    re.findall(r"[а-яёіїєґ]", partially_recovered, re.IGNORECASE)
-                )
-                if cyrillic_count > 0:
-                    self.logger.info(
-                        f"Partial encoding recovery successful: {cyrillic_count} Cyrillic characters"
-                    )
-                    return partially_recovered
-
-        return text
-
     async def normalize_unicode(self, text: str, aggressive: bool = False, normalize_homoglyphs: bool = False) -> Dict[str, Any]:
         """
         Unicode normalization with guaranteed dict return format.
@@ -315,12 +166,11 @@ class UnicodeService:
         # AND (doesn't need case normalization OR aggressive mode is enabled)
         has_special_chars = any(char in self.character_mapping for char in text)
         needs_whitespace_cleanup = re.search(r'\s{2,}', text) or text != text.strip()
-        has_invisible_chars = any(char in text for char in [
-            "\u200b", "\u200c", "\u200d", "\ufeff", "\u200e", "\u200f", 
-            "\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2060"
-        ])
+        has_invisible_chars = any(unicodedata.category(char) in {"Cc", "Cf"} for char in text)
         needs_case_normalization = any(c.isupper() for c in text)
-        if self._is_already_normalized(text) and not has_special_chars and not needs_whitespace_cleanup and not has_invisible_chars and (not needs_case_normalization or aggressive):
+        if (self._is_already_normalized(text) and not has_special_chars
+                and not needs_whitespace_cleanup and not has_invisible_chars
+                and not needs_case_normalization and not aggressive and not normalize_homoglyphs):
             result = self._create_normalization_result(text, 1.0, 0, 0, 0, aggressive)
             result["original"] = text
             result["idempotent"] = True
@@ -331,11 +181,13 @@ class UnicodeService:
         changes_count = 0
         char_replacements = 0
 
-        # 0. Attempt to recover corrupted encoding
-        recovered_text = self._attempt_encoding_recovery(text)
-        if recovered_text != text:
-            text = recovered_text
+        # Input is already decoded Unicode. Remove non-visible formatting before
+        # composition so controls cannot split a base letter from its marks.
+        cleaned_text = self._final_cleanup(text, aggressive)
+        if cleaned_text != text:
             changes_count += 1
+            char_replacements += max(0, len(text) - len(cleaned_text))
+        text = cleaned_text
 
         # 0.5. Apply homoglyph normalization if enabled
         homoglyph_traces = []
@@ -350,8 +202,14 @@ class UnicodeService:
         normalized_text, replacements = self._replace_complex_characters(text)
         char_replacements += replacements
 
-        # 2. Basic Unicode normalization (NFD -> NFKC) after character replacements
+        # 2. Canonical Unicode normalization after character replacements
         normalized_text = self._apply_unicode_normalization(normalized_text)
+
+        # NFC can compose a decomposed Latin sequence into a character handled by
+        # the explicit screening map (for example e + acute -> é). Apply that map
+        # once more so canonically equivalent inputs yield the same search key.
+        normalized_text, post_normalization_replacements = self._replace_complex_characters(normalized_text)
+        char_replacements += post_normalization_replacements
 
         # 3. Case normalization (in aggressive mode or when needed for specific cases)
         # DISABLED to prevent Cyrillic corruption
@@ -364,9 +222,13 @@ class UnicodeService:
         #     normalized_text, ascii_changes = self._apply_ascii_folding(normalized_text)
         #     char_replacements += ascii_changes
 
-        # 5. Final cleanup
-        # DISABLED to prevent Cyrillic corruption
-        # normalized_text = self._final_cleanup(normalized_text, aggressive)
+        # 5. Final cleanup. This preserves letters from every script while
+        # removing formatting/control obfuscation and canonicalizing whitespace.
+        before_cleanup = normalized_text
+        normalized_text = self._final_cleanup(normalized_text, aggressive)
+        if normalized_text != before_cleanup:
+            changes_count += 1
+            char_replacements += max(0, len(before_cleanup) - len(normalized_text))
 
         # Calculate confidence
         confidence = self._calculate_normalization_confidence(
@@ -754,44 +616,18 @@ class UnicodeService:
 
     def _final_cleanup(self, text: str, aggressive: bool = False) -> str:
         """Final text cleanup with clear policy for emojis and invisible characters"""
-        # Remove extra spaces
-        text = re.sub(r"\s+", " ", text).strip()
-
-        # Remove null characters
-        text = text.replace("\x00", "")
-
-        # Remove other control characters
-        text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
-
-        # Remove invisible Unicode characters
-        invisible_chars = [
-            "\u200b",  # Zero-width space
-            "\u200c",  # Zero-width non-joiner
-            "\u200d",  # Zero-width joiner
-            "\ufeff",  # Byte order mark
-            "\u200e",  # Left-to-right mark
-            "\u200f",  # Right-to-left mark
-            "\u202a",  # Left-to-right embedding
-            "\u202b",  # Right-to-left embedding
-            "\u202c",  # Pop directional formatting
-            "\u202d",  # Left-to-right override
-            "\u202e",  # Right-to-left override
-            "\u2060",  # Word joiner
-            "\u2061",  # Function application
-            "\u2062",  # Invisible times
-            "\u2063",  # Invisible separator
-            "\u2064",  # Invisible plus
-        ]
-        
-        for char in invisible_chars:
-            text = text.replace(char, "")
+        # Format controls can split otherwise equal names/identifiers. Ordinary
+        # control characters are removed too; whitespace controls are retained
+        # until the whitespace pass below so token boundaries do not disappear.
+        text = without_format_controls(text)
 
         # Emoji policy: only remove in aggressive mode
         if aggressive:
             # Remove emojis and other symbols in aggressive mode
             text = self._remove_emojis_and_symbols(text)
 
-        return text
+        # Removal can expose adjacent spaces or a trailing space.
+        return re.sub(r"\s+", " ", text).strip()
 
     def _calculate_normalization_confidence(
         self, original: str, normalized: str, char_replacements: int

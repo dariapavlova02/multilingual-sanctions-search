@@ -14,7 +14,7 @@ import os
 import asyncio
 from typing import List
 
-from src.ai_service.layers.normalization.normalization_service import NormalizationService
+from ai_service.layers.normalization.normalization_service import NormalizationService
 
 
 class TestRussianInitialsDoubleDots:
@@ -26,7 +26,7 @@ class TestRussianInitialsDoubleDots:
         os.environ["AISVC_FLAG_FIX_INITIALS_DOUBLE_DOT"] = "true"
 
         # Clear any cached feature flag manager to force reload
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
         self.service = NormalizationService()
@@ -36,7 +36,7 @@ class TestRussianInitialsDoubleDots:
         os.environ.pop("AISVC_FLAG_FIX_INITIALS_DOUBLE_DOT", None)
 
         # Clear feature flag manager cache to avoid test pollution
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
     @pytest.mark.asyncio
@@ -171,7 +171,7 @@ class TestRussianInitialsWithoutFlags:
         os.environ["AISVC_FLAG_FIX_INITIALS_DOUBLE_DOT"] = "false"
         
         # Clear any cached feature flag manager to force reload
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
         self.service = NormalizationService()
@@ -181,12 +181,12 @@ class TestRussianInitialsWithoutFlags:
         os.environ.pop("AISVC_FLAG_FIX_INITIALS_DOUBLE_DOT", None)
         
         # Clear feature flag manager cache to avoid test pollution
-        import src.ai_service.utils.feature_flags as ff_module
+        import ai_service.utils.feature_flags as ff_module
         ff_module._feature_flag_manager = None
 
     @pytest.mark.asyncio
-    async def test_legacy_behavior_preserved(self):
-        """Test that legacy behavior is preserved when flags are off."""
+    async def test_default_behavior_preserved(self):
+        """Test default behavior when flags are off."""
         text = "И.. И.."
         result = await self.service.normalize_async(text, language="ru")
 

@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 
+pytest_plugins = ["tests.owned_screening"]
+
 # Add src to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
@@ -75,11 +77,11 @@ def mock_services():
     from unittest.mock import Mock, AsyncMock
     
     # Import actual service classes for spec
-    from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
-    from src.ai_service.layers.normalization.normalization_service import NormalizationService
-    from src.ai_service.layers.variants.variant_generation_service import VariantGenerationService
-    from src.ai_service.layers.embeddings.embedding_service import EmbeddingService
-    from src.ai_service.core.cache_service import CacheService
+    from ai_service.layers.language.language_detection_service import LanguageDetectionService
+    from ai_service.layers.normalization.normalization_service import NormalizationService
+    from ai_service.layers.variants.variant_generation_service import VariantGenerationService
+    from ai_service.layers.embeddings.embedding_service import EmbeddingService
+    from ai_service.core.cache_service import CacheService
     
     return {
         'language_service': Mock(spec=LanguageDetectionService),
@@ -101,23 +103,23 @@ def orchestrator_service():
     from unittest.mock import patch, MagicMock
     
     # Mock heavy dependencies to avoid initialization issues
-    with patch('src.ai_service.data.dicts.stopwords.STOP_ALL') as mock_stopwords:
+    with patch('ai_service.data.dicts.stopwords.STOP_ALL') as mock_stopwords:
         
         # Configure mocks
         mock_stopwords.return_value = ['the', 'a', 'an']
         
-        from src.ai_service.core.unified_orchestrator import UnifiedOrchestrator as OrchestratorService
+        from ai_service.core.unified_orchestrator import UnifiedOrchestrator as OrchestratorService
         from unittest.mock import Mock
         
         # Create mock services for required dependencies
         from unittest.mock import AsyncMock, Mock
         
         # Import actual service classes for spec
-        from src.ai_service.layers.validation.validation_service import ValidationService
-        from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
-        from src.ai_service.layers.unicode.unicode_service import UnicodeService
-        from src.ai_service.layers.normalization.normalization_service import NormalizationService
-        from src.ai_service.layers.signals.signals_service import SignalsService
+        from ai_service.layers.validation.validation_service import ValidationService
+        from ai_service.layers.language.language_detection_service import LanguageDetectionService
+        from ai_service.layers.unicode.unicode_service import UnicodeService
+        from ai_service.layers.normalization.normalization_service import NormalizationService
+        from ai_service.layers.signals.signals_service import SignalsService
         
         mock_validation_service = AsyncMock(spec=ValidationService)
         mock_language_service = Mock(spec=LanguageDetectionService)
@@ -130,7 +132,7 @@ def orchestrator_service():
             return {"is_valid": True, "sanitized_text": text}
         
         def mock_language_config_driven(text, config=None):
-            from src.ai_service.utils.types import LanguageDetectionResult
+            from ai_service.utils.types import LanguageDetectionResult
             return LanguageDetectionResult(language="uk", confidence=0.9, details={})
         
         def mock_unicode_normalize_text(text, aggressive=False):
@@ -164,7 +166,7 @@ def orchestrator_service():
         mock_signals_service.extract_signals.side_effect = mock_signals
         
         # Create mock for variants service
-        from src.ai_service.layers.variants.variant_generation_service import VariantGenerationService
+        from ai_service.layers.variants.variant_generation_service import VariantGenerationService
         mock_variants_service = AsyncMock(spec=VariantGenerationService)
         mock_variants_service.generate_variants.return_value = [
             "Gnatuk Abdulaeva Zhorzha Rashida",
@@ -180,9 +182,15 @@ def orchestrator_service():
             "Jean-Baptiste Muller Олександр Петренко-Смит Zürcher Strasse",
             "Jean-Baptiste Muller Олександр Петренко-Смит Zürcher Strasse"
         ]
+        # The orchestrator uses the service's asynchronous, bounded entry point.
+        # Keep the existing fixture values while modeling its actual payload.
+        mock_variants_service.generate_variants_async.return_value = {
+            "variants": mock_variants_service.generate_variants.return_value,
+            "count": len(mock_variants_service.generate_variants.return_value),
+        }
         
         # Create mock cache service
-        from src.ai_service.core.cache_service import CacheService
+        from ai_service.core.cache_service import CacheService
         mock_cache_service = CacheService(default_ttl=60)
         
         # Create mock embeddings service
@@ -220,42 +228,42 @@ def orchestrator_service():
 @pytest.fixture(scope="function")
 def language_detection_service():
     """Provides a clean instance of LanguageDetectionService for each test"""
-    from src.ai_service.layers.language.language_detection_service import LanguageDetectionService
+    from ai_service.layers.language.language_detection_service import LanguageDetectionService
     return LanguageDetectionService()
 
 
 @pytest.fixture(scope="function")
-def advanced_normalization_service():
+def normalization_service():
     """Provides a clean instance of NormalizationService for each test"""
-    from src.ai_service.layers.normalization.normalization_service import NormalizationService
+    from ai_service.layers.normalization.normalization_service import NormalizationService
     return NormalizationService()
 
 
 @pytest.fixture(scope="function")
 def variant_generation_service():
     """Provides a clean instance of VariantGenerationService for each test"""
-    from src.ai_service.layers.variants.variant_generation_service import VariantGenerationService
+    from ai_service.layers.variants.variant_generation_service import VariantGenerationService
     return VariantGenerationService()
 
 
 @pytest.fixture(scope="function")
 def unicode_service():
     """Provides a clean instance of UnicodeService for each test"""
-    from src.ai_service.layers.unicode.unicode_service import UnicodeService
+    from ai_service.layers.unicode.unicode_service import UnicodeService
     return UnicodeService()
 
 
 @pytest.fixture(scope="function")
 def pattern_service():
     """Provides a clean instance of UnifiedPatternService for each test"""
-    from src.ai_service.layers.patterns.unified_pattern_service import UnifiedPatternService
+    from ai_service.layers.patterns.unified_pattern_service import UnifiedPatternService
     return UnifiedPatternService()
 
 
 @pytest.fixture(scope="function")
 def cache_service():
     """Provides a clean instance of CacheService for each test"""
-    from src.ai_service.core.cache_service import CacheService
+    from ai_service.core.cache_service import CacheService
     service = CacheService(max_size=3, default_ttl=5)  # Small size and TTL for tests
     yield service
     # Clean up after test
@@ -265,7 +273,7 @@ def cache_service():
 @pytest.fixture(scope="function")
 def template_builder():
     """Provides a clean instance of TemplateBuilder for each test"""
-    from src.ai_service.layers.variants.template_builder import TemplateBuilder
+    from ai_service.layers.variants.template_builder import TemplateBuilder
     return TemplateBuilder()
 
 
@@ -281,75 +289,22 @@ def event_loop():
     loop.close()
 
 
-@pytest.fixture(scope="session")
-def docker_client():
-    """Docker client for managing containers."""
-    try:
-        from docker import DockerClient  # type: ignore
-        client = DockerClient()
-        client.ping()
-        return client
-    except Exception as e:
-        pytest.skip(f"Docker not available: {e}")
+@pytest.fixture
+async def elasticsearch_container(owned_elasticsearch):
+    """Compatibility fixture: ownership belongs to the external regression runner.
 
-
-@pytest.fixture(scope="session")
-def elasticsearch_container(docker_client):
-    """Elasticsearch container for integration tests."""
-    container_name = "ai-service-test-es"
-    
-    # Remove existing container if any
-    try:
-        existing = docker_client.containers.get(container_name)
-        existing.remove(force=True)
-    except:
-        pass
-    
-    try:
-        # Start Elasticsearch container
-        container = docker_client.containers.run(
-            "docker.elastic.co/elasticsearch/elasticsearch:8.11.0",
-            name=container_name,
-            environment={
-                "discovery.type": "single-node",
-                "xpack.security.enabled": "false",
-                "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
-            },
-            ports={"9200/tcp": 9200},
-            detach=True,
-            remove=True
-        )
-        
-        # Wait for Elasticsearch to be ready
-        max_retries = 30
-        for i in range(max_retries):
-            try:
-                response = httpx.get("http://localhost:9200/_cluster/health", timeout=5.0)
-                if response.status_code == 200:
-                    break
-            except:
-                pass
-            time.sleep(2)
-        else:
-            container.remove(force=True)
-            pytest.skip("Elasticsearch failed to start")
-        
-        yield container
-        
-    finally:
-        # Cleanup
-        try:
-            container.remove(force=True)
-        except:
-            pass
+    Never remove a fixed-name container or start an unauthenticated server here.
+    """
+    return owned_elasticsearch
 
 
 @pytest.fixture
 async def elasticsearch_client(elasticsearch_container):
-    """Elasticsearch client for tests."""
+    """Authenticated HTTP compatibility client on the verified disposable cluster."""
     async with httpx.AsyncClient(
-        base_url="http://localhost:9200",
-        timeout=30.0
+        base_url=os.environ["SANCTIONS_TEST_ES_URL"],
+        auth=(os.environ["SANCTIONS_TEST_ES_USERNAME"], os.environ["SANCTIONS_TEST_ES_PASSWORD"]),
+        timeout=30.0,
     ) as client:
         yield client
 
@@ -607,8 +562,8 @@ async def test_indices(elasticsearch_client):
 @pytest.fixture
 def mock_hybrid_search_service():
     """Mock HybridSearchService for unit tests."""
-    from src.ai_service.layers.search import HybridSearchService
-    from src.ai_service.contracts.search_contracts import Candidate, SearchType
+    from ai_service.layers.search import HybridSearchService
+    from ai_service.contracts.search_contracts import Candidate, SearchType
     
     service = MagicMock(spec=HybridSearchService)
     
@@ -675,7 +630,7 @@ def mock_signals_result():
 @pytest.fixture
 def mock_normalization_result():
     """Mock NormalizationResult for tests."""
-    from src.ai_service.contracts.base_contracts import NormalizationResult
+    from ai_service.contracts.base_contracts import NormalizationResult
     
     return NormalizationResult(
         normalized="иван петров",
@@ -838,7 +793,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     # Статистика по маркерам
     stats = terminalreporter.stats
     if stats:
-        terminalreporter.write_line(f"Total tests: {sum(len(tests) for tests in stats.values())}")
+        terminalreporter.write_line(f"Collected tests: {terminalreporter._numcollected}")
         
         # Считаем канареечные тесты
         canary_tests = 0

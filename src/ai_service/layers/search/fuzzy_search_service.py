@@ -96,7 +96,8 @@ class FuzzySearchService:
         query: str,
         candidates: List[str],
         doc_mapping: Optional[Dict[str, str]] = None,
-        metadata_mapping: Optional[Dict[str, Dict[str, Any]]] = None
+        metadata_mapping: Optional[Dict[str, Dict[str, Any]]] = None,
+        *, max_results: Optional[int] = None
     ) -> List[FuzzyMatchResult]:
         """
         Perform fuzzy search against candidates.
@@ -111,7 +112,7 @@ class FuzzySearchService:
             List of fuzzy match results sorted by score
         """
         if not self.enabled:
-            return []
+            raise RuntimeError("Fuzzy matching is unavailable")
 
         if not query or not candidates:
             return []
@@ -122,11 +123,14 @@ class FuzzySearchService:
             # Preprocess query
             processed_query = self._preprocess_query(query) if self.config.enable_preprocessing else query
 
-            # Limit candidates for performance
-            candidate_subset = candidates[:self.config.max_candidates]
-
-            # Perform fuzzy matching with multiple algorithms
-            matches = self._fuzzy_match_multi_algorithm(processed_query, candidate_subset)
+            # Bound batch size, never source coverage. Truncating the candidate
+            # list made entities after the first batch impossible to detect.
+            batch_size = max(1, self.config.max_candidates)
+            matches = []
+            for offset in range(0, len(candidates), batch_size):
+                matches.extend(self._fuzzy_match_multi_algorithm(
+                    processed_query, candidates[offset:offset + batch_size]
+                ))
 
             # Convert to FuzzyMatchResult objects
             results = []
@@ -145,8 +149,8 @@ class FuzzySearchService:
                 results.append(result)
 
             # Sort by score (descending) and limit results
-            results.sort(key=lambda x: x.score, reverse=True)
-            results = results[:self.config.max_results]
+            results.sort(key=lambda x: (-x.score, x.matched_text))
+            results = results[:self.config.max_results if max_results is None else max_results]
 
             processing_time = (time.time() - start_time) * 1000
             self.logger.debug(f"Fuzzy search completed: {len(results)} results in {processing_time:.2f}ms")
@@ -154,8 +158,8 @@ class FuzzySearchService:
             return results
 
         except Exception as e:
-            self.logger.error(f"Fuzzy search failed: {e}")
-            return []
+            self.logger.error("Fuzzy matching failed")
+            raise RuntimeError("Fuzzy matching failed") from e
 
     def _preprocess_query(self, query: str) -> str:
         """Preprocess query for better matching."""
@@ -184,72 +188,20 @@ class FuzzySearchService:
             List of (candidate, score, algorithm) tuples
         """
         all_matches = []
-
-        # Algorithm 1: Simple ratio (Levenshtein-based)
-        try:
-            ratio_matches = process.extract(
-                query,
-                candidates,
-                scorer=fuzz.ratio,
-                limit=self.config.max_results * 2,
-                score_cutoff=self.config.min_score_threshold * 100  # rapidfuzz uses 0-100
+        algorithms = (
+            ("ratio", fuzz.ratio, self.config.min_score_threshold),
+            ("partial_ratio", fuzz.partial_ratio, self.config.partial_match_threshold),
+            ("token_sort_ratio", fuzz.token_sort_ratio, self.config.token_match_threshold),
+            ("token_set_ratio", fuzz.token_set_ratio, self.config.token_match_threshold),
+        )
+        for algorithm, scorer, threshold in algorithms:
+            matches = process.extract(
+                query, candidates, scorer=scorer, limit=None,
+                processor=self._preprocess_query if self.config.enable_preprocessing else None,
+                score_cutoff=threshold * 100,
             )
-            for candidate, score, _ in ratio_matches:
-                normalized_score = score / 100.0
-                if normalized_score >= self.config.min_score_threshold:
-                    all_matches.append((candidate, normalized_score, 'ratio'))
-        except Exception as e:
-            self.logger.warning(f"Ratio matching failed: {e}")
-
-        # Algorithm 2: Partial ratio (good for substring matches)
-        try:
-            partial_matches = process.extract(
-                query,
-                candidates,
-                scorer=fuzz.partial_ratio,
-                limit=self.config.max_results * 2,
-                score_cutoff=self.config.partial_match_threshold * 100
-            )
-            for candidate, score, _ in partial_matches:
-                normalized_score = score / 100.0
-                if normalized_score >= self.config.partial_match_threshold:
-                    all_matches.append((candidate, normalized_score, 'partial_ratio'))
-        except Exception as e:
-            self.logger.warning(f"Partial ratio matching failed: {e}")
-
-        # Algorithm 3: Token sort ratio (good for word order differences)
-        try:
-            token_sort_matches = process.extract(
-                query,
-                candidates,
-                scorer=fuzz.token_sort_ratio,
-                limit=self.config.max_results * 2,
-                score_cutoff=self.config.token_match_threshold * 100
-            )
-            for candidate, score, _ in token_sort_matches:
-                normalized_score = score / 100.0
-                if normalized_score >= self.config.token_match_threshold:
-                    all_matches.append((candidate, normalized_score, 'token_sort_ratio'))
-        except Exception as e:
-            self.logger.warning(f"Token sort matching failed: {e}")
-
-        # Algorithm 4: Token set ratio (good for different word sets)
-        try:
-            token_set_matches = process.extract(
-                query,
-                candidates,
-                scorer=fuzz.token_set_ratio,
-                limit=self.config.max_results * 2,
-                score_cutoff=self.config.token_match_threshold * 100
-            )
-            for candidate, score, _ in token_set_matches:
-                normalized_score = score / 100.0
-                if normalized_score >= self.config.token_match_threshold:
-                    all_matches.append((candidate, normalized_score, 'token_set_ratio'))
-        except Exception as e:
-            self.logger.warning(f"Token set matching failed: {e}")
-
-        # Combine and deduplicate results
+            all_matches.extend((candidate, score / 100.0, algorithm)
+                               for candidate, score, _ in matches)
         return self._combine_fuzzy_results(all_matches)
 
     def _combine_fuzzy_results(
